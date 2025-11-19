@@ -1,0 +1,12 @@
+[package]
+name = "spora"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+netstack-smoltcp = "0.1"
+tokio = { version = "1.40.0", features = ["full"] }
+futures-util = "0.3.31"
+log = "0.4.22"
+socket2 = "0.5.6"
+stunclient={version = "0.4"}
