@@ -1,13 +1,13 @@
-use std::net::{SocketAddr, ToSocketAddrs};
-use std::ops::Deref;
-use std::str::FromStr;
-use std::sync::Arc;
-use std::time::Duration;
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use log::{info, warn};
 use netstack_smoltcp::{AnyIpPktFrame, Stack, StackBuilder, TcpListener};
 use pubsub_client::PubSubService;
+use std::net::{SocketAddr, ToSocketAddrs};
+use std::ops::Deref;
+use std::str::FromStr;
+use std::sync::Arc;
+use std::time::Duration;
 use stunclient::StunClient;
 use tokio::io;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -26,7 +26,7 @@ async fn connect_socket(local_addr: SocketAddr, remote_addr: &SocketAddr) -> io:
 
 struct Peer {
     socket: Arc<UdpSocket>,
-    peer_addr: Mutex<Option<SocketAddr>>,
+    peer_addr: SocketAddr,
 }
 
 async fn handle_incoming(peer: Arc<Peer>, mut stack_sink: SplitSink<Stack, AnyIpPktFrame>) {
@@ -34,10 +34,6 @@ async fn handle_incoming(peer: Arc<Peer>, mut stack_sink: SplitSink<Stack, AnyIp
     loop {
         match peer.socket.recv_from(&mut buffer).await {
             Ok((n, from_peer)) if n > 0 => {
-                let mut lock = peer.peer_addr.lock().await;
-                if lock.is_none() {
-                    lock.replace(from_peer);
-                }
                 let v_buf = buffer[..n].to_vec();
                 if let Err(e) = stack_sink.send(v_buf).await {
                     // TODO
@@ -56,21 +52,13 @@ async fn handle_incoming(peer: Arc<Peer>, mut stack_sink: SplitSink<Stack, AnyIp
 async fn handle_outgoing(mut stack_stream: SplitStream<Stack>, peer: Arc<Peer>) {
     while let Some(pkt) = stack_stream.next().await {
         if let Ok(pkt) = pkt {
-            let lock = peer.peer_addr.lock().await;
-            match lock.deref() {
-                None => {
-                    // Drop all outgoing packets, until we have established the peer
-                }
-                Some(peer_addr) => {
-                    match peer
-                        .socket
-                        .send_to(pkt.to_vec().as_slice(), peer_addr)
-                        .await
-                    {
-                        Ok(_) => {}
-                        Err(e) => eprintln!("failed to send packet to TUN, err: {:?}", e),
-                    }
-                }
+            match peer
+                .socket
+                .send_to(pkt.to_vec().as_slice(), peer.peer_addr)
+                .await
+            {
+                Ok(_) => {}
+                Err(e) => eprintln!("failed to send packet to TUN, err: {:?}", e),
             }
         }
     }
@@ -118,7 +106,7 @@ const BASE_PORT: u16 = 54321;
 
 pub async fn share() -> Result<PeerPort, String> {
     let Ok(pp) = PeerPort::new().await else {
-        return Err("failed to start message subscription: {}".to_string(), ); // TODO: better error
+        return Err("failed to start message subscription: {}".to_string()); // TODO: better error
     };
     let clone = pp.clone();
     // TODO: error handling
@@ -190,9 +178,7 @@ impl PeerPort {
         dbg!(&tun_endpoint);
         let tun_endpoint = SocketAddr::from_str(&tun_endpoint).unwrap(); // TODO: do not panic!
 
-
         let (local_addr, external_addr) = pierce().await.unwrap();
-
 
         writer
             .write_all(external_addr.to_string().as_bytes())
@@ -214,7 +200,7 @@ impl PeerPort {
         let sock = Arc::new(connect_socket(local_addr, &tun_endpoint).await.unwrap());
         let peer = Arc::new(Peer {
             socket: sock.clone(),
-            peer_addr: Mutex::new(None),
+            peer_addr: tun_endpoint,
         });
 
         let (stack_sink, stack_stream) = stack.split();
