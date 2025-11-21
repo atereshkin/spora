@@ -20,8 +20,7 @@ const PUBSUB_PORT: u16 = 2334;
 
 async fn connect_socket(local_addr: SocketAddr, remote_addr: &SocketAddr) -> io::Result<UdpSocket> {
     let socket = UdpSocket::bind(local_addr).await?; // TODO: listen on IPv6 as well
-    socket.connect(remote_addr).await?;
-    socket.send(&[123]).await?;
+    socket.send_to(&[123], remote_addr).await?;
     Ok(socket)
 }
 
