@@ -34,6 +34,10 @@ async fn handle_incoming(peer: Arc<Peer>, mut stack_sink: SplitSink<Stack, AnyIp
     loop {
         match peer.socket.recv_from(&mut buffer).await {
             Ok((n, from_peer)) if n > 0 => {
+                if (from_peer != peer.peer_addr) {
+                    eprintln!("Received packet from unexpected peer");
+                    continue
+                }
                 let v_buf = buffer[..n].to_vec();
                 if let Err(e) = stack_sink.send(v_buf).await {
                     // TODO
