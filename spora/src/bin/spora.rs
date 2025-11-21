@@ -58,6 +58,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let other_end =  other_end.trim();
             let sock = UdpSocket::bind(local_addr).await?;
             sock.connect(other_end).await?;
+            sock.send(&[123]).await?;
             nanovpn::Tunnel::new(sock).start().await.unwrap();
         }
     }
