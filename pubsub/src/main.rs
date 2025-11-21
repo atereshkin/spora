@@ -64,19 +64,6 @@ impl PubServer {
         //TODO: we should check if subscriber is already there
         let mut subscribers = self.subscribers.lock().await;
 
-        // loop {
-        //     reader.read_line(&mut key).await.unwrap();
-        //     print!("{}", key);
-        //
-        //     if (subscribers.contains_key(&key)) {
-        //         writer
-        //             .write_all("ERROR: already subscribed".as_bytes())
-        //             .await
-        //             .unwrap();
-        //     } else {
-        //         break;
-        //     }
-        // }
         writer.write_all(format!("{}:{}\n", self.pub_host, self.pub_port).as_ref()).await.unwrap();
         writer.flush().await.unwrap();
         subscribers.insert(key, socket);
@@ -108,6 +95,9 @@ impl PubServer {
                 return;
             }
         }
+        writer.write_all("OK\n".as_bytes()).await.unwrap();
+        writer.flush().await.unwrap();
+        println!("Starting copy");
         copy_bidirectional(&mut socket, &mut subscriber)
             .await
             .unwrap();
