@@ -109,8 +109,11 @@ const STUN_SERVER: &str = "stun.l.google.com:19302";
 const BASE_PORT: u16 = 54321;
 
 pub async fn share() -> Result<PeerPort, String> {
-    let Ok(pp) = PeerPort::new().await else {
-        return Err("failed to start message subscription: {}".to_string()); // TODO: better error
+    let pp = match PeerPort::new().await {
+        Ok(pp) => pp,
+        Err(e) => {
+            return Err(format!("failed to start message subscription: {}", e))
+        }
     };
     let clone = pp.clone();
     // TODO: error handling

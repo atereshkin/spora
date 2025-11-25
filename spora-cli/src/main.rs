@@ -2,7 +2,7 @@ use std::fs::write;
 use tokio::io::{AsyncBufReadExt, BufReader, BufWriter};
 use std::time::Duration;
 use tokio::time::sleep;
-use spora::{pierce, share};
+use spora_core::{pierce, share};
 use clap::{Parser, Subcommand};
 use tokio::io::AsyncWriteExt;
 use tokio::net::UdpSocket;

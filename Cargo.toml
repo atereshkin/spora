@@ -1,5 +1,5 @@
 [workspace]
 members = [
-    "spora",
-    "pubsub", "pubsub-client",
+    "spora-core", "spora-cli",
+    "pubsub", "pubsub-client", "spora-ffi",
 ]
