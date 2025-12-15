@@ -43,6 +43,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 panic!("Unsupported scheme {}. Expected a spora:// URL", url.scheme());
             }
             let (local_addr, extrenal_addr) = pierce().await?;
+            let sock = UdpSocket::bind(local_addr).await?;
 
             let mut stream = PubSubService::publish(url.host_str().unwrap(), url.port().unwrap(), url.path().strip_prefix("/").unwrap()).await?;
             let (reader, mut writer) = stream.split();
@@ -56,7 +57,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             reader.read_line(&mut other_end).await?;
             dbg!("Other end {}", &other_end);
             let other_end =  other_end.trim();
-            let sock = UdpSocket::bind(local_addr).await?;
+
             sock.connect(other_end).await?;
             sock.send(&[123]).await?;
             nanovpn::Tunnel::new(sock).start().await.unwrap();
