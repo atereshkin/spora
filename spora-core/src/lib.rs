@@ -1,6 +1,6 @@
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
-use log::{info, warn};
+use log::{info, warn, error, debug};
 use netstack_smoltcp::{AnyIpPktFrame, Stack, StackBuilder, TcpListener};
 use pubsub_client::PubSubService;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -11,6 +11,7 @@ use tokio::io;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
+
 
 const PUBSUB_SERVER: &str = "188.166.74.116";
 const PUBSUB_PORT: u16 = 2334;
@@ -32,18 +33,18 @@ async fn handle_incoming(peer: Arc<Peer>, mut stack_sink: SplitSink<Stack, AnyIp
         match peer.socket.recv_from(&mut buffer).await {
             Ok((n, from_peer)) if n > 0 => {
                 if from_peer != peer.peer_addr {
-                    eprintln!("Received packet from unexpected peer");
+                    error!("Received packet from unexpected peer {} (expected {})", from_peer, peer.peer_addr);
                     continue
                 }
                 let v_buf = buffer[..n].to_vec();
                 if let Err(e) = stack_sink.send(v_buf).await {
-                    // TODO
-                    eprintln!("Error writing incoming packet to stack: {}", e)
+                    // TODO ?
+                    error!("Error writing incoming packet to stack: {}", e)
                 }
             }
             Ok(_) => continue,
             Err(e) => {
-                eprintln!("Error receiving UDP packet: {}", e);
+                error!("Error receiving UDP packet: {}", e);
                 break;
             }
         }
@@ -59,7 +60,7 @@ async fn handle_outgoing(mut stack_stream: SplitStream<Stack>, peer: Arc<Peer>) 
                 .await
             {
                 Ok(_) => {}
-                Err(e) => eprintln!("failed to send packet to TUN, err: {:?}", e),
+                Err(e) => error!("failed to send packet to TUN, err: {:?}", e),
             }
         }
     }
@@ -130,7 +131,7 @@ pub async fn pierce() -> Result<(SocketAddr, SocketAddr), String> {
     while local_port < BASE_PORT + 10 {
         let local_addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], local_port));
         let udp = tokio::net::UdpSocket::bind(&local_addr).await.unwrap();
-        println!("Local addr: {}", udp.local_addr().unwrap());
+        debug!("Local addr: {}", udp.local_addr().unwrap());
 
         let c = StunClient::new(stun_addr);
         let f = c.query_external_address_async(&udp);
@@ -142,7 +143,7 @@ pub async fn pierce() -> Result<(SocketAddr, SocketAddr), String> {
             }
         };
     }
-    Err("failed to pinch".parse().unwrap())
+    Err("failed to pierce".parse().unwrap())
 }
 
 #[derive(Clone)]
@@ -164,7 +165,7 @@ impl PeerPort {
         Ok(PeerPort {
             key,
             control_stream: Arc::new(Mutex::new(stream)),
-            endpoint: endpoint,
+            endpoint,
         })
     }
 
