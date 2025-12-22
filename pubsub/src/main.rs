@@ -68,7 +68,6 @@ impl PubServer {
         reader.read_line(&mut key).await?;
         info!("SUB: {} {}", peer_addr, key);
 
-        //TODO: we should check if subscriber is already there
         let mut subscribers = self.subscribers.lock().await;
 
         writer.write_all(format!("{}:{}\n", self.pub_host, self.pub_port).as_ref()).await?;
