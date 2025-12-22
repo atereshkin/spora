@@ -1,8 +1,6 @@
 use std::io as std_io;
-use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
-use tokio::time::sleep;
 
 pub struct PubSubService<'a> {
     host: &'a str,
@@ -40,7 +38,7 @@ impl<'a> PubSubService<'a> {
         let mut br = BufReader::new(stream);
         let mut ack = String::new();
         br.read_line(&mut ack).await?;
-        assert!(ack == "OK\n");
+        assert_eq!(ack, "OK\n");
         Ok(br.into_inner())
     }
 }
