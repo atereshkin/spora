@@ -3,3 +3,4 @@ members = [
     "spora-core", "spora-cli",
     "pubsub", "pubsub-client", "spora-ffi",
 ]
+resolver = "3"
