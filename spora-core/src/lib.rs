@@ -4,16 +4,13 @@ use log::{info, warn};
 use netstack_smoltcp::{AnyIpPktFrame, Stack, StackBuilder, TcpListener};
 use pubsub_client::PubSubService;
 use std::net::{SocketAddr, ToSocketAddrs};
-use std::ops::Deref;
 use std::str::FromStr;
 use std::sync::Arc;
-use std::time::Duration;
 use stunclient::StunClient;
 use tokio::io;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
-use tokio::time::sleep;
 
 const PUBSUB_SERVER: &str = "188.166.74.116";
 const PUBSUB_PORT: u16 = 2334;
@@ -34,7 +31,7 @@ async fn handle_incoming(peer: Arc<Peer>, mut stack_sink: SplitSink<Stack, AnyIp
     loop {
         match peer.socket.recv_from(&mut buffer).await {
             Ok((n, from_peer)) if n > 0 => {
-                if (from_peer != peer.peer_addr) {
+                if from_peer != peer.peer_addr {
                     eprintln!("Received packet from unexpected peer");
                     continue
                 }

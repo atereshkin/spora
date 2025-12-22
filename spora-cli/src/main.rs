@@ -1,4 +1,3 @@
-use std::fs::write;
 use tokio::io::{AsyncBufReadExt, BufReader, BufWriter};
 use std::time::Duration;
 use tokio::time::sleep;
@@ -46,7 +45,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let sock = UdpSocket::bind(local_addr).await?;
 
             let mut stream = PubSubService::publish(url.host_str().unwrap(), url.port().unwrap(), url.path().strip_prefix("/").unwrap()).await?;
-            let (reader, mut writer) = stream.split();
+            let (reader, writer) = stream.split();
             let mut writer = BufWriter::new(writer);
             writer.write_all(extrenal_addr.to_string().as_bytes()).await?;
             writer.write_u8('\n' as u8).await?;
