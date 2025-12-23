@@ -170,7 +170,7 @@ impl PeerPort {
     }
 
     pub async fn start(&self) {
-        // TODO: read other endpoint from control stream, pinch, write our endpoint to control stream
+        // TODO: read other endpoint from control stream, pierce, write our endpoint to control stream
         let mut cstream = self.control_stream.lock().await; // TODO we are essentially locking it forever
 
         let (reader, mut writer) = cstream.split();
@@ -179,8 +179,9 @@ impl PeerPort {
 
         let mut tun_endpoint = String::new();
         reader.read_line(&mut tun_endpoint).await.unwrap(); // TODO: no reason to panic
+        // if the socket is closed, we should reconnect to pub-sub. in case of some other error, just loop
         tun_endpoint = tun_endpoint.trim().to_string();
-        dbg!(&tun_endpoint);
+        info!("Got tunnel endpoint {}", &tun_endpoint);
         let tun_endpoint = SocketAddr::from_str(&tun_endpoint).unwrap(); // TODO: do not panic!
 
         let (local_addr, external_addr) = pierce().await.unwrap();
