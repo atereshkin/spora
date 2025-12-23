@@ -8,10 +8,11 @@ use std::str::FromStr;
 use std::sync::Arc;
 use stunclient::StunClient;
 use tokio::io;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
-
+use tokio_util::codec::{FramedWrite, LinesCodec, LinesCodecError};
+use tokio_util::codec::FramedRead;
+use crate::TunnelError::{PierceError, ProtocolError};
 
 const PUBSUB_SERVER: &str = "188.166.74.116";
 const PUBSUB_PORT: u16 = 2334;
@@ -34,7 +35,7 @@ async fn handle_incoming(peer: Arc<Peer>, mut stack_sink: SplitSink<Stack, AnyIp
             Ok((n, from_peer)) if n > 0 => {
                 if from_peer != peer.peer_addr {
                     error!("Received packet from unexpected peer {} (expected {})", from_peer, peer.peer_addr);
-                    continue
+                    continue;
                 }
                 let v_buf = buffer[..n].to_vec();
                 if let Err(e) = stack_sink.send(v_buf).await {
@@ -146,6 +147,71 @@ pub async fn pierce() -> Result<(SocketAddr, SocketAddr), String> {
     Err("failed to pierce".parse().unwrap())
 }
 
+#[derive(Debug)]
+enum TunnelError {
+    NegChannelClosed,
+    // Io(std::io::Error),
+    // Parse(std::net::AddrParseError),
+    ProtocolError(String),
+    PierceError(String),
+}
+
+trait NegChannel {
+    async fn send_endpoint(&mut self, addr: SocketAddr) -> Result<(), TunnelError>;
+    async fn recv_endpoint(&mut self) -> Result<SocketAddr, TunnelError>;
+}
+
+struct FramedNegChannel<'a> {
+    reader: FramedRead<tokio::net::tcp::ReadHalf<'a>, LinesCodec>,
+    writer: FramedWrite<tokio::net::tcp::WriteHalf<'a>, LinesCodec>,
+}
+
+impl<'a> FramedNegChannel<'a> {
+    fn from_tcp_stream(stream: &'a mut TcpStream) -> Self {
+        let (read_half, write_half) = stream.split();
+        let decoder = LinesCodec::new();
+        let reader = FramedRead::new(read_half, decoder);
+        let encoder = LinesCodec::new();
+        let writer = FramedWrite::new(write_half, encoder);
+        FramedNegChannel { reader, writer }
+    }
+}
+
+impl<'a> NegChannel for FramedNegChannel<'a> {
+    async fn send_endpoint(&mut self, addr: SocketAddr) -> Result<(), TunnelError> {
+        self.writer.send(addr.to_string()).await.map_err(|error| {
+            match error {
+                LinesCodecError::MaxLineLengthExceeded => {
+                    panic!("max line length exceeded when sending endpoint")
+                }
+                LinesCodecError::Io(e) => {
+                    warn!("failed to send endpoint: {}", e);
+                    TunnelError::NegChannelClosed
+                }
+            }
+        })
+    }
+
+    async fn recv_endpoint(&mut self) -> Result<SocketAddr, TunnelError> {
+        let frame = match self.reader.next().await {
+            Some(Ok(line)) => line,
+            Some(Err(e)) => return Err(match e {
+                LinesCodecError::MaxLineLengthExceeded => {
+                    error!("max line length exceeded when receiving endpoint, possibly malicious peer");
+                    ProtocolError("Line too long".into())
+                }
+                LinesCodecError::Io(io_err) => {
+                    error!("failed to receive endpoint: {}", io_err);
+                    return Err(TunnelError::NegChannelClosed);
+                }
+            }),
+            None => return Err(TunnelError::NegChannelClosed),
+        };
+        Ok(SocketAddr::from_str(&frame).map_err(|parse_err| { ProtocolError(format!("invalid peer address: {}", parse_err))})?)
+    }
+}
+
+
 #[derive(Clone)]
 pub struct PeerPort {
     pub key: String,
@@ -169,30 +235,19 @@ impl PeerPort {
         })
     }
 
-    pub async fn start(&self) {
-        // TODO: read other endpoint from control stream, pierce, write our endpoint to control stream
-        let mut cstream = self.control_stream.lock().await; // TODO we are essentially locking it forever
+    async fn negotiate_endpoints(&self) -> Result<(SocketAddr, SocketAddr), TunnelError> {
+        // read the other endpoint from the control stream, pierce, write our endpoint to control stream
+        let mut cstream = self.control_stream.lock().await;
 
-        let (reader, mut writer) = cstream.split();
+        let mut neg_channel = FramedNegChannel::from_tcp_stream(&mut *cstream);
+        let tun_endpoint = neg_channel.recv_endpoint().await?;
 
-        let mut reader = BufReader::new(reader);
+        let (local_addr, external_addr) = pierce().await.map_err(PierceError)?;
+        neg_channel.send_endpoint(external_addr).await?;
+        Ok((local_addr, tun_endpoint))
+    }
 
-        let mut tun_endpoint = String::new();
-        reader.read_line(&mut tun_endpoint).await.unwrap(); // TODO: no reason to panic
-        // if the socket is closed, we should reconnect to pub-sub. in case of some other error, just loop
-        tun_endpoint = tun_endpoint.trim().to_string();
-        info!("Got tunnel endpoint {}", &tun_endpoint);
-        let tun_endpoint = SocketAddr::from_str(&tun_endpoint).unwrap(); // TODO: do not panic!
-
-        let (local_addr, external_addr) = pierce().await.unwrap();
-
-        writer
-            .write_all(external_addr.to_string().as_bytes())
-            .await
-            .unwrap();
-        writer.write_u8('\n' as u8).await.unwrap();
-        writer.flush().await.unwrap(); // TODO: do not panic
-
+    async fn start_tunnel(local_addr:SocketAddr, tun_endpoint: SocketAddr) -> io::Result<()> {
         let builder = StackBuilder::default()
             .enable_tcp(true)
             .enable_udp(true)
@@ -203,7 +258,7 @@ impl PeerPort {
         // let udp_socket = udp_socket.unwrap(); // udp enabled
         let tcp_listener = tcp_listener.unwrap(); // tcp enabled or icmp enabled
 
-        let sock = Arc::new(connect_socket(local_addr, &tun_endpoint).await.unwrap());
+        let sock = Arc::new(connect_socket(local_addr, &tun_endpoint).await?);
         let peer = Arc::new(Peer {
             socket: sock.clone(),
             peer_addr: tun_endpoint,
@@ -220,5 +275,29 @@ impl PeerPort {
         let w_tcp = tokio::spawn(handle_tcp_streams(tcp_listener));
         // let w_runner = tokio::spawn(runner);
         tokio::try_join!(w_incoming, w_outgoing, w_tcp).unwrap();
+
+        Ok(())
+    }
+
+    pub async fn start(&self) {
+        loop {
+            match self.negotiate_endpoints().await {
+                Err(TunnelError::NegChannelClosed) =>  {
+                    panic!("Negotiation channel closed") // TODO: reconnect
+                }
+                Err(PierceError(str)) => {
+                    panic!("Failed to pierce: {}", str) // TODO: report to caller
+                },
+                Err(ProtocolError(str)) => {
+                    warn!("Protocol error: {}", str);
+                },
+                Ok((local_addr, tun_endpoint)) => {
+                    match Self::start_tunnel(local_addr, tun_endpoint).await {
+                        Ok(_) => {}
+                        Err(e) => error!("Failed to start tunnel: {}", e),
+                    }
+                },
+            }
+        }
     }
 }
