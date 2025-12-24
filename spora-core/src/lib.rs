@@ -302,7 +302,10 @@ impl PeerPort {
             match self.negotiate_endpoints().await {
                 Err(TunnelError::NegChannelClosed) =>  {
                     warn!("Negotiation channel closed, reconnecting...");
-                    self.reconnect().await.unwrap(); // TODO: retry, not panic
+                    while let Err(e) = self.reconnect().await {
+                        warn!("Failed to reconnect, retrying in 5 seconds...");
+                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    }
                 }
                 Err(PierceError(str)) => {
                     panic!("Failed to pierce: {}", str) // TODO: report to caller
@@ -314,10 +317,6 @@ impl PeerPort {
                     debug!("Peer connected from {}. Starting tunnel", tun_endpoint);
                     tokio::spawn(Self::start_tunnel(local_addr, tun_endpoint)); // TODO: handle result
                     debug!("Tunnel started")
-                    // match Self::start_tunnel(local_addr, tun_endpoint).await {
-                    //     Ok(_) => {}
-                    //     Err(e) => error!("Failed to start tunnel: {}", e),
-                    // }
                 },
             }
         }
