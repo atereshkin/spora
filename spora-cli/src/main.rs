@@ -29,6 +29,7 @@ enum Mode {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    env_logger::init();
     let args = Args::parse();
     match args.mode{
         Mode::Share{..} => {

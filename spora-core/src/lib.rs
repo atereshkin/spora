@@ -116,7 +116,7 @@ pub async fn share() -> Result<PeerPort, String> {
     };
     let clone = pp.clone();
     // TODO: error handling
-    tokio::spawn(async move { clone.start().await });
+    tokio::spawn(async move { clone.run().await });
     Ok(pp)
 }
 
@@ -131,7 +131,13 @@ pub async fn pierce() -> Result<(SocketAddr, SocketAddr), String> {
     let mut local_port = BASE_PORT;
     while local_port < BASE_PORT + 10 {
         let local_addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], local_port));
-        let udp = tokio::net::UdpSocket::bind(&local_addr).await.unwrap();
+        let udp = match tokio::net::UdpSocket::bind(&local_addr).await {
+            Ok(udp) => udp,
+            Err(_) => {
+                local_port += 1;
+                continue
+            },
+        };
         debug!("Local addr: {}", udp.local_addr().unwrap());
 
         let c = StunClient::new(stun_addr);
@@ -144,7 +150,7 @@ pub async fn pierce() -> Result<(SocketAddr, SocketAddr), String> {
             }
         };
     }
-    Err("failed to pierce".parse().unwrap())
+    Err("failed to pierce".into())
 }
 
 #[derive(Debug)]
@@ -224,15 +230,26 @@ impl PeerPort {
         String::from("abcdef") // TODO
     }
 
+    async fn connect(key: &str) -> io::Result<(TcpStream, String)> {
+        let pubsub = PubSubService::new(PUBSUB_SERVER, PUBSUB_PORT);
+        pubsub.sub(key).await
+    }
+
     async fn new() -> io::Result<Self> {
         let key = PeerPort::make_key();
-        let pubsub = PubSubService::new(PUBSUB_SERVER, PUBSUB_PORT);
-        let (stream, endpoint) = pubsub.sub(&key).await?;
+        let (stream, endpoint) = Self::connect(&key).await?;
         Ok(PeerPort {
             key,
             control_stream: Arc::new(Mutex::new(stream)),
             endpoint,
         })
+    }
+
+    async fn reconnect(&self) -> io::Result<()> {
+        let mut guard = self.control_stream.lock().await;
+        let (stream, _) = Self::connect(&self.key).await?;
+        *guard = stream;
+        Ok(())
     }
 
     async fn negotiate_endpoints(&self) -> Result<(SocketAddr, SocketAddr), TunnelError> {
@@ -279,11 +296,13 @@ impl PeerPort {
         Ok(())
     }
 
-    pub async fn start(&self) {
+    pub async fn run(&self) {
         loop {
+            debug!("Waiting for peer to connect...");
             match self.negotiate_endpoints().await {
                 Err(TunnelError::NegChannelClosed) =>  {
-                    panic!("Negotiation channel closed") // TODO: reconnect
+                    warn!("Negotiation channel closed, reconnecting...");
+                    self.reconnect().await.unwrap(); // TODO: retry, not panic
                 }
                 Err(PierceError(str)) => {
                     panic!("Failed to pierce: {}", str) // TODO: report to caller
@@ -292,10 +311,13 @@ impl PeerPort {
                     warn!("Protocol error: {}", str);
                 },
                 Ok((local_addr, tun_endpoint)) => {
-                    match Self::start_tunnel(local_addr, tun_endpoint).await {
-                        Ok(_) => {}
-                        Err(e) => error!("Failed to start tunnel: {}", e),
-                    }
+                    debug!("Peer connected from {}. Starting tunnel", tun_endpoint);
+                    tokio::spawn(Self::start_tunnel(local_addr, tun_endpoint)); // TODO: handle result
+                    debug!("Tunnel started")
+                    // match Self::start_tunnel(local_addr, tun_endpoint).await {
+                    //     Ok(_) => {}
+                    //     Err(e) => error!("Failed to start tunnel: {}", e),
+                    // }
                 },
             }
         }
