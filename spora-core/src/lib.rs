@@ -1,3 +1,5 @@
+mod transport;
+
 use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use log::{info, warn, error, debug};
@@ -12,6 +14,7 @@ use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio_util::codec::{FramedWrite, LinesCodec, LinesCodecError};
 use tokio_util::codec::FramedRead;
+use crate::transport::{IpSink, IpStream, UdpTransport};
 use crate::TunnelError::{PierceError, ProtocolError};
 
 const PUBSUB_SERVER: &str = "188.166.74.116";
@@ -23,45 +26,29 @@ async fn connect_socket(local_addr: SocketAddr, remote_addr: &SocketAddr) -> io:
     Ok(socket)
 }
 
-struct Peer {
-    socket: Arc<UdpSocket>,
-    peer_addr: SocketAddr,
-}
 
-async fn handle_incoming(peer: Arc<Peer>, mut stack_sink: SplitSink<Stack, AnyIpPktFrame>) {
-    let mut buffer = vec![0u8; 1500];
-    loop {
-        match peer.socket.recv_from(&mut buffer).await {
-            Ok((n, from_peer)) if n > 0 => {
-                if from_peer != peer.peer_addr {
-                    error!("Received packet from unexpected peer {} (expected {})", from_peer, peer.peer_addr);
-                    continue;
-                }
-                let v_buf = buffer[..n].to_vec();
+async fn handle_incoming(mut peer_stream: IpStream, mut stack_sink: SplitSink<Stack, AnyIpPktFrame>) {
+    while let Some(pkt) = peer_stream.next().await {
+        match pkt {
+            Ok(v_buf) => {
                 if let Err(e) = stack_sink.send(v_buf).await {
-                    // TODO ?
-                    error!("Error writing incoming packet to stack: {}", e)
+                    error!("Error writing incoming packet to stack: {}", e);
                 }
             }
-            Ok(_) => continue,
             Err(e) => {
-                error!("Error receiving UDP packet: {}", e);
+                error!("Error receiving from transport: {}", e);
                 break;
             }
         }
     }
 }
 
-async fn handle_outgoing(mut stack_stream: SplitStream<Stack>, peer: Arc<Peer>) {
+async fn handle_outgoing(mut stack_stream: SplitStream<Stack>, mut peer_sink: IpSink) {
     while let Some(pkt) = stack_stream.next().await {
         if let Ok(pkt) = pkt {
-            match peer
-                .socket
-                .send_to(pkt.to_vec().as_slice(), peer.peer_addr)
-                .await
-            {
-                Ok(_) => {}
-                Err(e) => error!("failed to send packet to TUN, err: {:?}", e),
+            if let Err(e) = peer_sink.send(pkt.to_vec()).await {
+                error!("failed to send packet to transport, err: {:?}", e);
+                break;
             }
         }
     }
@@ -276,19 +263,17 @@ impl PeerPort {
         let tcp_listener = tcp_listener.unwrap(); // tcp enabled or icmp enabled
 
         let sock = Arc::new(connect_socket(local_addr, &tun_endpoint).await?);
-        let peer = Arc::new(Peer {
-            socket: sock.clone(),
-            peer_addr: tun_endpoint,
-        });
+
+        let transport = UdpTransport::new(sock.clone(), tun_endpoint);
 
         let (stack_sink, stack_stream) = stack.split();
 
         if let Some(runner) = runner {
             tokio::spawn(runner);
         }
-
-        let w_incoming = tokio::spawn(handle_incoming(peer.clone(), stack_sink));
-        let w_outgoing = tokio::spawn(handle_outgoing(stack_stream, peer));
+        let (transport_sink, transport_stream) = transport.split();
+        let w_incoming = tokio::spawn(handle_incoming(Box::new(transport_stream), stack_sink));
+        let w_outgoing = tokio::spawn(handle_outgoing(stack_stream, Box::new(transport_sink)));
         let w_tcp = tokio::spawn(handle_tcp_streams(tcp_listener));
         // let w_runner = tokio::spawn(runner);
         tokio::try_join!(w_incoming, w_outgoing, w_tcp).unwrap();
@@ -303,7 +288,7 @@ impl PeerPort {
                 Err(TunnelError::NegChannelClosed) =>  {
                     warn!("Negotiation channel closed, reconnecting...");
                     while let Err(e) = self.reconnect().await {
-                        warn!("Failed to reconnect, retrying in 5 seconds...");
+                        warn!("Failed to reconnect: {}. Retrying in 5 seconds...", e);
                         tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
                     }
                 }
