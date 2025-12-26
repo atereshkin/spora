@@ -1,9 +1,8 @@
 mod transport;
 
-use futures_util::stream::{SplitSink, SplitStream};
 use futures_util::{SinkExt, StreamExt};
 use log::{info, warn, error, debug};
-use netstack_smoltcp::{AnyIpPktFrame, Stack, StackBuilder, TcpListener};
+use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
 use pubsub_client::PubSubService;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::str::FromStr;
@@ -14,7 +13,7 @@ use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::sync::Mutex;
 use tokio_util::codec::{FramedWrite, LinesCodec, LinesCodecError};
 use tokio_util::codec::FramedRead;
-use crate::transport::{IpSink, IpStream, UdpTransport};
+use crate::transport::{IpTransport, UdpTransport};
 use crate::TunnelError::{PierceError, ProtocolError};
 
 const PUBSUB_SERVER: &str = "188.166.74.116";
@@ -26,29 +25,44 @@ async fn connect_socket(local_addr: SocketAddr, remote_addr: &SocketAddr) -> io:
     Ok(socket)
 }
 
-
-async fn handle_incoming(mut peer_stream: IpStream, mut stack_sink: SplitSink<Stack, AnyIpPktFrame>) {
-    while let Some(pkt) = peer_stream.next().await {
-        match pkt {
-            Ok(v_buf) => {
-                if let Err(e) = stack_sink.send(v_buf).await {
-                    error!("Error writing incoming packet to stack: {}", e);
+async fn run_tunnel(transport: IpTransport, stack: Stack) {
+    let (mut stack_sink, mut stack_stream) = stack.split();
+    let (mut peer_sink, mut peer_stream) = transport.split();
+    loop {
+        tokio::select! {
+            res = peer_stream.next() => {
+                match res {
+                    Some(Ok(v_buf)) => {
+                        if let Err(e) = stack_sink.send(v_buf).await {
+                            error!("Error writing to stack: {}", e);
+                        }
+                    }
+                    Some(Err(e)) => {
+                        error!("Transport read error: {}", e);
+                        break;
+                    }
+                    None => {
+                        info!("Transport stream closed (None).");
+                        break;
+                    }
                 }
             }
-            Err(e) => {
-                error!("Error receiving from transport: {}", e);
-                break;
-            }
-        }
-    }
-}
-
-async fn handle_outgoing(mut stack_stream: SplitStream<Stack>, mut peer_sink: IpSink) {
-    while let Some(pkt) = stack_stream.next().await {
-        if let Ok(pkt) = pkt {
-            if let Err(e) = peer_sink.send(pkt.to_vec()).await {
-                error!("failed to send packet to transport, err: {:?}", e);
-                break;
+            res = stack_stream.next() => {
+                match res {
+                    Some(Ok(pkt)) => {
+                        if let Err(e) = peer_sink.send(pkt.to_vec()).await {
+                            error!("Transport write error: {}", e);
+                            break;
+                        }
+                    }
+                    Some(Err(e)) => {
+                        error!("Stack read error: {}", e);
+                    }
+                    None => {
+                        info!("Stack stream closed.");
+                        break;
+                    }
+                }
             }
         }
     }
@@ -143,8 +157,6 @@ pub async fn pierce() -> Result<(SocketAddr, SocketAddr), String> {
 #[derive(Debug)]
 enum TunnelError {
     NegChannelClosed,
-    // Io(std::io::Error),
-    // Parse(std::net::AddrParseError),
     ProtocolError(String),
     PierceError(String),
 }
@@ -266,17 +278,13 @@ impl PeerPort {
 
         let transport = UdpTransport::new(sock.clone(), tun_endpoint);
 
-        let (stack_sink, stack_stream) = stack.split();
-
         if let Some(runner) = runner {
             tokio::spawn(runner);
         }
-        let (transport_sink, transport_stream) = transport.split();
-        let w_incoming = tokio::spawn(handle_incoming(Box::new(transport_stream), stack_sink));
-        let w_outgoing = tokio::spawn(handle_outgoing(stack_stream, Box::new(transport_sink)));
+
+        let w_tunnel = tokio::spawn(run_tunnel(Box::new(transport), stack));
         let w_tcp = tokio::spawn(handle_tcp_streams(tcp_listener));
-        // let w_runner = tokio::spawn(runner);
-        tokio::try_join!(w_incoming, w_outgoing, w_tcp).unwrap();
+        tokio::try_join!(w_tunnel, w_tcp).unwrap();
 
         Ok(())
     }

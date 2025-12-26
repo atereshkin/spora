@@ -6,22 +6,19 @@ use std::task::{Context, Poll};
 use tokio::net::UdpSocket;
 use futures_util::{Stream, Sink};
 
-// pub type IpTransport = Box<dyn Transport + Send + Unpin>;
-//
-// pub trait Transport:
-//     Stream<Item = io::Result<Vec<u8>>> +
-//     Sink<Vec<u8>, Error = io::Error>
-// {}
+pub type IpTransport = Box<dyn Transport + Send + Unpin>;
 
-pub type IpStream = Box<dyn Stream<Item = io::Result<Vec<u8>>> + Send + Unpin>;
-pub type IpSink = Box<dyn Sink<Vec<u8>, Error = io::Error> + Send + Unpin>;
+pub trait Transport:
+    Stream<Item = io::Result<Vec<u8>>> +
+    Sink<Vec<u8>, Error = io::Error>
+{}
 
 
-// impl<T> Transport for T
-// where T: Stream<Item = io::Result<Vec<u8>>> +
-//          Sink<Vec<u8>, Error = io::Error> +
-//          Send + Unpin
-// {}
+impl<T> Transport for T
+where T: Stream<Item = io::Result<Vec<u8>>> +
+         Sink<Vec<u8>, Error = io::Error> +
+         Send + Unpin
+{}
 
 
 pub struct UdpTransport {
