@@ -51,7 +51,7 @@ impl Stream for UdpTransport {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        loop {
+        loop { // it's only in a loop to repeat polling the socket if we get a packet from the wrong peer
             let mut buf = tokio::io::ReadBuf::new(&mut this.recv_buffer);
             match this.socket.poll_recv_from(cx, &mut buf) {
                 Poll::Ready(Ok(addr)) => {
@@ -66,11 +66,11 @@ impl Stream for UdpTransport {
                 Poll::Ready(Err(e)) => return Poll::Ready(Some(Err(e))),
                 Poll::Pending => {}
             }
-            match this.timeout_timer.as_mut().poll(cx) {
+            return match this.timeout_timer.as_mut().poll(cx) {
                 Poll::Ready(_) => {
-                    return Poll::Ready(None)
+                    Poll::Ready(None)
                 }
-                Poll::Pending => return Poll::Pending,
+                Poll::Pending => Poll::Pending,
             }
         }
     }
