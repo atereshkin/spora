@@ -4,8 +4,8 @@ use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
 use log::{error, warn};
 use tokio::net::TcpStream;
 use futures_util::{SinkExt, StreamExt};
-use crate::TunnelError;
-use crate::TunnelError::ProtocolError;
+use crate::server::TunnelError;
+use crate::server::TunnelError::ProtocolError;
 
 pub trait NegChannel {
     async fn send_endpoint(&mut self, addr: SocketAddr) -> Result<(), TunnelError>;
