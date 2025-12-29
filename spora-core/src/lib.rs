@@ -2,10 +2,19 @@ mod neg;
 mod server;
 mod transport;
 
-use log::{debug};
+pub use crate::transport::IpTransport;
+use log::debug;
+use pubsub_client::PubSubService;
 use server::{PeerPort, BASE_PORT};
+use std::error::Error;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::sync::Arc;
 use stunclient::StunClient;
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
+use tokio::net::UdpSocket;
+use url::Url;
+use crate::neg::{FramedNegChannel, NegChannel};
+use crate::transport::UdpTransport;
 
 const STUN_SERVER: &str = "stun.l.google.com:19302";
 
@@ -18,6 +27,27 @@ pub async fn share() -> Result<PeerPort, String> {
     // TODO: error handling
     tokio::spawn(async move { clone.run().await });
     Ok(pp)
+}
+
+// TODO: needs better error handling
+pub async fn connect(url: Url) -> Result<IpTransport, String> {
+    let (local_addr, extrenal_addr) = pierce().await?;
+    let sock = UdpSocket::bind(local_addr).await.map_err(|_| "failed to bind socket")?;
+
+    let mut stream = PubSubService::publish(
+        url.host_str().unwrap(),
+        url.port().unwrap(),
+        url.path().strip_prefix("/").unwrap(),
+    )
+    .await.map_err(|_| "failed to publish to pubsub")?;
+    let mut neg_chan = FramedNegChannel::from_tcp_stream(&mut stream);
+    neg_chan.send_endpoint(extrenal_addr).await.map_err(|_| "failed to send endpoint")?;
+    dbg!("Sent external addr {} to sharer", extrenal_addr);
+    let other_end = neg_chan.recv_endpoint().await.map_err(|_| "could not receive endpoint")?;
+
+    sock.connect(other_end).await.map_err(|_| "could not connect to peer")?;
+    sock.send(&[123]).await.map_err(|_| "unable to send initial byte")?;
+    Ok(Box::new(UdpTransport::new(Arc::new(sock), other_end)))
 }
 
 pub async fn pierce() -> Result<(SocketAddr, SocketAddr), String> {

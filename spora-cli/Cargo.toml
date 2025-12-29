@@ -11,3 +11,6 @@ tokio = "1.48.0"
 pubsub-client={path="../pubsub-client"}
 url = "2.5.7"
 env_logger = "0.11.8"
+tokio-tun = "0.12.1"
+futures-util = "0.3.31"
+log = "0.4.29"

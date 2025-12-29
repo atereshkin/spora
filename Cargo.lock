@@ -1306,10 +1306,13 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "env_logger",
+ "futures-util",
+ "log",
  "nanovpn",
  "pubsub-client",
  "spora-core",
  "tokio",
+ "tokio-tun",
  "url",
 ]
 
@@ -1325,6 +1328,7 @@ dependencies = [
  "stunclient",
  "tokio",
  "tokio-util",
+ "url",
 ]
 
 [[package]]
