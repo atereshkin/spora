@@ -31,7 +31,7 @@ pub async fn share() -> Result<PeerPort, String> {
 
 // TODO: needs better error handling
 pub async fn connect(url: Url) -> Result<IpTransport, String> {
-    let (local_addr, extrenal_addr) = pierce().await?;
+    let (local_addr, external_addr) = pierce().await?;
     let sock = UdpSocket::bind(local_addr).await.map_err(|_| "failed to bind socket")?;
 
     let mut stream = PubSubService::publish(
@@ -41,8 +41,8 @@ pub async fn connect(url: Url) -> Result<IpTransport, String> {
     )
     .await.map_err(|_| "failed to publish to pubsub")?;
     let mut neg_chan = FramedNegChannel::from_tcp_stream(&mut stream);
-    neg_chan.send_endpoint(extrenal_addr).await.map_err(|_| "failed to send endpoint")?;
-    dbg!("Sent external addr {} to sharer", extrenal_addr);
+    neg_chan.send_endpoint(external_addr).await.map_err(|_| "failed to send endpoint")?;
+    dbg!("Sent external addr {} to sharer", external_addr);
     let other_end = neg_chan.recv_endpoint().await.map_err(|_| "could not receive endpoint")?;
 
     sock.connect(other_end).await.map_err(|_| "could not connect to peer")?;
