@@ -154,12 +154,12 @@ impl Stream for ReconnectTransport {
                         Poll::Ready(Some(Ok(pkt))) => return Poll::Ready(Some(Ok(pkt))),
                         Poll::Ready(Some(Err(_e))) => {
                             // Underlying transport errored => reconnect.
-                            this.begin_sleep();
+                            this.begin_dial();
                             continue;
                         }
                         Poll::Ready(None) => {
                             // Underlying transport ended => reconnect.
-                            this.begin_sleep();
+                            this.begin_dial();
                             continue;
                         }
                         Poll::Pending => return Poll::Pending,
