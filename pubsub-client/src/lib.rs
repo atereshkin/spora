@@ -38,8 +38,11 @@ impl<'a> PubSubService<'a> {
         let mut br = BufReader::new(stream);
         let mut ack = String::new();
         br.read_line(&mut ack).await?;
-        assert_eq!(ack, "OK\n");
-        Ok(br.into_inner())
+        if ack == "OK\n" {
+            Ok(br.into_inner())
+        } else {
+            Err(std_io::Error::new(std_io::ErrorKind::Other, ack)) // TODO: custom error type
+        }
     }
 }
 

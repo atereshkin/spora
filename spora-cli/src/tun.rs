@@ -1,7 +1,7 @@
 use futures_util::stream::StreamExt;
 use std::io;
 use futures_util::SinkExt;
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio_tun::Tun;
 use log::{error, info};
 use spora_core::IpTransport;

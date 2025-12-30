@@ -6,15 +6,14 @@ pub use crate::transport::IpTransport;
 use log::debug;
 use pubsub_client::PubSubService;
 use server::{PeerPort, BASE_PORT};
-use std::error::Error;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use stunclient::StunClient;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::net::UdpSocket;
 use url::Url;
 use crate::neg::{FramedNegChannel, NegChannel};
-use crate::transport::UdpTransport;
+use crate::transport::{ReconnectTransport, UdpTransport};
+use std::io;
 
 const STUN_SERVER: &str = "stun.l.google.com:19302";
 
@@ -31,24 +30,60 @@ pub async fn share() -> Result<PeerPort, String> {
 
 // TODO: needs better error handling
 pub async fn connect(url: Url) -> Result<IpTransport, String> {
-    let (local_addr, external_addr) = pierce().await?;
-    let sock = UdpSocket::bind(local_addr).await.map_err(|_| "failed to bind socket")?;
+    async fn connect_once(url: &Url) -> Result<IpTransport, String> {
+        let (local_addr, external_addr) = pierce().await?;
+        let sock = UdpSocket::bind(local_addr).await.map_err(|_| "failed to bind socket")?;
 
-    let mut stream = PubSubService::publish(
-        url.host_str().unwrap(),
-        url.port().unwrap(),
-        url.path().strip_prefix("/").unwrap(),
-    )
-    .await.map_err(|_| "failed to publish to pubsub")?;
-    let mut neg_chan = FramedNegChannel::from_tcp_stream(&mut stream);
-    neg_chan.send_endpoint(external_addr).await.map_err(|_| "failed to send endpoint")?;
-    dbg!("Sent external addr {} to sharer", external_addr);
-    let other_end = neg_chan.recv_endpoint().await.map_err(|_| "could not receive endpoint")?;
+        let mut stream = PubSubService::publish(
+            url.host_str().unwrap(),
+            url.port().unwrap(),
+            url.path().strip_prefix("/").unwrap(),
+        )
+        .await
+        .map_err(|_| "failed to publish to pubsub")?;
 
-    sock.connect(other_end).await.map_err(|_| "could not connect to peer")?;
-    sock.send(&[123]).await.map_err(|_| "unable to send initial byte")?;
-    Ok(Box::new(UdpTransport::new(Arc::new(sock), other_end)))
+        let mut neg_chan = FramedNegChannel::from_tcp_stream(&mut stream);
+        neg_chan
+            .send_endpoint(external_addr)
+            .await
+            .map_err(|_| "failed to send endpoint")?;
+
+        let other_end = neg_chan
+            .recv_endpoint()
+            .await
+            .map_err(|_| "could not receive endpoint")?;
+
+        sock.connect(other_end)
+            .await
+            .map_err(|_| "could not connect to peer")?;
+
+        sock.send(&[123])
+            .await
+            .map_err(|_| "unable to send initial byte")?;
+
+        Ok(Box::new(UdpTransport::new(Arc::new(sock), other_end)))
+    }
+
+    let initial = connect_once(&url).await?;
+
+    // Dialer used by the reconnect wrapper: infinite retries; any `None`/`Err` triggers reconnect.
+    let url_for_dialer = url.clone();
+    let dialer = Box::new(move || {
+        let url = url_for_dialer.clone();
+
+        // Force `Pin<Box<impl Future>>` -> `Pin<Box<dyn Future>>` coercion.
+        let fut: crate::transport::DialFuture = Box::pin(async move {
+            connect_once(&url)
+                .await
+                .map_err(|s| io::Error::new(io::ErrorKind::Other, s))
+        });
+
+        fut
+    });
+
+    Ok(Box::new(ReconnectTransport::new(initial, dialer)))
 }
+
 
 pub async fn pierce() -> Result<(SocketAddr, SocketAddr), String> {
     let stun_addr = STUN_SERVER

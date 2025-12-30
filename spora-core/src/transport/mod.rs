@@ -5,6 +5,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
+use log::debug;
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, Sleep};
 
@@ -93,5 +94,134 @@ impl Sink<Vec<u8>> for UdpTransport {
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         self.inner_sink.as_mut().poll_close(cx)
+    }
+}
+
+
+const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub(crate) type DialFuture = Pin<Box<dyn Future<Output = io::Result<IpTransport>> + Send>>;
+type Dialer = Box<dyn FnMut() -> DialFuture + Send>;
+
+enum ReconnectState {
+    Connected(IpTransport),
+    Sleeping(Pin<Box<Sleep>>),
+    Dialing(DialFuture),
+}
+
+/// A `Transport` wrapper that transparently reconnects by swapping the inner `IpTransport`.
+///
+/// Policy:
+/// - retry forever
+/// - when inner yields `None` or `Err`, start reconnect
+/// - outbound packets are *dropped* while reconnecting
+pub struct ReconnectTransport {
+    dialer: Dialer,
+    state: ReconnectState,
+}
+
+impl ReconnectTransport {
+    pub fn new(initial: IpTransport, dialer: Dialer) -> Self {
+        Self {
+            dialer,
+            state: ReconnectState::Connected(initial),
+        }
+    }
+
+    fn begin_sleep(&mut self) {
+        debug!("Sleeping for {} seconds before reconnecting.", RECONNECT_DELAY.as_secs());
+        self.state = ReconnectState::Sleeping(Box::pin(sleep(RECONNECT_DELAY)));
+    }
+
+    fn begin_dial(&mut self) {
+        debug!("Dialing...");
+        let fut = (self.dialer)();
+        self.state = ReconnectState::Dialing(fut);
+    }
+}
+
+impl Stream for ReconnectTransport {
+    type Item = io::Result<Vec<u8>>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        loop {
+            match &mut this.state {
+                ReconnectState::Connected(inner) => {
+                    let mut pinned = Pin::new(inner);
+                    match pinned.as_mut().poll_next(cx) {
+                        Poll::Ready(Some(Ok(pkt))) => return Poll::Ready(Some(Ok(pkt))),
+                        Poll::Ready(Some(Err(_e))) => {
+                            // Underlying transport errored => reconnect.
+                            this.begin_sleep();
+                            continue;
+                        }
+                        Poll::Ready(None) => {
+                            // Underlying transport ended => reconnect.
+                            this.begin_sleep();
+                            continue;
+                        }
+                        Poll::Pending => return Poll::Pending,
+                    }
+                }
+                ReconnectState::Sleeping(timer) => match timer.as_mut().poll(cx) {
+                    Poll::Ready(()) => {
+                        this.begin_dial();
+                        continue;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+                ReconnectState::Dialing(fut) => match fut.as_mut().poll(cx) {
+                    Poll::Ready(Ok(new_inner)) => {
+                        this.state = ReconnectState::Connected(new_inner);
+                        continue;
+                    }
+                    Poll::Ready(Err(e)) => {
+                        debug!("Dial failed: {}", e);
+                        // Dial failed => sleep then try again forever.
+                        this.begin_sleep();
+                        continue;
+                    }
+                    Poll::Pending => return Poll::Pending,
+                },
+            }
+        }
+    }
+}
+
+impl Sink<Vec<u8>> for ReconnectTransport {
+    type Error = io::Error;
+
+    fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+        match &mut this.state {
+            ReconnectState::Connected(inner) => Pin::new(inner).poll_ready(cx),
+            ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
+        }
+    }
+
+    fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
+        let this = self.get_mut();
+        match &mut this.state {
+            ReconnectState::Connected(inner) => Pin::new(inner).start_send(item),
+            ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Ok(()), // drop policy
+        }
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+        match &mut this.state {
+            ReconnectState::Connected(inner) => Pin::new(inner).poll_flush(cx),
+            ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
+        }
+    }
+
+    fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let this = self.get_mut();
+        match &mut this.state {
+            ReconnectState::Connected(inner) => Pin::new(inner).poll_close(cx),
+            ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
+        }
     }
 }
