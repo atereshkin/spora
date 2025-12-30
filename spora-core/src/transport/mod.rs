@@ -5,7 +5,8 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use log::debug;
+use std::task::Poll::Ready;
+use log::{debug, trace, warn};
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, Sleep};
 
@@ -195,24 +196,43 @@ impl Sink<Vec<u8>> for ReconnectTransport {
 
     fn poll_ready(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
-        match &mut this.state {
+        let ret = match &mut this.state {
             ReconnectState::Connected(inner) => Pin::new(inner).poll_ready(cx),
             ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
-        }
+        };
+        trace!("poll_ready: {:?}", ret);
+        ret
     }
 
     fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
         let this = self.get_mut();
-        match &mut this.state {
-            ReconnectState::Connected(inner) => Pin::new(inner).start_send(item),
+        let ret = match &mut this.state {
+            ReconnectState::Connected(inner) => {
+                if let Err(e) = Pin::new(inner).start_send(item) {
+                    warn!("start_send failed: {}. Reconnecting...", e);
+                    this.begin_dial();
+                }
+                Ok(())
+            },
             ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Ok(()), // drop policy
-        }
+        };
+        trace!("start_send: {:?}", ret);
+        ret
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
         match &mut this.state {
-            ReconnectState::Connected(inner) => Pin::new(inner).poll_flush(cx),
+            ReconnectState::Connected(inner) => {
+                match Pin::new(inner).poll_flush(cx) {
+                    Ready(Err(e)) => {
+                        warn!("poll_flush failed: {}. Reconnecting...", e);
+                        this.begin_dial();
+                        Ready(Ok(()))
+                    },
+                    p => p
+                }
+            },
             ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
         }
     }
@@ -220,7 +240,16 @@ impl Sink<Vec<u8>> for ReconnectTransport {
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
         match &mut this.state {
-            ReconnectState::Connected(inner) => Pin::new(inner).poll_close(cx),
+            ReconnectState::Connected(inner) => {
+                match Pin::new(inner).poll_close(cx) {
+                    Ready(Err(e)) => {
+                        warn!("poll_close failed: {}. Reconnecting...", e);
+                        this.begin_dial();
+                        Ready(Ok(()))
+                    },
+                    p => p
+                }
+            },
             ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
         }
     }
