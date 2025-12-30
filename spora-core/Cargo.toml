@@ -13,3 +13,4 @@ socket2 = "0.5.6"
 stunclient={version = "0.4"}
 pubsub-client={path="../pubsub-client"}
 url = "2.5.7"
+etherparse = "0.16.0"

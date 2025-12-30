@@ -1320,6 +1320,7 @@ dependencies = [
 name = "spora-core"
 version = "0.1.0"
 dependencies = [
+ "etherparse",
  "futures-util",
  "log",
  "netstack-smoltcp",

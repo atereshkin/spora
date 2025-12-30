@@ -14,6 +14,7 @@ use url::Url;
 use crate::neg::{FramedNegChannel, NegChannel};
 use crate::transport::{ReconnectTransport, UdpTransport};
 use std::io;
+use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
 
 const STUN_SERVER: &str = "stun.l.google.com:19302";
 
@@ -81,7 +82,11 @@ pub async fn connect(url: Url) -> Result<IpTransport, String> {
         fut
     });
 
-    Ok(Box::new(ReconnectTransport::new(initial, dialer)))
+    let reconnect = Box::new(ReconnectTransport::new(initial, dialer)) as IpTransport;
+
+    let keepalive_cfg = KeepAliveConfig::default();
+    Ok(Box::new(KeepAliveTransport::new(reconnect, keepalive_cfg)))
+    // Ok(Box::new(ReconnectTransport::new(initial, dialer)))
 }
 
 

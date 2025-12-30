@@ -1,3 +1,5 @@
+pub mod keepalive;
+
 use std::future::Future;
 use futures_util::{Sink, Stream};
 use std::io;
