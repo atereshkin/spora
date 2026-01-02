@@ -830,15 +830,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nanovpn"
-version = "0.1.0"
-dependencies = [
- "clap",
- "tokio",
- "tokio-tun",
-]
-
-[[package]]
 name = "netstack-smoltcp"
 version = "0.1.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1308,8 +1299,6 @@ dependencies = [
  "env_logger",
  "futures-util",
  "log",
- "nanovpn",
- "pubsub-client",
  "spora-core",
  "tokio",
  "tokio-tun",

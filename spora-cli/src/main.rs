@@ -1,3 +1,4 @@
+#[cfg(not(windows))]
 mod tun;
 
 use std::time::Duration;
@@ -36,13 +37,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             sleep(Duration::from_secs(1000)).await; //TODO: join instead or something
         }
         Mode::Use{url} => {
-            let url = Url::parse(&url)?;
-            if url.scheme() != "spora" {
-                panic!("Unsupported scheme {}. Expected a spora:// URL", url.scheme());
+            #[cfg(windows)]
+            {
+                let _ = url; // silence unused warning
+                return Err("The 'use' mode is not supported on Windows yet (requires a TUN device).".into());
             }
-            let transport = connect(url).await.unwrap();
 
-            tun::Tunnel::new(transport).start().await?;
+            #[cfg(not(windows))]
+            {
+                let url = Url::parse(&url)?;
+                if url.scheme() != "spora" {
+                    panic!("Unsupported scheme {}. Expected a spora:// URL", url.scheme());
+                }
+                let transport = connect(url).await.unwrap();
+
+                tun::Tunnel::new(transport).start().await?;
+            }
         }
     }
     Ok(())
