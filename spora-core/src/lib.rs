@@ -2,19 +2,19 @@ mod neg;
 mod server;
 mod transport;
 
+use crate::neg::{FramedNegChannel, NegChannel};
+use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
 pub use crate::transport::IpTransport;
+use crate::transport::{ReconnectTransport, UdpTransport};
 use log::debug;
 use pubsub_client::PubSubService;
 use server::{PeerPort, BASE_PORT};
+use std::io;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use stunclient::StunClient;
 use tokio::net::UdpSocket;
 use url::Url;
-use crate::neg::{FramedNegChannel, NegChannel};
-use crate::transport::{ReconnectTransport, UdpTransport};
-use std::io;
-use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
 
 const STUN_SERVER: &str = "stun.l.google.com:19302";
 
@@ -33,7 +33,9 @@ pub async fn share() -> Result<PeerPort, String> {
 pub async fn connect(url: Url) -> Result<IpTransport, String> {
     async fn connect_once(url: &Url) -> Result<IpTransport, String> {
         let (local_addr, external_addr) = pierce().await?;
-        let sock = UdpSocket::bind(local_addr).await.map_err(|_| "failed to bind socket")?;
+        let sock = UdpSocket::bind(local_addr)
+            .await
+            .map_err(|_| "failed to bind socket")?;
 
         let mut stream = PubSubService::publish(
             url.host_str().unwrap(),
@@ -89,14 +91,15 @@ pub async fn connect(url: Url) -> Result<IpTransport, String> {
     // Ok(Box::new(ReconnectTransport::new(initial, dialer)))
 }
 
-
 pub async fn pierce() -> Result<(SocketAddr, SocketAddr), String> {
-    let stun_addr = STUN_SERVER
+    let Some(stun_addr) = STUN_SERVER
         .to_socket_addrs()
-        .unwrap()
+        .map_err(|e| format!("failed to resolve stun address: {}", e))?
         .filter(|x| x.is_ipv4())
         .next()
-        .unwrap();
+    else {
+        return Err("stun address did not resolve into an IPv4".into());
+    };
 
     let mut local_port = BASE_PORT;
     while local_port < BASE_PORT + 10 {
@@ -108,7 +111,7 @@ pub async fn pierce() -> Result<(SocketAddr, SocketAddr), String> {
                 continue;
             }
         };
-        debug!("Local addr: {}", udp.local_addr().unwrap());
+        debug!("Local addr: {}", &local_addr);
 
         let c = StunClient::new(stun_addr);
         let f = c.query_external_address_async(&udp);
