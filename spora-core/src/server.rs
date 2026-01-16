@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -99,6 +100,70 @@ async fn new_tcp_stream<'a>(addr: SocketAddr) -> std::io::Result<TcpStream> {
     Ok(stream)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct NATKey(SocketAddr, SocketAddr);
+
+// TODO: the NAT table entries should expire and be cleaned up
+async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+    let (mut read_half, mut write_half) = udp_socket.split();
+    tokio::spawn(async move {
+        while let Some((data, local, remote)) = rx.recv().await {
+            let _ = write_half.send((data, remote, local)).await;
+        }
+    });
+
+    let mut sockets: HashMap<NATKey, Arc<UdpSocket>> = HashMap::new();
+
+    while let Some((data, local, remote)) = read_half.next().await {
+        let key = NATKey(local, remote);
+        let sock = if let Some(sock) = sockets.get_mut(&key) {
+            sock
+        } else {
+            &mut match new_udp_packet(remote).await {
+                Ok(socket) => {
+                    let tx = tx.clone();
+                    let socket = Arc::new(socket);
+                    sockets.insert(key, socket.clone());
+                    let recv_socket = socket.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            let mut buf = vec![0; 1500];
+                            match recv_socket.recv_from(&mut buf).await {
+                                Ok((len, _)) => {
+                                    let _ = tx.send((buf[..len].to_vec(), local, remote));
+                                }
+                                Err(e) => {
+                                    warn!(
+                                        "failed to recv udp datagram {:?}<->{:?}: {:?}",
+                                        local, remote, e
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    });
+                    socket
+                },
+                Err(e) => panic!("failed to create udp socket: {:?}", e)
+            }
+
+        };
+        let _ = sock.send(&data).await;
+    }
+}
+
+async fn new_udp_packet(addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+    socket.set_nonblocking(true)?;
+
+    let socket = tokio::net::UdpSocket::from_std(socket.into());
+    if let Ok(ref socket) = socket {
+        socket.connect(addr).await?;
+    }
+    socket
+}
+
 pub const BASE_PORT: u16 = 54321;
 
 #[derive(Debug)]
@@ -162,7 +227,7 @@ impl PeerPort {
 
         let (stack, runner, udp_socket, tcp_listener) = builder.build().unwrap();
         // TODO: handle UDP
-        // let udp_socket = udp_socket.unwrap(); // udp enabled
+        let udp_socket = udp_socket.unwrap(); // udp enabled
         let tcp_listener = tcp_listener.unwrap(); // tcp enabled or icmp enabled
 
         let sock = Arc::new(connect_socket(local_addr, &tun_endpoint).await?);
@@ -175,7 +240,8 @@ impl PeerPort {
 
         let w_tunnel = tokio::spawn(run_tunnel(Box::new(transport), stack));
         let w_tcp = tokio::spawn(handle_tcp_streams(tcp_listener));
-        tokio::try_join!(w_tunnel, w_tcp).unwrap();
+        let w_udp = tokio::spawn(handle_inbound_datagram(udp_socket));
+        tokio::try_join!(w_tunnel, w_tcp, w_udp).unwrap();
 
         Ok(())
     }
