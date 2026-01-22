@@ -1,10 +1,10 @@
 #[cfg(not(windows))]
-mod tun;
 
 use std::time::Duration;
 use tokio::time::sleep;
-use spora_core::{connect, share};
+use spora_core::{connect, share, tun_util};
 use clap::{Parser, Subcommand};
+use tokio_tun::Tun;
 use url::{Url};
 
 #[derive(Parser, Debug)]
@@ -50,8 +50,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     panic!("Unsupported scheme {}. Expected a spora:// URL", url.scheme());
                 }
                 let transport = connect(url).await.unwrap();
-
-                tun::Tunnel::new(transport).start().await?;
+                let tun = Tun::builder().name("").up().try_build().unwrap();
+                tun_util::start(transport, tun).await?;
             }
         }
     }

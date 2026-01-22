@@ -1,6 +1,7 @@
 mod neg;
 mod server;
 mod transport;
+pub mod tun_util;
 
 use crate::neg::{FramedNegChannel, NegChannel};
 use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
