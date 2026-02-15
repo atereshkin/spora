@@ -15,6 +15,8 @@ use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use stunclient::StunClient;
 use tokio::net::UdpSocket;
+use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 
 pub struct ConnectResult {
@@ -39,15 +41,38 @@ impl Default for Config {
     }
 }
 
-pub async fn share(config: Config) -> Result<PeerPort, String> {
+pub struct ShareSession {
+    pub key: String,
+    pub endpoint: String,
+    pub cancel: CancellationToken,
+    pub task: JoinHandle<()>,
+}
+
+impl ShareSession {
+    /// Cancel the session and wait for the background task to finish.
+    pub async fn stop(self) {
+        self.cancel.cancel();
+        let _ = self.task.await;
+    }
+
+    /// Cancel the session and abort the background task immediately.
+    pub fn abort(self) {
+        self.cancel.cancel();
+        self.task.abort();
+    }
+}
+
+pub async fn share(config: Config) -> Result<ShareSession, String> {
     let pp = match PeerPort::new(config).await {
         Ok(pp) => pp,
         Err(e) => return Err(format!("failed to start message subscription: {}", e)),
     };
-    let clone = pp.clone();
-    // TODO: error handling
-    tokio::spawn(async move { clone.run().await });
-    Ok(pp)
+    let key = pp.key.clone();
+    let endpoint = pp.endpoint.clone();
+    let cancel = CancellationToken::new();
+    let child = cancel.clone();
+    let task = tokio::spawn(async move { pp.run(child).await });
+    Ok(ShareSession { key, endpoint, cancel, task })
 }
 
 async fn connect_once(url: &Url, stun_server: &str) -> Result<(IpTransport, Arc<UdpSocket>), String> {

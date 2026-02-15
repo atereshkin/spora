@@ -12,6 +12,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use url::Url;
 extern crate android_logger;
 use log::LevelFilter;
@@ -30,6 +31,20 @@ static SESSIONS: Lazy<Mutex<HashMap<i32, TunnelSession>>> =
 struct TunnelSession {
     task: JoinHandle<()>,
     socket_fd: RawFd,
+}
+
+struct ShareSessionEntry {
+    cancel: CancellationToken,
+    task: JoinHandle<()>,
+}
+
+static SHARE_SESSIONS: Lazy<Mutex<HashMap<i32, ShareSessionEntry>>> =
+    Lazy::new(|| Mutex::new(HashMap::new()));
+
+#[derive(uniffi::Record)]
+pub struct ShareResult {
+    pub handle: i32,
+    pub url: String,
 }
 
 #[uniffi::export]
@@ -55,12 +70,34 @@ impl std::fmt::Display for ShareError {
 }
 
 #[uniffi::export]
-pub async fn share() -> Result<String, ShareError> {
-    let handle = RUNTIME.spawn(async move { spora_core::share(spora_core::Config::default()).await });
-    match handle.await.unwrap() {
-        Ok(result) => Ok(format!("spora://{}/{}", result.endpoint, result.key)),
-        Err(e) => Err(ShareError::Generic(e.to_string())),
-    }
+pub fn share() -> Result<ShareResult, ShareError> {
+    let session = RUNTIME
+        .block_on(spora_core::share(spora_core::Config::default()))
+        .map_err(|e| ShareError::Generic(e.to_string()))?;
+
+    let url = format!("spora://{}/{}", session.endpoint, session.key);
+    let cancel = session.cancel.clone();
+    let task = session.task;
+
+    // Detach the cancel token from ShareSession so we manage it ourselves.
+    // We don't call session.stop() — we store the pieces directly.
+    let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    SHARE_SESSIONS
+        .lock()
+        .unwrap()
+        .insert(id, ShareSessionEntry { cancel, task });
+
+    Ok(ShareResult { handle: id, url })
+}
+
+/// Stops the share session associated with the given handle.
+#[uniffi::export]
+pub fn stop_share(handle: i32) -> Result<(), TunnelError> {
+    let mut sessions = SHARE_SESSIONS.lock().unwrap();
+    let entry = sessions.remove(&handle).ok_or(TunnelError::InvalidHandle)?;
+    entry.cancel.cancel();
+    entry.task.abort();
+    Ok(())
 }
 
 #[derive(Debug, uniffi::Error)]

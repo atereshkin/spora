@@ -5,6 +5,7 @@ use std::sync::Arc;
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use pubsub_client::PubSubService;
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
 use log::{debug, error, info, warn};
 use futures_util::{SinkExt, StreamExt};
@@ -219,7 +220,7 @@ impl PeerPort {
         Ok((local_addr, tun_endpoint))
     }
 
-    async fn start_tunnel(local_addr:SocketAddr, tun_endpoint: SocketAddr) -> io::Result<()> {
+    async fn start_tunnel(local_addr: SocketAddr, tun_endpoint: SocketAddr, cancel: CancellationToken) -> io::Result<()> {
         let builder = StackBuilder::default()
             .enable_tcp(true)
             .enable_udp(true)
@@ -234,38 +235,85 @@ impl PeerPort {
 
         let transport = UdpTransport::new(sock.clone(), tun_endpoint);
 
-        if let Some(runner) = runner {
-            tokio::spawn(runner);
-        }
+        let runner_handle = runner.map(|r| tokio::spawn(r));
 
         let w_tunnel = tokio::spawn(run_tunnel(Box::new(transport), stack));
         let w_tcp = tokio::spawn(handle_tcp_streams(tcp_listener));
         let w_udp = tokio::spawn(handle_inbound_datagram(udp_socket));
-        tokio::try_join!(w_tunnel, w_tcp, w_udp).unwrap();
+
+        let abort_handles = [
+            w_tunnel.abort_handle(),
+            w_tcp.abort_handle(),
+            w_udp.abort_handle(),
+        ];
+        let runner_abort = runner_handle.as_ref().map(|h| h.abort_handle());
+
+        tokio::select! {
+            _ = cancel.cancelled() => {
+                info!("Tunnel cancelled, aborting tasks");
+                for h in &abort_handles {
+                    h.abort();
+                }
+                if let Some(h) = runner_abort {
+                    h.abort();
+                }
+            }
+            _ = async { tokio::try_join!(w_tunnel, w_tcp, w_udp) } => {}
+        }
 
         Ok(())
     }
 
-    pub async fn run(&self) {
+    pub async fn run(&self, cancel: CancellationToken) {
         loop {
             debug!("Waiting for peer to connect...");
-            match self.negotiate_endpoints().await {
+
+            let negotiate = tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("Share session cancelled");
+                    break;
+                }
+                result = self.negotiate_endpoints() => result,
+            };
+
+            match negotiate {
                 Err(TunnelError::NegChannelClosed) =>  {
                     warn!("Negotiation channel closed, reconnecting...");
-                    while let Err(e) = self.reconnect().await {
-                        warn!("Failed to reconnect: {}. Retrying in 5 seconds...", e);
-                        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+                    loop {
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                info!("Share session cancelled during reconnect");
+                                return;
+                            }
+                            result = self.reconnect() => {
+                                match result {
+                                    Ok(()) => break,
+                                    Err(e) => {
+                                        warn!("Failed to reconnect: {}. Retrying in 5 seconds...", e);
+                                        tokio::select! {
+                                            _ = cancel.cancelled() => {
+                                                info!("Share session cancelled during reconnect delay");
+                                                return;
+                                            }
+                                            _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {}
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
                 Err(TunnelError::PierceError(str)) => {
-                    panic!("Failed to pierce: {}", str) // TODO: report to caller
+                    error!("Failed to pierce: {}", str);
+                    break;
                 },
                 Err(TunnelError::ProtocolError(str)) => {
                     warn!("Protocol error: {}", str);
                 },
                 Ok((local_addr, tun_endpoint)) => {
                     debug!("Peer connected from {}. Starting tunnel", tun_endpoint);
-                    tokio::spawn(Self::start_tunnel(local_addr, tun_endpoint)); // TODO: handle result
+                    let child_cancel = cancel.child_token();
+                    tokio::spawn(Self::start_tunnel(local_addr, tun_endpoint, child_cancel));
                     debug!("Tunnel started")
                 },
             }

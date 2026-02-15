@@ -1,7 +1,5 @@
 #[cfg(not(windows))]
 
-use std::time::Duration;
-use tokio::time::sleep;
 use spora_core::{connect, share, tun_util, Config};
 use clap::{Parser, Subcommand};
 use tokio_tun::Tun;
@@ -32,9 +30,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     match args.mode{
         Mode::Share{..} => {
-            let pp = share(Config::default()).await?;
-            println!("Expecting peer negotiation at spora://{}/{}", pp.endpoint, pp.key);
-            sleep(Duration::from_secs(1000)).await; //TODO: join instead or something
+            let session = share(Config::default()).await?;
+            println!("Expecting peer negotiation at spora://{}/{}", session.endpoint, session.key);
+            println!("Press Ctrl+C to stop sharing.");
+            tokio::signal::ctrl_c().await?;
+            println!("Stopping share session...");
+            session.stop().await;
         }
         Mode::Use{url} => {
             #[cfg(windows)]
