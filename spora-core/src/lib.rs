@@ -45,44 +45,44 @@ pub async fn share(config: Config) -> Result<PeerPort, String> {
     Ok(pp)
 }
 
+async fn connect_once(url: &Url, stun_server: &str) -> Result<IpTransport, String> {
+    let (local_addr, external_addr) = pierce(stun_server).await?;
+    let sock = UdpSocket::bind(local_addr)
+        .await
+        .map_err(|_| "failed to bind socket")?;
+
+    let mut stream = PubSubService::publish(
+        url.host_str().unwrap(),
+        url.port().unwrap(),
+        url.path().strip_prefix("/").unwrap(),
+    )
+    .await
+    .map_err(|_| "failed to publish to pubsub")?;
+
+    let mut neg_chan = FramedNegChannel::from_tcp_stream(&mut stream);
+    neg_chan
+        .send_endpoint(external_addr)
+        .await
+        .map_err(|_| "failed to send endpoint")?;
+
+    let other_end = neg_chan
+        .recv_endpoint()
+        .await
+        .map_err(|_| "could not receive endpoint")?;
+
+    sock.connect(other_end)
+        .await
+        .map_err(|_| "could not connect to peer")?;
+
+    sock.send(&[123])
+        .await
+        .map_err(|_| "unable to send initial byte")?;
+
+    Ok(Box::new(UdpTransport::new(Arc::new(sock), other_end)))
+}
+
 // TODO: needs better error handling
 pub async fn connect(url: Url, config: &Config) -> Result<IpTransport, String> {
-    async fn connect_once(url: &Url, stun_server: &str) -> Result<IpTransport, String> {
-        let (local_addr, external_addr) = pierce(stun_server).await?;
-        let sock = UdpSocket::bind(local_addr)
-            .await
-            .map_err(|_| "failed to bind socket")?;
-
-        let mut stream = PubSubService::publish(
-            url.host_str().unwrap(),
-            url.port().unwrap(),
-            url.path().strip_prefix("/").unwrap(),
-        )
-        .await
-        .map_err(|_| "failed to publish to pubsub")?;
-
-        let mut neg_chan = FramedNegChannel::from_tcp_stream(&mut stream);
-        neg_chan
-            .send_endpoint(external_addr)
-            .await
-            .map_err(|_| "failed to send endpoint")?;
-
-        let other_end = neg_chan
-            .recv_endpoint()
-            .await
-            .map_err(|_| "could not receive endpoint")?;
-
-        sock.connect(other_end)
-            .await
-            .map_err(|_| "could not connect to peer")?;
-
-        sock.send(&[123])
-            .await
-            .map_err(|_| "unable to send initial byte")?;
-
-        Ok(Box::new(UdpTransport::new(Arc::new(sock), other_end)))
-    }
-
     let initial = connect_once(&url, &config.stun_server).await?;
 
     // Dialer used by the reconnect wrapper: infinite retries; any `None`/`Err` triggers reconnect.
@@ -142,4 +142,56 @@ pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), Strin
         };
     }
     Err("failed to pierce".into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn pierce_fails_on_unresolvable_stun() {
+        let result = pierce("this.host.does.not.exist.invalid:19302").await;
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(
+            err.contains("failed to resolve"),
+            "expected 'failed to resolve' in error, got: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn pierce_fails_on_unreachable_stun() {
+        // 192.0.2.1 is TEST-NET-1 (RFC 5737), guaranteed non-routable
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            pierce("192.0.2.1:19302"),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(_)) => panic!("should not succeed with unreachable STUN server"),
+            Ok(Err(_)) => {} // pierce returned an error — expected
+            Err(_) => {}     // timed out — also acceptable
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_once_fails_on_bad_pubsub() {
+        // Port 1 — nothing listening. pierce will try the real STUN server, so
+        // we use an unreachable STUN to make it fail fast at the pierce stage,
+        // OR we craft a URL that will fail at the pubsub stage.
+        // Easiest: use a valid STUN but an unreachable pubsub host.
+        let url = Url::parse("http://127.0.0.1:1/testkey").unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            connect_once(&url, "192.0.2.1:19302"),
+        )
+        .await;
+
+        match result {
+            Ok(Ok(_)) => panic!("should not succeed with bad pubsub/stun"),
+            Ok(Err(_)) => {} // error — expected
+            Err(_) => {}     // timed out — also acceptable
+        }
+    }
 }

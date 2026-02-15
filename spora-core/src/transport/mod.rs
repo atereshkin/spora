@@ -262,9 +262,11 @@ impl Sink<Vec<u8>> for ReconnectTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::mock::mock_transport_pair;
+    use super::mock::{mock_transport, mock_transport_pair, is_icmp_echo_request, MockTransportHandle};
+    use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
     use futures_util::{SinkExt, StreamExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Mutex;
 
     #[tokio::test]
     async fn reconnect_passes_packets_through() {
@@ -285,19 +287,21 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_redials_on_inner_close() {
-        let (local, remote) = mock_transport_pair();
-        drop(remote); // close the channel so local yields None
+        let (local, handle) = mock_transport();
+        handle.close(); // close the channel so local yields None
 
         let dial_count = Arc::new(AtomicUsize::new(0));
         let dc = dial_count.clone();
+        let handles: Arc<Mutex<Vec<MockTransportHandle>>> = Arc::new(Mutex::new(Vec::new()));
+        let handles_clone = handles.clone();
 
         let dialer: Dialer = Box::new(move || {
             let dc = dc.clone();
+            let handles = handles_clone.clone();
             Box::pin(async move {
                 dc.fetch_add(1, Ordering::SeqCst);
-                let (new_local, _keep) = mock_transport_pair();
-                // Leak _keep so the new transport doesn't close immediately
-                Box::leak(Box::new(_keep));
+                let (new_local, new_handle) = mock_transport();
+                handles.lock().unwrap().push(new_handle);
                 Ok(Box::new(new_local) as IpTransport)
             })
         });
@@ -314,21 +318,24 @@ mod tests {
     async fn reconnect_retries_after_dial_failure() {
         tokio::time::pause();
 
-        let (local, remote) = mock_transport_pair();
-        drop(remote); // close channel to trigger reconnect
+        let (local, handle) = mock_transport();
+        handle.close(); // close channel to trigger reconnect
 
         let dial_count = Arc::new(AtomicUsize::new(0));
         let dc = dial_count.clone();
+        let handles: Arc<Mutex<Vec<MockTransportHandle>>> = Arc::new(Mutex::new(Vec::new()));
+        let handles_clone = handles.clone();
 
         let dialer: Dialer = Box::new(move || {
             let dc = dc.clone();
+            let handles = handles_clone.clone();
             Box::pin(async move {
                 let n = dc.fetch_add(1, Ordering::SeqCst);
                 if n < 2 {
                     Err(io::Error::new(io::ErrorKind::ConnectionRefused, "test failure"))
                 } else {
-                    let (new_local, _keep) = mock_transport_pair();
-                    Box::leak(Box::new(_keep));
+                    let (new_local, new_handle) = mock_transport();
+                    handles.lock().unwrap().push(new_handle);
                     Ok(Box::new(new_local) as IpTransport)
                 }
             })
@@ -352,5 +359,201 @@ mod tests {
         .expect("should complete within timeout");
 
         assert!(dial_count.load(Ordering::SeqCst) >= 3, "dialer should have been called at least 3 times");
+    }
+
+    // --- Sink tests ---
+
+    #[tokio::test]
+    async fn reconnect_sink_error_triggers_redial() {
+        let (local, handle) = mock_transport();
+        // Close the handle so the inner transport's Sink returns BrokenPipe
+        handle.close();
+
+        let dial_count = Arc::new(AtomicUsize::new(0));
+        let dc = dial_count.clone();
+        let handles: Arc<Mutex<Vec<MockTransportHandle>>> = Arc::new(Mutex::new(Vec::new()));
+        let handles_clone = handles.clone();
+
+        let dialer: Dialer = Box::new(move || {
+            let dc = dc.clone();
+            let handles = handles_clone.clone();
+            Box::pin(async move {
+                dc.fetch_add(1, Ordering::SeqCst);
+                let (new_local, new_handle) = mock_transport();
+                handles.lock().unwrap().push(new_handle);
+                Ok(Box::new(new_local) as IpTransport)
+            })
+        });
+
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer);
+
+        // First, poll_next to drive past the None from the closed stream and reconnect
+        tokio::time::timeout(std::time::Duration::from_millis(100), rt.next()).await.ok();
+        assert!(dial_count.load(Ordering::SeqCst) >= 1, "dialer should have been called from stream close");
+
+        // Now close the new handle to make the Sink fail
+        {
+            let mut h = handles.lock().unwrap();
+            let new_handle = h.pop().unwrap();
+            new_handle.close();
+        }
+
+        // Reset dial count
+        dial_count.store(0, Ordering::SeqCst);
+
+        // Send through the ReconnectTransport — start_send should hit BrokenPipe and trigger redial
+        Pin::new(&mut rt).send(vec![1, 2, 3]).await.unwrap();
+
+        // Drive the state machine so the dial future completes
+        tokio::time::timeout(std::time::Duration::from_millis(100), rt.next()).await.ok();
+
+        assert!(dial_count.load(Ordering::SeqCst) >= 1, "dialer should have been called after sink error");
+    }
+
+    #[tokio::test]
+    async fn reconnect_drops_packets_while_sleeping() {
+        tokio::time::pause();
+
+        let (local, handle) = mock_transport();
+        handle.close(); // trigger reconnect
+
+        // Dialer always fails, so we stay in Sleeping state
+        let dialer: Dialer = Box::new(|| {
+            Box::pin(async {
+                Err(io::Error::new(io::ErrorKind::ConnectionRefused, "always fails"))
+            })
+        });
+
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer);
+
+        // Poll to drive: None → Dial → fail → Sleeping
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+
+        // Now in Sleeping state — send should succeed (drop policy)
+        let result = Pin::new(&mut rt).send(vec![1, 2, 3]).await;
+        assert!(result.is_ok(), "send should succeed (drop policy) while sleeping");
+    }
+
+    #[tokio::test]
+    async fn reconnect_drops_packets_while_dialing() {
+        let (local, handle) = mock_transport();
+        handle.close(); // trigger reconnect
+
+        // Dialer hangs forever
+        let dialer: Dialer = Box::new(|| {
+            Box::pin(futures_util::future::pending())
+        });
+
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer);
+
+        // Poll to drive: None → begin_dial → Dialing(pending)
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+
+        // Now in Dialing state — send should succeed (drop policy)
+        let result = Pin::new(&mut rt).send(vec![1, 2, 3]).await;
+        assert!(result.is_ok(), "send should succeed (drop policy) while dialing");
+    }
+
+    // --- Full transport stack integration tests ---
+
+    #[tokio::test]
+    async fn full_stack_passes_packets_and_injects_keepalives() {
+        tokio::time::pause();
+
+        let (local, mut handle) = mock_transport();
+
+        let dialer: Dialer = Box::new(|| Box::pin(async { unreachable!("should not dial") }));
+        let reconnect = Box::new(ReconnectTransport::new(Box::new(local), dialer)) as IpTransport;
+
+        let ka_cfg = KeepAliveConfig {
+            interval: std::time::Duration::from_secs(5),
+            ..Default::default()
+        };
+        let mut stack = KeepAliveTransport::new(reconnect, ka_cfg);
+
+        // Data flows inbound: handle → stack
+        handle.send(vec![10, 20]).unwrap();
+        let pkt = stack.next().await.unwrap().unwrap();
+        assert_eq!(pkt, vec![10, 20]);
+
+        // Data flows outbound: stack → handle
+        Pin::new(&mut stack).send(vec![30, 40]).await.unwrap();
+        let pkt = handle.recv().await.unwrap();
+        assert_eq!(pkt, vec![30, 40]);
+
+        // Advance past keepalive interval
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+
+        // Poll to trigger keepalive injection
+        let _ = futures_util::future::poll_fn(|cx| {
+            let _ = Pin::new(&mut stack).poll_next(cx);
+            Poll::Ready(())
+        })
+        .await;
+
+        // Remote should receive the ICMP keepalive
+        let pkt = tokio::time::timeout(std::time::Duration::from_millis(100), handle.recv())
+            .await
+            .expect("should receive keepalive")
+            .unwrap();
+        assert!(is_icmp_echo_request(&pkt), "expected ICMP echo request");
+    }
+
+    #[tokio::test]
+    async fn full_stack_reconnects_on_close_and_resumes() {
+        tokio::time::pause();
+
+        let (local, handle) = mock_transport();
+
+        let handles: Arc<Mutex<Vec<MockTransportHandle>>> = Arc::new(Mutex::new(Vec::new()));
+        let handles_clone = handles.clone();
+        let dial_count = Arc::new(AtomicUsize::new(0));
+        let dc = dial_count.clone();
+
+        let dialer: Dialer = Box::new(move || {
+            let dc = dc.clone();
+            let handles = handles_clone.clone();
+            Box::pin(async move {
+                dc.fetch_add(1, Ordering::SeqCst);
+                let (new_local, new_handle) = mock_transport();
+                handles.lock().unwrap().push(new_handle);
+                Ok(Box::new(new_local) as IpTransport)
+            })
+        });
+
+        let reconnect = Box::new(ReconnectTransport::new(Box::new(local), dialer)) as IpTransport;
+
+        let ka_cfg = KeepAliveConfig {
+            interval: std::time::Duration::from_secs(5),
+            ..Default::default()
+        };
+        let mut stack = KeepAliveTransport::new(reconnect, ka_cfg);
+
+        // Initial passthrough works
+        handle.send(vec![1, 2, 3]).unwrap();
+        let pkt = stack.next().await.unwrap().unwrap();
+        assert_eq!(pkt, vec![1, 2, 3]);
+
+        // Close the handle to trigger reconnect
+        handle.close();
+
+        // Drive the state machine — poll_next sees None, triggers dial
+        tokio::time::timeout(std::time::Duration::from_millis(100), stack.next()).await.ok();
+
+        assert!(dial_count.load(Ordering::SeqCst) >= 1, "dialer should have been called");
+
+        // Send data via the new handle's transport
+        {
+            let h = handles.lock().unwrap();
+            h[0].send(vec![7, 8, 9]).unwrap();
+        }
+
+        // Data should flow through the new connection
+        let pkt = tokio::time::timeout(std::time::Duration::from_millis(100), stack.next())
+            .await
+            .expect("should receive on new connection")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pkt, vec![7, 8, 9]);
     }
 }
