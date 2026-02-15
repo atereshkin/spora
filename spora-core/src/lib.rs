@@ -17,10 +17,25 @@ use stunclient::StunClient;
 use tokio::net::UdpSocket;
 use url::Url;
 
-const STUN_SERVER: &str = "stun.l.google.com:19302";
+#[derive(Clone)]
+pub struct Config {
+    pub stun_server: String,
+    pub pubsub_host: String,
+    pub pubsub_port: u16,
+}
 
-pub async fn share() -> Result<PeerPort, String> {
-    let pp = match PeerPort::new().await {
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            stun_server: "stun.l.google.com:19302".into(),
+            pubsub_host: "188.166.74.116".into(),
+            pubsub_port: 2334,
+        }
+    }
+}
+
+pub async fn share(config: Config) -> Result<PeerPort, String> {
+    let pp = match PeerPort::new(config).await {
         Ok(pp) => pp,
         Err(e) => return Err(format!("failed to start message subscription: {}", e)),
     };
@@ -31,9 +46,9 @@ pub async fn share() -> Result<PeerPort, String> {
 }
 
 // TODO: needs better error handling
-pub async fn connect(url: Url) -> Result<IpTransport, String> {
-    async fn connect_once(url: &Url) -> Result<IpTransport, String> {
-        let (local_addr, external_addr) = pierce().await?;
+pub async fn connect(url: Url, config: &Config) -> Result<IpTransport, String> {
+    async fn connect_once(url: &Url, stun_server: &str) -> Result<IpTransport, String> {
+        let (local_addr, external_addr) = pierce(stun_server).await?;
         let sock = UdpSocket::bind(local_addr)
             .await
             .map_err(|_| "failed to bind socket")?;
@@ -68,16 +83,18 @@ pub async fn connect(url: Url) -> Result<IpTransport, String> {
         Ok(Box::new(UdpTransport::new(Arc::new(sock), other_end)))
     }
 
-    let initial = connect_once(&url).await?;
+    let initial = connect_once(&url, &config.stun_server).await?;
 
     // Dialer used by the reconnect wrapper: infinite retries; any `None`/`Err` triggers reconnect.
     let url_for_dialer = url.clone();
+    let stun_for_dialer = config.stun_server.clone();
     let dialer = Box::new(move || {
         let url = url_for_dialer.clone();
+        let stun = stun_for_dialer.clone();
 
         // Force `Pin<Box<impl Future>>` -> `Pin<Box<dyn Future>>` coercion.
         let fut: crate::transport::DialFuture = Box::pin(async move {
-            connect_once(&url)
+            connect_once(&url, &stun)
                 .await
                 .map_err(|s| io::Error::new(io::ErrorKind::Other, s))
         });
@@ -92,8 +109,8 @@ pub async fn connect(url: Url) -> Result<IpTransport, String> {
     // Ok(Box::new(ReconnectTransport::new(initial, dialer)))
 }
 
-pub async fn pierce() -> Result<(SocketAddr, SocketAddr), String> {
-    let Some(stun_addr) = STUN_SERVER
+pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), String> {
+    let Some(stun_addr) = stun_server
         .to_socket_addrs()
         .map_err(|e| format!("failed to resolve stun address: {}", e))?
         .filter(|x| x.is_ipv4())

@@ -199,3 +199,95 @@ impl Sink<Vec<u8>> for KeepAliveTransport {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::mock::mock_transport_pair;
+    use futures_util::{SinkExt, StreamExt};
+
+    fn is_icmp_echo_request(pkt: &[u8]) -> bool {
+        // Minimal check: IPv4 (version nibble == 4), protocol == 1 (ICMP), ICMP type == 8 (echo request)
+        pkt.len() >= 24 && (pkt[0] >> 4) == 4 && pkt[9] == 1 && pkt[20] == 8
+    }
+
+    #[tokio::test]
+    async fn keepalive_injects_icmp_after_interval() {
+        tokio::time::pause();
+
+        let (local, mut remote) = mock_transport_pair();
+        let cfg = KeepAliveConfig {
+            interval: std::time::Duration::from_secs(5),
+            ..Default::default()
+        };
+        let mut ka = KeepAliveTransport::new(Box::new(local), cfg);
+
+        // Advance past the keepalive interval
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+
+        // Poll the keepalive transport — it should inject an ICMP packet
+        // We need to poll ka (as Stream) to trigger the keepalive send
+        tokio::time::timeout(std::time::Duration::from_millis(100), async {
+            // poll_next on ka drives poll_maybe_send_keepalive internally
+            let _ = futures_util::future::poll_fn(|cx| {
+                let _ = Pin::new(&mut ka).poll_next(cx);
+                Poll::Ready(())
+            })
+            .await;
+        })
+        .await
+        .unwrap();
+
+        // The remote side should have received the ICMP echo
+        let pkt = tokio::time::timeout(std::time::Duration::from_millis(100), remote.next())
+            .await
+            .expect("should receive keepalive packet")
+            .unwrap()
+            .unwrap();
+        assert!(is_icmp_echo_request(&pkt), "expected ICMP echo request, got {:?}", &pkt[..pkt.len().min(24)]);
+    }
+
+    #[tokio::test]
+    async fn inbound_traffic_resets_keepalive_timer() {
+        tokio::time::pause();
+
+        let (local, mut remote) = mock_transport_pair();
+        let cfg = KeepAliveConfig {
+            interval: std::time::Duration::from_secs(5),
+            ..Default::default()
+        };
+        let mut ka = KeepAliveTransport::new(Box::new(local), cfg);
+
+        // Advance 3 seconds (not yet past the 5s interval)
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+
+        // Send inbound traffic which should reset the timer
+        remote.send(vec![10, 20, 30]).await.unwrap();
+        let pkt = ka.next().await.unwrap().unwrap();
+        assert_eq!(pkt, vec![10, 20, 30]);
+
+        // Advance another 3 seconds (6s total, but only 3s since reset)
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+
+        // Poll — timer should NOT have fired yet (only 3s since reset, need 5s)
+        let result = tokio::time::timeout(std::time::Duration::from_millis(10), remote.next()).await;
+        assert!(result.is_err(), "should not have received keepalive yet (timer was reset)");
+
+        // Advance past the interval from the reset point
+        tokio::time::advance(std::time::Duration::from_secs(3)).await;
+
+        // Now poll ka to trigger the keepalive
+        let _ = futures_util::future::poll_fn(|cx| {
+            let _ = Pin::new(&mut ka).poll_next(cx);
+            Poll::Ready(())
+        })
+        .await;
+
+        let pkt = tokio::time::timeout(std::time::Duration::from_millis(100), remote.next())
+            .await
+            .expect("should receive keepalive after full interval since reset")
+            .unwrap()
+            .unwrap();
+        assert!(is_icmp_echo_request(&pkt));
+    }
+}
+

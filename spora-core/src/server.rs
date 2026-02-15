@@ -10,9 +10,7 @@ use log::{debug, error, info, warn};
 use futures_util::{SinkExt, StreamExt};
 use crate::neg::{FramedNegChannel, NegChannel};
 use crate::transport::{IpTransport, UdpTransport};
-
-const PUBSUB_SERVER: &str = "188.166.74.116";
-const PUBSUB_PORT: u16 = 2334;
+use crate::Config;
 
 async fn connect_socket(local_addr: SocketAddr, remote_addr: &SocketAddr) -> io::Result<UdpSocket> {
     let socket = UdpSocket::bind(local_addr).await?; // TODO: listen on IPv6 as well
@@ -178,6 +176,7 @@ pub struct PeerPort {
     pub key: String,
     pub endpoint: String,
     control_stream: Arc<Mutex<TcpStream>>,
+    config: Config,
 }
 
 impl PeerPort {
@@ -185,24 +184,25 @@ impl PeerPort {
         String::from("abcdef") // TODO
     }
 
-    async fn connect(key: &str) -> io::Result<(TcpStream, String)> {
-        let pubsub = PubSubService::new(PUBSUB_SERVER, PUBSUB_PORT);
+    async fn connect_pubsub(key: &str, config: &Config) -> io::Result<(TcpStream, String)> {
+        let pubsub = PubSubService::new(&config.pubsub_host, config.pubsub_port);
         pubsub.sub(key).await
     }
 
-    pub async fn new() -> io::Result<Self> {
+    pub async fn new(config: Config) -> io::Result<Self> {
         let key = PeerPort::make_key();
-        let (stream, endpoint) = Self::connect(&key).await?;
+        let (stream, endpoint) = Self::connect_pubsub(&key, &config).await?;
         Ok(PeerPort {
             key,
             control_stream: Arc::new(Mutex::new(stream)),
             endpoint,
+            config,
         })
     }
 
     async fn reconnect(&self) -> io::Result<()> {
         let mut guard = self.control_stream.lock().await;
-        let (stream, _) = Self::connect(&self.key).await?;
+        let (stream, _) = Self::connect_pubsub(&self.key, &self.config).await?;
         *guard = stream;
         Ok(())
     }
@@ -214,7 +214,7 @@ impl PeerPort {
         let mut neg_channel = FramedNegChannel::from_tcp_stream(&mut *cstream);
         let tun_endpoint = neg_channel.recv_endpoint().await?;
 
-        let (local_addr, external_addr) = crate::pierce().await.map_err(TunnelError::PierceError)?;
+        let (local_addr, external_addr) = crate::pierce(&self.config.stun_server).await.map_err(TunnelError::PierceError)?;
         neg_channel.send_endpoint(external_addr).await?;
         Ok((local_addr, tun_endpoint))
     }

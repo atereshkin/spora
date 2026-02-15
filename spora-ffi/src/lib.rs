@@ -43,7 +43,7 @@ impl std::fmt::Display for ShareError {
 
 #[uniffi::export]
 pub async fn share() -> Result<String, ShareError> {
-    let handle = RUNTIME.spawn(async move { spora_core::share().await });
+    let handle = RUNTIME.spawn(async move { spora_core::share(spora_core::Config::default()).await });
     match handle.await.unwrap() {
         Ok(result) => Ok(format!("spora://{}/{}", result.endpoint, result.key)),
         Err(e) => Err(ShareError::Generic(e.to_string())),
@@ -72,7 +72,7 @@ pub async fn connect(url: String, tun_fd: RawFd) -> Result<(), ConnectError> {
         return Err(InvalidUrl);
     }
     let handle = RUNTIME.spawn(async move {
-        let transport = spora_core::connect(url)
+        let transport = spora_core::connect(url, &spora_core::Config::default())
             .await
             .map_err(|e| ConnectError::Generic(e))?;
         let tun = unsafe { tokio::fs::File::from_raw_fd(tun_fd) };

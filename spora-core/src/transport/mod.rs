@@ -1,4 +1,6 @@
 pub mod keepalive;
+#[cfg(test)]
+pub mod mock;
 
 use std::future::Future;
 use futures_util::{Sink, Stream};
@@ -254,5 +256,101 @@ impl Sink<Vec<u8>> for ReconnectTransport {
             },
             ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use super::mock::mock_transport_pair;
+    use futures_util::{SinkExt, StreamExt};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn reconnect_passes_packets_through() {
+        let (local, mut remote) = mock_transport_pair();
+        let dialer: Dialer = Box::new(|| Box::pin(async { unreachable!("should not dial") }));
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer);
+
+        // Send from remote, receive on reconnect transport
+        remote.send(vec![1, 2, 3]).await.unwrap();
+        let pkt = rt.next().await.unwrap().unwrap();
+        assert_eq!(pkt, vec![1, 2, 3]);
+
+        // Send through reconnect transport, receive on remote
+        Pin::new(&mut rt).send(vec![4, 5, 6]).await.unwrap();
+        let pkt = remote.next().await.unwrap().unwrap();
+        assert_eq!(pkt, vec![4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn reconnect_redials_on_inner_close() {
+        let (local, remote) = mock_transport_pair();
+        drop(remote); // close the channel so local yields None
+
+        let dial_count = Arc::new(AtomicUsize::new(0));
+        let dc = dial_count.clone();
+
+        let dialer: Dialer = Box::new(move || {
+            let dc = dc.clone();
+            Box::pin(async move {
+                dc.fetch_add(1, Ordering::SeqCst);
+                let (new_local, _keep) = mock_transport_pair();
+                // Leak _keep so the new transport doesn't close immediately
+                Box::leak(Box::new(_keep));
+                Ok(Box::new(new_local) as IpTransport)
+            })
+        });
+
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer);
+
+        // The first poll should see None from the dead inner, dial, and then pend (new transport is idle)
+        tokio::time::timeout(std::time::Duration::from_millis(100), rt.next()).await.ok();
+
+        assert!(dial_count.load(Ordering::SeqCst) >= 1, "dialer should have been called");
+    }
+
+    #[tokio::test]
+    async fn reconnect_retries_after_dial_failure() {
+        tokio::time::pause();
+
+        let (local, remote) = mock_transport_pair();
+        drop(remote); // close channel to trigger reconnect
+
+        let dial_count = Arc::new(AtomicUsize::new(0));
+        let dc = dial_count.clone();
+
+        let dialer: Dialer = Box::new(move || {
+            let dc = dc.clone();
+            Box::pin(async move {
+                let n = dc.fetch_add(1, Ordering::SeqCst);
+                if n < 2 {
+                    Err(io::Error::new(io::ErrorKind::ConnectionRefused, "test failure"))
+                } else {
+                    let (new_local, _keep) = mock_transport_pair();
+                    Box::leak(Box::new(_keep));
+                    Ok(Box::new(new_local) as IpTransport)
+                }
+            })
+        });
+
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer);
+
+        // Drive the transport: it should fail twice, sleep between, then succeed
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                if dial_count.load(Ordering::SeqCst) >= 3 {
+                    break;
+                }
+                // Advance time past the reconnect delay
+                tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_millis(100)).await;
+                // Poll to drive state machine
+                tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+            }
+        })
+        .await
+        .expect("should complete within timeout");
+
+        assert!(dial_count.load(Ordering::SeqCst) >= 3, "dialer should have been called at least 3 times");
     }
 }
