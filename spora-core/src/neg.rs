@@ -1,9 +1,7 @@
 use std::net::SocketAddr;
 use std::str::FromStr;
-use tokio_util::codec::{FramedRead, FramedWrite, LinesCodec, LinesCodecError};
-use log::{error, warn};
-use tokio::net::TcpStream;
-use futures_util::{SinkExt, StreamExt};
+use log::error;
+use tokio::net::UdpSocket;
 use crate::server::TunnelError;
 use crate::server::TunnelError::ProtocolError;
 
@@ -12,52 +10,36 @@ pub trait NegChannel {
     async fn recv_endpoint(&mut self) -> Result<SocketAddr, TunnelError>;
 }
 
-pub struct FramedNegChannel<'a> {
-    reader: FramedRead<tokio::net::tcp::ReadHalf<'a>, LinesCodec>,
-    writer: FramedWrite<tokio::net::tcp::WriteHalf<'a>, LinesCodec>,
+pub struct UdpNegChannel<'a> {
+    socket: &'a UdpSocket,
 }
 
-impl<'a> FramedNegChannel<'a> {
-    pub fn from_tcp_stream(stream: &'a mut TcpStream) -> Self {
-        let (read_half, write_half) = stream.split();
-        let decoder = LinesCodec::new();
-        let reader = FramedRead::new(read_half, decoder);
-        let encoder = LinesCodec::new();
-        let writer = FramedWrite::new(write_half, encoder);
-        FramedNegChannel { reader, writer }
+impl<'a> UdpNegChannel<'a> {
+    pub fn new(socket: &'a UdpSocket) -> Self {
+        UdpNegChannel { socket }
     }
 }
 
-impl<'a> NegChannel for FramedNegChannel<'a> {
+impl<'a> NegChannel for UdpNegChannel<'a> {
     async fn send_endpoint(&mut self, addr: SocketAddr) -> Result<(), TunnelError> {
-        self.writer.send(addr.to_string()).await.map_err(|error| {
-            match error {
-                LinesCodecError::MaxLineLengthExceeded => {
-                    panic!("max line length exceeded when sending endpoint")
-                }
-                LinesCodecError::Io(e) => {
-                    warn!("failed to send endpoint: {}", e);
-                    TunnelError::NegChannelClosed
-                }
-            }
-        })
+        self.socket.send(addr.to_string().as_bytes()).await.map_err(|e| {
+            error!("failed to send endpoint: {}", e);
+            TunnelError::NegChannelClosed
+        })?;
+        Ok(())
     }
 
     async fn recv_endpoint(&mut self) -> Result<SocketAddr, TunnelError> {
-        let frame = match self.reader.next().await {
-            Some(Ok(line)) => line,
-            Some(Err(e)) => return Err(match e {
-                LinesCodecError::MaxLineLengthExceeded => {
-                    error!("max line length exceeded when receiving endpoint, possibly malicious peer");
-                    ProtocolError("Line too long".into())
-                }
-                LinesCodecError::Io(io_err) => {
-                    error!("failed to receive endpoint: {}", io_err);
-                    return Err(TunnelError::NegChannelClosed);
-                }
-            }),
-            None => return Err(TunnelError::NegChannelClosed),
-        };
-        Ok(SocketAddr::from_str(&frame).map_err(|parse_err| { ProtocolError(format!("invalid peer address: {}", parse_err))})?)
+        let mut buf = [0u8; 256];
+        let len = self.socket.recv(&mut buf).await.map_err(|e| {
+            error!("failed to receive endpoint: {}", e);
+            TunnelError::NegChannelClosed
+        })?;
+        let line = std::str::from_utf8(&buf[..len]).map_err(|e| {
+            ProtocolError(format!("invalid UTF-8 in endpoint: {}", e))
+        })?;
+        SocketAddr::from_str(line.trim()).map_err(|e| {
+            ProtocolError(format!("invalid peer address: {}", e))
+        })
     }
 }

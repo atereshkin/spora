@@ -1,118 +1,95 @@
 use std::collections::HashMap;
-use std::sync::{Arc};
-use tokio::io::{
-    AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter, copy_bidirectional,
-};
-use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use std::net::SocketAddr;
+use tokio::net::UdpSocket;
 use clap::Parser;
-use log::{error, info};
+use log::{error, info, warn};
+
+const MSG_SUB: u8 = 0x01;
+const MSG_PUB: u8 = 0x02;
+const RESP_ERROR: u8 = 0xFF;
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
-    // The hostname for "subscriber" connections
+    /// Advertised hostname for publisher connections
     #[arg(required = true)]
-    pub_host: String,
-    // Port to listen on for "subscribers"
-    #[arg(short = 's', long, default_value_t = 2334)]
-    sub_port: u16,
-    // Port to listen on for "publishers"
-    #[arg(short = 'p', long, default_value_t = 2335)]
-    pub_port: u16
+    host: String,
+    /// Port to listen on
+    #[arg(short, long, default_value_t = 2334)]
+    port: u16,
 }
 
 #[tokio::main]
 async fn main() {
     env_logger::init();
     let args = Args::parse();
-    let sub_listener = TcpListener::bind(("0.0.0.0", args.sub_port)).await.unwrap();
-    let pub_listener = TcpListener::bind(("0.0.0.0", args.pub_port)).await.unwrap();
-    let server = Arc::new(PubServer::new(args.pub_host, args.pub_port));
-    {
-        let server = server.clone();
-        tokio::spawn(PubServer::listen_pub(server, pub_listener));
-    }
+    let socket = UdpSocket::bind(("0.0.0.0", args.port))
+        .await
+        .expect("failed to bind UDP socket");
+    let endpoint = format!("{}:{}", args.host, args.port);
+    info!("Relay listening on UDP port {}, advertising {}", args.port, endpoint);
+
+    let mut subscribers: HashMap<Vec<u8>, SocketAddr> = HashMap::new();
+    let mut routes: HashMap<SocketAddr, SocketAddr> = HashMap::new();
+    let mut buf = [0u8; 65535];
+
     loop {
-        let (socket, _) = sub_listener.accept().await.unwrap();
-        let server = server.clone();
-        tokio::spawn(async move {
-             if let Err(e) = server.handle_sub(socket).await {
-                 error!("Error while processing subscriber: {}", e);
+        let (len, src) = match socket.recv_from(&mut buf).await {
+            Ok(r) => r,
+            Err(e) => {
+                error!("recv_from error: {}", e);
+                continue;
             }
-        });
-    }
-}
+        };
 
-struct PubServer {
-    pub_host: String,
-    pub_port: u16,
-    subscribers: Mutex<HashMap<String, TcpStream>>,
-}
-
-impl PubServer {
-    fn new(pub_host: String, pub_port: u16) -> Self {
-        PubServer {
-            pub_host,
-            pub_port,
-            subscribers: Mutex::new(HashMap::new()),
+        if len == 0 {
+            continue;
         }
-    }
-    async fn handle_sub(&self, mut socket: TcpStream) -> std::io::Result<()> {
-        let peer_addr = socket.peer_addr()?;
-        let (reader, writer) = socket.split();
-        let mut reader = BufReader::new(reader);
-        let mut writer = BufWriter::new(writer);
 
-        let mut key = String::new();
-        reader.read_line(&mut key).await?;
-        info!("SUB: {} {}", peer_addr, key);
+        // If this peer is already matched, forward raw
+        if let Some(&dest) = routes.get(&src) {
+            if let Err(e) = socket.send_to(&buf[..len], dest).await {
+                warn!("failed to forward data from {} to {}: {}", src, dest, e);
+            }
+            continue;
+        }
 
-        let mut subscribers = self.subscribers.lock().await;
+        let msg_type = buf[0];
+        let payload = &buf[1..len];
 
-        writer.write_all(format!("{}:{}\n", self.pub_host, self.pub_port).as_ref()).await?;
-        writer.flush().await?;
-        subscribers.insert(key, socket);
-        Ok(())
-    }
-
-    async fn listen_pub(server: Arc<PubServer>, listener: TcpListener) {
-        loop {
-            let (socket, _) = listener.accept().await.unwrap();
-            let server = server.clone();
-            tokio::spawn(async move {
-                if let Err(e) = server.handle_pub(socket).await {
-                    error!("Error while handling publisher: {}", e);
+        match msg_type {
+            MSG_SUB => {
+                let key = payload.to_vec();
+                info!("SUB from {} key={:?}", src, String::from_utf8_lossy(&key));
+                subscribers.insert(key, src);
+                let mut resp = vec![MSG_SUB];
+                resp.extend_from_slice(endpoint.as_bytes());
+                if let Err(e) = socket.send_to(&resp, src).await {
+                    warn!("failed to send SUB_ACK to {}: {}", src, e);
                 }
-            });
-        }
-    }
-
-    async fn handle_pub(&self, mut socket: TcpStream) -> std::io::Result<()> {
-        let peer_addr = socket.peer_addr()?;
-        let (reader, writer) = socket.split();
-        let mut reader = BufReader::new(reader);
-        let mut writer = BufWriter::new(writer);
-        let mut key = String::new();
-        reader.read_line(&mut key).await?;
-        info!("PUB: {} {}", peer_addr, key);
-        let mut subscriber: TcpStream;
-        {
-            let mut subscribers = self.subscribers.lock().await;
-            if let Some(s) = subscribers.remove(&key) {
-                subscriber = s;
-            } else {
-                info!("Unknown subscriber: {}", key);
-                writer.write_all("ERROR: unknown subscriber\n".as_bytes()).await?;
-                writer.flush().await?;
-                return Ok(())
+            }
+            MSG_PUB => {
+                let key = payload.to_vec();
+                info!("PUB from {} key={:?}", src, String::from_utf8_lossy(&key));
+                if let Some(sub_addr) = subscribers.remove(&key) {
+                    routes.insert(src, sub_addr);
+                    routes.insert(sub_addr, src);
+                    if let Err(e) = socket.send_to(&[MSG_PUB], src).await {
+                        warn!("failed to send PUB_ACK to {}: {}", src, e);
+                    }
+                    info!("Matched {} <-> {}", sub_addr, src);
+                } else {
+                    info!("No subscriber for key {:?}", String::from_utf8_lossy(&key));
+                    let mut resp = vec![RESP_ERROR];
+                    resp.extend_from_slice(b"unknown subscriber");
+                    if let Err(e) = socket.send_to(&resp, src).await {
+                        warn!("failed to send ERROR to {}: {}", src, e);
+                    }
+                }
+            }
+            _ => {
+                warn!("Unknown message type 0x{:02x} from unmatched peer {}", msg_type, src);
             }
         }
-        writer.write_all("OK\n".as_bytes()).await?;
-        writer.flush().await?;
-        info!("Starting copy for {}", key);
-        copy_bidirectional(&mut socket, &mut subscriber)
-            .await?;
-        Ok(())
     }
 }

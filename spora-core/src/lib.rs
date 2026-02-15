@@ -3,7 +3,7 @@ mod server;
 mod transport;
 pub mod tun_util;
 
-use crate::neg::{FramedNegChannel, NegChannel};
+use crate::neg::{UdpNegChannel, NegChannel};
 use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
 pub use crate::transport::IpTransport;
 use crate::transport::{ReconnectTransport, UdpTransport};
@@ -81,15 +81,15 @@ async fn connect_once(url: &Url, stun_server: &str) -> Result<(IpTransport, Arc<
         .await
         .map_err(|_| "failed to bind socket")?;
 
-    let mut stream = PubSubService::publish(
+    let relay_socket = PubSubService::publish(
         url.host_str().unwrap(),
         url.port().unwrap(),
         url.path().strip_prefix("/").unwrap(),
     )
     .await
-    .map_err(|_| "failed to publish to pubsub")?;
+    .map_err(|e| format!("failed to publish to pubsub: {}", e))?;
 
-    let mut neg_chan = FramedNegChannel::from_tcp_stream(&mut stream);
+    let mut neg_chan = UdpNegChannel::new(&relay_socket);
     neg_chan
         .send_endpoint(external_addr)
         .await
@@ -210,11 +210,9 @@ mod tests {
 
     #[tokio::test]
     async fn connect_once_fails_on_bad_pubsub() {
-        // Port 1 — nothing listening. pierce will try the real STUN server, so
-        // we use an unreachable STUN to make it fail fast at the pierce stage,
-        // OR we craft a URL that will fail at the pubsub stage.
-        // Easiest: use a valid STUN but an unreachable pubsub host.
-        let url = Url::parse("http://127.0.0.1:1/testkey").unwrap();
+        // UDP send doesn't fail immediately like TCP connect, so this will
+        // timeout at the PUB retry level (~10s) or at our outer timeout (15s).
+        let url = Url::parse("http://192.0.2.1:1/testkey").unwrap();
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(15),
             connect_once(&url, "192.0.2.1:19302"),

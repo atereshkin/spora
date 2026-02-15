@@ -6,7 +6,7 @@ edition = "2021"
 [dependencies]
 netstack-smoltcp = "0.2.0"
 tokio = { version = "1.40.0", features = ["full"] }
-tokio-util = { version = "0.7.17", features = ["codec"] }
+tokio-util = { version = "0.7.17" }
 futures-util = "0.3.31"
 log = "0.4.22"
 socket2 = "0.5.6"

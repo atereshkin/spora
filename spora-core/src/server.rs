@@ -9,7 +9,7 @@ use tokio_util::sync::CancellationToken;
 use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
 use log::{debug, error, info, warn};
 use futures_util::{SinkExt, StreamExt};
-use crate::neg::{FramedNegChannel, NegChannel};
+use crate::neg::{UdpNegChannel, NegChannel};
 use crate::transport::{IpTransport, UdpTransport};
 use crate::Config;
 
@@ -176,7 +176,7 @@ pub enum TunnelError {
 pub struct PeerPort {
     pub key: String,
     pub endpoint: String,
-    control_stream: Arc<Mutex<TcpStream>>,
+    relay_socket: Arc<Mutex<UdpSocket>>,
     config: Config,
 }
 
@@ -185,34 +185,33 @@ impl PeerPort {
         String::from("abcdef") // TODO
     }
 
-    async fn connect_pubsub(key: &str, config: &Config) -> io::Result<(TcpStream, String)> {
+    async fn connect_pubsub(key: &str, config: &Config) -> io::Result<(UdpSocket, String)> {
         let pubsub = PubSubService::new(&config.pubsub_host, config.pubsub_port);
         pubsub.sub(key).await
     }
 
     pub async fn new(config: Config) -> io::Result<Self> {
         let key = PeerPort::make_key();
-        let (stream, endpoint) = Self::connect_pubsub(&key, &config).await?;
+        let (socket, endpoint) = Self::connect_pubsub(&key, &config).await?;
         Ok(PeerPort {
             key,
-            control_stream: Arc::new(Mutex::new(stream)),
+            relay_socket: Arc::new(Mutex::new(socket)),
             endpoint,
             config,
         })
     }
 
     async fn reconnect(&self) -> io::Result<()> {
-        let mut guard = self.control_stream.lock().await;
-        let (stream, _) = Self::connect_pubsub(&self.key, &self.config).await?;
-        *guard = stream;
+        let mut guard = self.relay_socket.lock().await;
+        let (socket, _) = Self::connect_pubsub(&self.key, &self.config).await?;
+        *guard = socket;
         Ok(())
     }
 
     async fn negotiate_endpoints(&self) -> Result<(SocketAddr, SocketAddr), TunnelError> {
-        // read the other endpoint from the control stream, pierce, write our endpoint to control stream
-        let mut cstream = self.control_stream.lock().await;
+        let cstream = self.relay_socket.lock().await;
 
-        let mut neg_channel = FramedNegChannel::from_tcp_stream(&mut *cstream);
+        let mut neg_channel = UdpNegChannel::new(&cstream);
         let tun_endpoint = neg_channel.recv_endpoint().await?;
 
         let (local_addr, external_addr) = crate::pierce(&self.config.stun_server).await.map_err(TunnelError::PierceError)?;
