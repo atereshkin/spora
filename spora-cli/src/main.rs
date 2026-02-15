@@ -49,9 +49,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if url.scheme() != "spora" {
                     panic!("Unsupported scheme {}. Expected a spora:// URL", url.scheme());
                 }
-                let transport = connect(url, &Config::default()).await.unwrap();
+                let result = connect(url, &Config::default()).await.unwrap();
                 let tun = Tun::builder().name("").up().try_build().unwrap();
-                tun_util::start(transport, tun).await?;
+                tun_util::start(result.transport, tun).await?;
             }
         }
     }

@@ -17,6 +17,11 @@ use stunclient::StunClient;
 use tokio::net::UdpSocket;
 use url::Url;
 
+pub struct ConnectResult {
+    pub transport: IpTransport,
+    pub udp_socket: Arc<UdpSocket>,
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub stun_server: String,
@@ -45,7 +50,7 @@ pub async fn share(config: Config) -> Result<PeerPort, String> {
     Ok(pp)
 }
 
-async fn connect_once(url: &Url, stun_server: &str) -> Result<IpTransport, String> {
+async fn connect_once(url: &Url, stun_server: &str) -> Result<(IpTransport, Arc<UdpSocket>), String> {
     let (local_addr, external_addr) = pierce(stun_server).await?;
     let sock = UdpSocket::bind(local_addr)
         .await
@@ -78,12 +83,14 @@ async fn connect_once(url: &Url, stun_server: &str) -> Result<IpTransport, Strin
         .await
         .map_err(|_| "unable to send initial byte")?;
 
-    Ok(Box::new(UdpTransport::new(Arc::new(sock), other_end)))
+    let sock = Arc::new(sock);
+    let sock_ref = sock.clone();
+    Ok((Box::new(UdpTransport::new(sock, other_end)), sock_ref))
 }
 
 // TODO: needs better error handling
-pub async fn connect(url: Url, config: &Config) -> Result<IpTransport, String> {
-    let initial = connect_once(&url, &config.stun_server).await?;
+pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String> {
+    let (initial, udp_socket) = connect_once(&url, &config.stun_server).await?;
 
     // Dialer used by the reconnect wrapper: infinite retries; any `None`/`Err` triggers reconnect.
     let url_for_dialer = url.clone();
@@ -94,9 +101,10 @@ pub async fn connect(url: Url, config: &Config) -> Result<IpTransport, String> {
 
         // Force `Pin<Box<impl Future>>` -> `Pin<Box<dyn Future>>` coercion.
         let fut: crate::transport::DialFuture = Box::pin(async move {
-            connect_once(&url, &stun)
+            let (transport, _) = connect_once(&url, &stun)
                 .await
-                .map_err(|s| io::Error::new(io::ErrorKind::Other, s))
+                .map_err(|s| io::Error::new(io::ErrorKind::Other, s))?;
+            Ok(transport)
         });
 
         fut
@@ -105,8 +113,8 @@ pub async fn connect(url: Url, config: &Config) -> Result<IpTransport, String> {
     let reconnect = Box::new(ReconnectTransport::new(initial, dialer)) as IpTransport;
 
     let keepalive_cfg = KeepAliveConfig::default();
-    Ok(Box::new(KeepAliveTransport::new(reconnect, keepalive_cfg)))
-    // Ok(Box::new(ReconnectTransport::new(initial, dialer)))
+    let transport = Box::new(KeepAliveTransport::new(reconnect, keepalive_cfg));
+    Ok(ConnectResult { transport, udp_socket })
 }
 
 pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), String> {
