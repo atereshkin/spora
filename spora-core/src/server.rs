@@ -3,6 +3,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
+use tokio::task::AbortHandle;
 use pubsub_client::PubSubService;
 use tokio_util::sync::CancellationToken;
 use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
@@ -14,46 +15,81 @@ use crate::transport::relay::relay_connection;
 use crate::transport::upgradable::upgradable_transport;
 use crate::Config;
 
+const EGRESS_CHANNEL_CAPACITY: usize = 512;
+
+/// Guard that aborts a set of tasks when dropped.
+struct AbortOnDrop(Vec<AbortHandle>);
+
+impl Drop for AbortOnDrop {
+    fn drop(&mut self) {
+        for h in &self.0 {
+            h.abort();
+        }
+    }
+}
+
 pub(crate) async fn run_tunnel(transport: IpTransport, stack: Stack) {
     let (mut stack_sink, mut stack_stream) = stack.split();
     let (mut peer_sink, mut peer_stream) = transport.split();
-    loop {
-        tokio::select! {
-            res = peer_stream.next() => {
-                match res {
-                    Some(Ok(v_buf)) => {
-                        if let Err(e) = stack_sink.send(v_buf).await {
-                            error!("Error writing to stack: {}", e);
-                        }
-                    }
-                    Some(Err(e)) => {
-                        error!("Transport read error: {}", e);
-                        break;
-                    }
-                    None => {
-                        info!("Transport stream closed (None).");
-                        break;
+
+    let (egress_tx, mut egress_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(EGRESS_CHANNEL_CAPACITY);
+
+    // Ingress: transport → stack (can .await freely, stack ingress is unbounded)
+    let ingress = tokio::spawn(async move {
+        while let Some(res) = peer_stream.next().await {
+            match res {
+                Ok(v_buf) => {
+                    if let Err(e) = stack_sink.send(v_buf).await {
+                        error!("Error writing to stack: {}", e);
                     }
                 }
-            }
-            res = stack_stream.next() => {
-                match res {
-                    Some(Ok(pkt)) => {
-                        if let Err(e) = peer_sink.send(pkt.to_vec()).await {
-                            error!("Transport write error: {}", e);
-                            break;
-                        }
-                    }
-                    Some(Err(e)) => {
-                        error!("Stack read error: {}", e);
-                    }
-                    None => {
-                        info!("Stack stream closed.");
-                        break;
-                    }
+                Err(e) => {
+                    error!("Transport read error: {}", e);
+                    break;
                 }
             }
         }
+        info!("Transport stream closed.");
+    });
+
+    // Stack drain: stack → bounded channel (never blocks on transport I/O)
+    let drain = tokio::spawn(async move {
+        while let Some(res) = stack_stream.next().await {
+            match res {
+                Ok(pkt) => {
+                    if egress_tx.try_send(pkt.to_vec()).is_err() {
+                        debug!("Egress channel full, dropping packet");
+                    }
+                }
+                Err(e) => {
+                    error!("Stack read error: {}", e);
+                }
+            }
+        }
+        info!("Stack stream closed.");
+    });
+
+    // Egress: bounded channel → transport (can be slow without affecting drain)
+    let egress = tokio::spawn(async move {
+        while let Some(pkt) = egress_rx.recv().await {
+            if let Err(e) = peer_sink.send(pkt).await {
+                error!("Transport write error: {}", e);
+                break;
+            }
+        }
+    });
+
+    let _guard = AbortOnDrop(vec![
+        ingress.abort_handle(),
+        drain.abort_handle(),
+        egress.abort_handle(),
+    ]);
+
+    // Wait until any task finishes — then the guard aborts the rest.
+    tokio::select! {
+        _ = ingress => {}
+        _ = drain => {}
+        _ = egress => {}
     }
 }
 
@@ -172,6 +208,7 @@ pub enum TunnelError {
 /// Blocks until the tunnel ends or `cancel` is triggered.
 pub(crate) async fn start_tunnel(transport: IpTransport, cancel: CancellationToken) -> io::Result<()> {
     let builder = StackBuilder::default()
+        .stack_buffer_size(4096)
         .enable_tcp(true)
         .enable_udp(true)
         .enable_icmp(true);
