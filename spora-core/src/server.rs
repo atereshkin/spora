@@ -4,20 +4,15 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use pubsub_client::PubSubService;
-use tokio::sync::Mutex;
 use tokio_util::sync::CancellationToken;
 use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
 use log::{debug, error, info, warn};
 use futures_util::{SinkExt, StreamExt};
-use crate::neg::{UdpNegChannel, NegChannel};
-use crate::transport::{IpTransport, UdpTransport};
+use crate::transport::IpTransport;
+use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
+use crate::transport::relay::relay_connection;
+use crate::transport::upgradable::upgradable_transport;
 use crate::Config;
-
-async fn connect_socket(local_addr: SocketAddr, remote_addr: &SocketAddr) -> io::Result<UdpSocket> {
-    let socket = UdpSocket::bind(local_addr).await?; // TODO: listen on IPv6 as well
-    socket.send_to(&[123], remote_addr).await?;
-    Ok(socket)
-}
 
 async fn run_tunnel(transport: IpTransport, stack: Stack) {
     let (mut stack_sink, mut stack_stream) = stack.split();
@@ -86,7 +81,7 @@ async fn handle_tcp_streams(mut tcp_listener: TcpListener) {
     }
 }
 
-async fn new_tcp_stream<'a>(addr: SocketAddr) -> std::io::Result<TcpStream> {
+async fn new_tcp_stream(addr: SocketAddr) -> std::io::Result<TcpStream> {
     let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
     socket.set_keepalive(true)?;
     socket.set_nodelay(true)?;
@@ -172,11 +167,53 @@ pub enum TunnelError {
     PierceError(String),
 }
 
-#[derive(Clone)]
+/// Start the virtual IP stack and tunnel with the given transport.
+///
+/// Blocks until the tunnel ends or `cancel` is triggered.
+async fn start_tunnel(transport: IpTransport, cancel: CancellationToken) -> io::Result<()> {
+    let builder = StackBuilder::default()
+        .enable_tcp(true)
+        .enable_udp(true)
+        .enable_icmp(true);
+
+    let (stack, runner, udp_socket, tcp_listener) = builder.build().unwrap();
+    let udp_socket = udp_socket.unwrap();
+    let tcp_listener = tcp_listener.unwrap();
+
+    let runner_handle = runner.map(|r| tokio::spawn(r));
+
+    let w_tunnel = tokio::spawn(run_tunnel(transport, stack));
+    let w_tcp = tokio::spawn(handle_tcp_streams(tcp_listener));
+    let w_udp = tokio::spawn(handle_inbound_datagram(udp_socket));
+
+    let abort_handles = [
+        w_tunnel.abort_handle(),
+        w_tcp.abort_handle(),
+        w_udp.abort_handle(),
+    ];
+    let runner_abort = runner_handle.as_ref().map(|h| h.abort_handle());
+
+    tokio::select! {
+        _ = cancel.cancelled() => {
+            info!("Tunnel cancelled, aborting tasks");
+            for h in &abort_handles {
+                h.abort();
+            }
+            if let Some(h) = runner_abort {
+                h.abort();
+            }
+        }
+        _ = async { tokio::try_join!(w_tunnel, w_tcp, w_udp) } => {}
+    }
+
+    Ok(())
+}
+
 pub struct PeerPort {
     pub key: String,
     pub endpoint: String,
-    relay_socket: Arc<Mutex<UdpSocket>>,
+    /// Socket from the initial subscription — used for the first iteration of run().
+    initial_socket: Option<UdpSocket>,
     config: Config,
 }
 
@@ -195,127 +232,75 @@ impl PeerPort {
         let (socket, endpoint) = Self::connect_pubsub(&key, &config).await?;
         Ok(PeerPort {
             key,
-            relay_socket: Arc::new(Mutex::new(socket)),
             endpoint,
+            initial_socket: Some(socket),
             config,
         })
     }
 
-    async fn reconnect(&self) -> io::Result<()> {
-        let mut guard = self.relay_socket.lock().await;
-        let (socket, _) = Self::connect_pubsub(&self.key, &self.config).await?;
-        *guard = socket;
-        Ok(())
-    }
-
-    async fn negotiate_endpoints(&self) -> Result<(SocketAddr, SocketAddr), TunnelError> {
-        let cstream = self.relay_socket.lock().await;
-
-        let mut neg_channel = UdpNegChannel::new(&cstream);
-        let tun_endpoint = neg_channel.recv_endpoint().await?;
-
-        let (local_addr, external_addr) = crate::pierce(&self.config.stun_server).await.map_err(TunnelError::PierceError)?;
-        neg_channel.send_endpoint(external_addr).await?;
-        Ok((local_addr, tun_endpoint))
-    }
-
-    async fn start_tunnel(local_addr: SocketAddr, tun_endpoint: SocketAddr, cancel: CancellationToken) -> io::Result<()> {
-        let builder = StackBuilder::default()
-            .enable_tcp(true)
-            .enable_udp(true)
-            .enable_icmp(true);
-
-        let (stack, runner, udp_socket, tcp_listener) = builder.build().unwrap();
-        // TODO: handle UDP
-        let udp_socket = udp_socket.unwrap(); // udp enabled
-        let tcp_listener = tcp_listener.unwrap(); // tcp enabled or icmp enabled
-
-        let sock = Arc::new(connect_socket(local_addr, &tun_endpoint).await?);
-
-        let transport = UdpTransport::new(sock.clone(), tun_endpoint);
-
-        let runner_handle = runner.map(|r| tokio::spawn(r));
-
-        let w_tunnel = tokio::spawn(run_tunnel(Box::new(transport), stack));
-        let w_tcp = tokio::spawn(handle_tcp_streams(tcp_listener));
-        let w_udp = tokio::spawn(handle_inbound_datagram(udp_socket));
-
-        let abort_handles = [
-            w_tunnel.abort_handle(),
-            w_tcp.abort_handle(),
-            w_udp.abort_handle(),
-        ];
-        let runner_abort = runner_handle.as_ref().map(|h| h.abort_handle());
-
-        tokio::select! {
-            _ = cancel.cancelled() => {
-                info!("Tunnel cancelled, aborting tasks");
-                for h in &abort_handles {
-                    h.abort();
-                }
-                if let Some(h) = runner_abort {
-                    h.abort();
-                }
-            }
-            _ = async { tokio::try_join!(w_tunnel, w_tcp, w_udp) } => {}
-        }
-
-        Ok(())
-    }
-
-    pub async fn run(&self, cancel: CancellationToken) {
+    pub async fn run(mut self, cancel: CancellationToken) {
         loop {
             debug!("Waiting for peer to connect...");
 
-            let negotiate = tokio::select! {
-                _ = cancel.cancelled() => {
-                    info!("Share session cancelled");
-                    break;
-                }
-                result = self.negotiate_endpoints() => result,
-            };
-
-            match negotiate {
-                Err(TunnelError::NegChannelClosed) =>  {
-                    warn!("Negotiation channel closed, reconnecting...");
-                    loop {
+            // Use the socket from new() on the first iteration,
+            // re-subscribe on subsequent iterations.
+            let relay_socket = if let Some(socket) = self.initial_socket.take() {
+                socket
+            } else {
+                let result = tokio::select! {
+                    _ = cancel.cancelled() => {
+                        info!("Share session cancelled");
+                        break;
+                    }
+                    result = Self::connect_pubsub(&self.key, &self.config) => result,
+                };
+                match result {
+                    Ok((socket, _endpoint)) => socket,
+                    Err(e) => {
+                        warn!("Failed to subscribe to pubsub: {}. Retrying in 5s...", e);
                         tokio::select! {
                             _ = cancel.cancelled() => {
-                                info!("Share session cancelled during reconnect");
+                                info!("Share session cancelled during retry delay");
                                 return;
                             }
-                            result = self.reconnect() => {
-                                match result {
-                                    Ok(()) => break,
-                                    Err(e) => {
-                                        warn!("Failed to reconnect: {}. Retrying in 5 seconds...", e);
-                                        tokio::select! {
-                                            _ = cancel.cancelled() => {
-                                                info!("Share session cancelled during reconnect delay");
-                                                return;
-                                            }
-                                            _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {}
-                                        }
-                                    }
-                                }
-                            }
+                            _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {}
                         }
+                        continue;
                     }
                 }
-                Err(TunnelError::PierceError(str)) => {
-                    error!("Failed to pierce: {}", str);
-                    break;
-                },
-                Err(TunnelError::ProtocolError(str)) => {
-                    warn!("Protocol error: {}", str);
-                },
-                Ok((local_addr, tun_endpoint)) => {
-                    debug!("Peer connected from {}. Starting tunnel", tun_endpoint);
-                    let child_cancel = cancel.child_token();
-                    tokio::spawn(Self::start_tunnel(local_addr, tun_endpoint, child_cancel));
-                    debug!("Tunnel started")
-                },
-            }
+            };
+
+            debug!("Peer connected via relay. Setting up tunnel...");
+
+            // Demux the relay socket into IP transport and signal channel
+            let (relay_transport, signal_channel, demux_handle) =
+                relay_connection(relay_socket);
+
+            // Wrap in upgradable transport
+            let (upgradable, upgrade_sender, router_handle) =
+                upgradable_transport(Box::new(relay_transport));
+
+            // Wrap in keepalive
+            let keepalive_cfg = KeepAliveConfig::default();
+            let transport: IpTransport =
+                Box::new(KeepAliveTransport::new(Box::new(upgradable), keepalive_cfg));
+
+            // Spawn background direct upgrade task
+            let stun_server = self.config.stun_server.clone();
+            let upgrade_task = tokio::spawn(async move {
+                crate::try_direct_upgrade(signal_channel, upgrade_sender, &stun_server).await;
+            });
+
+            // Run the tunnel — blocks until it ends or is cancelled
+            let child_cancel = cancel.child_token();
+            let _ = start_tunnel(transport, child_cancel).await;
+
+            // Clean up background tasks
+            upgrade_task.abort();
+            demux_handle.abort();
+            router_handle.abort();
+
+            debug!("Tunnel ended, looping to wait for next peer");
         }
     }
 }

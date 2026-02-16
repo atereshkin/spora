@@ -1,4 +1,6 @@
 pub mod keepalive;
+pub mod relay;
+pub mod upgradable;
 #[cfg(test)]
 pub mod mock;
 

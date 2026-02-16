@@ -7,7 +7,7 @@ use spora_core::tun_util;
 use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::os::fd::RawFd;
-use std::os::unix::io::{AsRawFd, FromRawFd};
+use std::os::unix::io::FromRawFd;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicI32, Ordering};
 use tokio::runtime::Runtime;
@@ -149,7 +149,7 @@ pub fn connect(url: String, tun_fd: RawFd) -> Result<i32, ConnectError> {
             .map_err(ConnectError::Generic)
     })?;
 
-    let socket_fd = result.udp_socket.as_raw_fd();
+    let socket_fd = result.relay_socket_fd;
 
     // Spawn the tunnel loop in the background.
     let task = RUNTIME.spawn(async move {
