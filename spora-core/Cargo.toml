@@ -14,6 +14,7 @@ stunclient={version = "0.4"}
 pubsub-client={path="../pubsub-client"}
 url = "2.5.7"
 etherparse = "0.16.0"
+rand = "0.8"
 
 [dev-dependencies]
 tokio = { version = "1.40.0", features = ["full", "test-util"] }

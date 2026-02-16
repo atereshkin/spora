@@ -1,6 +1,6 @@
 #[cfg(not(windows))]
 
-use spora_core::{connect, share, tun_util, Config};
+use spora_core::{connect, make_secret_key, share, tun_util, Config};
 use clap::{Parser, Subcommand};
 use tokio_tun::Tun;
 use url::{Url};
@@ -30,7 +30,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let args = Args::parse();
     match args.mode{
         Mode::Share{..} => {
-            let session = share(Config::default()).await?;
+            let key = make_secret_key();
+            let session = share(key, Config::default()).await?;
             println!("Expecting peer negotiation at spora://{}/{}", session.endpoint, session.key);
             println!("Press Ctrl+C to stop sharing.");
             tokio::signal::ctrl_c().await?;

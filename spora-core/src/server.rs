@@ -255,17 +255,12 @@ pub struct PeerPort {
 }
 
 impl PeerPort {
-    fn make_key() -> String {
-        String::from("abcdef") // TODO
-    }
-
     async fn connect_pubsub(key: &str, config: &Config) -> io::Result<(UdpSocket, String)> {
         let pubsub = PubSubService::new(&config.pubsub_host, config.pubsub_port);
         pubsub.sub(key).await
     }
 
-    pub async fn new(config: Config) -> io::Result<Self> {
-        let key = PeerPort::make_key();
+    pub async fn new(key: String, config: Config) -> io::Result<Self> {
         let (socket, endpoint) = Self::connect_pubsub(&key, &config).await?;
         Ok(PeerPort {
             key,

@@ -70,9 +70,14 @@ impl std::fmt::Display for ShareError {
 }
 
 #[uniffi::export]
-pub fn share() -> Result<ShareResult, ShareError> {
+pub fn make_secret_key() -> String {
+    spora_core::make_secret_key()
+}
+
+#[uniffi::export]
+pub fn share(key: String) -> Result<ShareResult, ShareError> {
     let session = RUNTIME
-        .block_on(spora_core::share(spora_core::Config::default()))
+        .block_on(spora_core::share(key, spora_core::Config::default()))
         .map_err(|e| ShareError::Generic(e.to_string()))?;
 
     let url = format!("spora://{}/{}", session.endpoint, session.key);

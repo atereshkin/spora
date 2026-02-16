@@ -65,8 +65,16 @@ impl ShareSession {
     }
 }
 
-pub async fn share(config: Config) -> Result<ShareSession, String> {
-    let pp = match PeerPort::new(config).await {
+/// Generate a random secret key for use with `share()`.
+pub fn make_secret_key() -> String {
+    use rand::Rng;
+    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let mut rng = rand::thread_rng();
+    (0..12).map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char).collect()
+}
+
+pub async fn share(key: String, config: Config) -> Result<ShareSession, String> {
+    let pp = match PeerPort::new(key, config).await {
         Ok(pp) => pp,
         Err(e) => return Err(format!("failed to start message subscription: {}", e)),
     };
@@ -1491,7 +1499,7 @@ mod tests {
         };
 
         // Start sharing (server side) — this subscribes and spawns the tunnel
-        let session = share(config.clone()).await.unwrap();
+        let session = share("testkey".into(), config.clone()).await.unwrap();
         let key = session.key.clone();
 
         // Give the server a moment to set up

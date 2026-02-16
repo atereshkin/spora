@@ -1332,6 +1332,7 @@ dependencies = [
  "log",
  "netstack-smoltcp",
  "pubsub-client",
+ "rand",
  "socket2 0.5.10",
  "stunclient",
  "tokio",
