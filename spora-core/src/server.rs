@@ -14,7 +14,7 @@ use crate::transport::relay::relay_connection;
 use crate::transport::upgradable::upgradable_transport;
 use crate::Config;
 
-async fn run_tunnel(transport: IpTransport, stack: Stack) {
+pub(crate) async fn run_tunnel(transport: IpTransport, stack: Stack) {
     let (mut stack_sink, mut stack_stream) = stack.split();
     let (mut peer_sink, mut peer_stream) = transport.split();
     loop {
@@ -170,7 +170,7 @@ pub enum TunnelError {
 /// Start the virtual IP stack and tunnel with the given transport.
 ///
 /// Blocks until the tunnel ends or `cancel` is triggered.
-async fn start_tunnel(transport: IpTransport, cancel: CancellationToken) -> io::Result<()> {
+pub(crate) async fn start_tunnel(transport: IpTransport, cancel: CancellationToken) -> io::Result<()> {
     let builder = StackBuilder::default()
         .enable_tcp(true)
         .enable_udp(true)
@@ -270,7 +270,7 @@ impl PeerPort {
                 }
             };
 
-            debug!("Peer connected via relay. Setting up tunnel...");
+            debug!("Relay socket ready. Setting up tunnel...");
 
             // Demux the relay socket into IP transport and signal channel
             let (relay_transport, signal_channel, demux_handle) =
@@ -285,10 +285,10 @@ impl PeerPort {
             let transport: IpTransport =
                 Box::new(KeepAliveTransport::new(Box::new(upgradable), keepalive_cfg));
 
-            // Spawn background direct upgrade task
+            // Spawn background direct upgrade task (server = responder).
             let stun_server = self.config.stun_server.clone();
             let upgrade_task = tokio::spawn(async move {
-                crate::try_direct_upgrade(signal_channel, upgrade_sender, &stun_server).await;
+                crate::try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, false).await;
             });
 
             // Run the tunnel — blocks until it ends or is cancelled
