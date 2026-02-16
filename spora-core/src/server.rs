@@ -239,6 +239,8 @@ impl PeerPort {
     }
 
     pub async fn run(mut self, cancel: CancellationToken) {
+        let mut tunnel_cancel: Option<CancellationToken> = None;
+
         loop {
             debug!("Waiting for peer to connect...");
 
@@ -270,7 +272,28 @@ impl PeerPort {
                 }
             };
 
-            debug!("Relay socket ready. Setting up tunnel...");
+            // Wait for a peer to actually connect. peek() reads without consuming,
+            // so relay_connection's demux task will see the same first packet.
+            let mut peek_buf = [0u8; 1];
+            let peek_result = tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("Share session cancelled while waiting for peer");
+                    break;
+                }
+                result = relay_socket.peek(&mut peek_buf) => result,
+            };
+            if peek_result.is_err() {
+                warn!("Relay socket error while waiting for peer. Retrying...");
+                continue;
+            }
+
+            // New peer connected — kick out the previous one.
+            if let Some(tc) = tunnel_cancel.take() {
+                info!("New peer connected, cancelling previous tunnel");
+                tc.cancel();
+            }
+
+            debug!("Peer connected. Setting up tunnel...");
 
             // Demux the relay socket into IP transport and signal channel
             let (relay_transport, signal_channel, demux_handle) =
@@ -291,16 +314,19 @@ impl PeerPort {
                 crate::try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, false).await;
             });
 
-            // Run the tunnel — blocks until it ends or is cancelled
+            // Spawn the tunnel — does NOT block the loop.
             let child_cancel = cancel.child_token();
-            let _ = start_tunnel(transport, child_cancel).await;
+            tunnel_cancel = Some(child_cancel.clone());
 
-            // Clean up background tasks
-            upgrade_task.abort();
-            demux_handle.abort();
-            router_handle.abort();
+            tokio::spawn(async move {
+                let _ = start_tunnel(transport, child_cancel).await;
+                // Clean up background tasks
+                upgrade_task.abort();
+                demux_handle.abort();
+                router_handle.abort();
+            });
 
-            debug!("Tunnel ended, looping to wait for next peer");
+            // Loop immediately to re-subscribe and wait for the next peer.
         }
     }
 }

@@ -5,9 +5,11 @@ pub mod tun_util;
 
 use crate::neg::{NegChannel, SignalNegChannel};
 use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
+use crate::transport::DialFuture;
 pub use crate::transport::IpTransport;
 use crate::transport::relay::{relay_connection, SignalChannel};
 use crate::transport::upgradable::{upgradable_transport, UpgradeSender};
+use crate::transport::ReconnectTransport;
 use crate::transport::UdpTransport;
 use log::{debug, info, warn};
 use pubsub_client::PubSubService;
@@ -76,12 +78,39 @@ pub async fn share(config: Config) -> Result<ShareSession, String> {
     Ok(ShareSession { key, endpoint, cancel, task })
 }
 
+/// Build a relay-based client transport stack and spawn a background upgrade task.
+///
+/// Returns `KeepAlive(Upgradable(Relay))` with a background task attempting
+/// direct UDP upgrade via STUN.
+fn build_client_transport(relay_socket: UdpSocket, stun_server: &str) -> IpTransport {
+    let (relay_transport, signal_channel, demux_handle) = relay_connection(relay_socket);
+
+    let (upgradable, upgrade_sender, router_handle) =
+        upgradable_transport(Box::new(relay_transport));
+
+    let keepalive_cfg = KeepAliveConfig::default();
+    let transport: IpTransport =
+        Box::new(KeepAliveTransport::new(Box::new(upgradable), keepalive_cfg));
+
+    // Spawn background direct upgrade task (client = initiator).
+    // Move demux_handle and router_handle into the task to keep them alive.
+    let stun_server = stun_server.to_string();
+    tokio::spawn(async move {
+        try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, true).await;
+        drop(demux_handle);
+        drop(router_handle);
+    });
+
+    transport
+}
+
 /// Connect to a peer via relay-first tunneling with background direct upgrade.
 ///
 /// 1. Publishes to the relay to get a relay socket
 /// 2. Creates a RelayTransport for immediate IP tunneling
 /// 3. Wraps in UpgradableTransport + KeepAlive
 /// 4. Spawns a background task that tries to establish a direct UDP connection
+/// 5. Wraps in ReconnectTransport to auto-reconnect if the relay connection drops
 pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String> {
     let relay_socket = PubSubService::publish(
         url.host_str().unwrap(),
@@ -99,24 +128,25 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     #[cfg(not(unix))]
     let relay_fd = -1;
 
-    let (relay_transport, signal_channel, demux_handle) = relay_connection(relay_socket);
+    let initial = build_client_transport(relay_socket, &config.stun_server);
 
-    let (upgradable, upgrade_sender, router_handle) =
-        upgradable_transport(Box::new(relay_transport));
-
-    let keepalive_cfg = KeepAliveConfig::default();
-    let transport = Box::new(KeepAliveTransport::new(Box::new(upgradable), keepalive_cfg));
-
-    // Spawn background direct upgrade task (client = initiator).
-    // Move demux_handle and router_handle into the task to keep them alive.
-    let stun_server = config.stun_server.clone();
-    tokio::spawn(async move {
-        try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, true).await;
-        // Keep handles alive until upgrade task ends — dropping them aborts the
-        // background tasks. The router/demux continue as long as this task runs.
-        drop(demux_handle);
-        drop(router_handle);
+    let url_clone = url;
+    let config_clone = config.clone();
+    let dialer: Box<dyn FnMut() -> DialFuture + Send> = Box::new(move || {
+        let url = url_clone.clone();
+        let config = config_clone.clone();
+        Box::pin(async move {
+            let relay_socket = PubSubService::publish(
+                url.host_str().unwrap(),
+                url.port().unwrap(),
+                url.path().strip_prefix("/").unwrap(),
+            )
+            .await?;
+            Ok(build_client_transport(relay_socket, &config.stun_server))
+        })
     });
+
+    let transport = Box::new(ReconnectTransport::new(initial, dialer));
 
     Ok(ConnectResult {
         transport,
@@ -903,6 +933,209 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(received, pkt);
+    }
+
+    // --- Client reconnect tests ---
+
+    /// After the relay connection breaks, a client transport wrapped in
+    /// ReconnectTransport re-publishes to the relay and resumes data flow.
+    ///
+    /// This tests the reconnect mechanism that connect() should use.
+    /// Connection break is simulated by aborting the relay demux handle.
+    #[tokio::test]
+    async fn client_reconnects_through_relay_after_disconnect() {
+        use crate::transport::{DialFuture, ReconnectTransport};
+
+        let relay_addr = start_fake_relay().await;
+        let ka_cfg = KeepAliveConfig {
+            interval: std::time::Duration::from_secs(300),
+            ..Default::default()
+        };
+
+        // --- Round 1: initial connection ---
+
+        let pubsub = PubSubService::new("127.0.0.1", relay_addr.port());
+        let (server_sock, _) = pubsub.sub("testkey").await.unwrap();
+        let client_sock =
+            PubSubService::publish("127.0.0.1", relay_addr.port(), "testkey")
+                .await
+                .unwrap();
+
+        // Server transport
+        let (server_relay, _, _sh) = relay_connection(server_sock);
+        let (server_up, _, _sr) = upgradable_transport(Box::new(server_relay));
+        let mut server1 = KeepAliveTransport::new(Box::new(server_up), ka_cfg);
+
+        // Client transport with ReconnectTransport
+        let (client_relay, _, client_demux) = relay_connection(client_sock);
+        let (client_up, _, _cr) = upgradable_transport(Box::new(client_relay));
+        let client_inner: IpTransport =
+            Box::new(KeepAliveTransport::new(Box::new(client_up), ka_cfg));
+
+        let relay_port = relay_addr.port();
+        let dialer: Box<dyn FnMut() -> DialFuture + Send> = Box::new(move || {
+            let port = relay_port;
+            Box::pin(async move {
+                let sock = PubSubService::publish("127.0.0.1", port, "testkey").await?;
+                let (relay, _, _) = relay_connection(sock);
+                let (up, _, _) = upgradable_transport(Box::new(relay));
+                let ka = KeepAliveConfig {
+                    interval: std::time::Duration::from_secs(300),
+                    ..Default::default()
+                };
+                Ok(Box::new(KeepAliveTransport::new(Box::new(up), ka)) as IpTransport)
+            })
+        });
+
+        let mut client = ReconnectTransport::new(client_inner, dialer);
+
+        // Data flows in round 1
+        let pkt1 = vec![0x45, 0, 0, 20, 1, 2, 3, 4];
+        Pin::new(&mut client).send(pkt1.clone()).await.unwrap();
+        let received = tokio::time::timeout(TIMEOUT, server1.next())
+            .await
+            .expect("round 1: server should receive data")
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, pkt1);
+
+        // --- Break the connection, set up round 2 ---
+
+        // Server re-subscribes FIRST (ready for client's re-publish)
+        drop(server1);
+        let (server_sock2, _) = pubsub.sub("testkey").await.unwrap();
+        let (server_relay2, _, _sh2) = relay_connection(server_sock2);
+        let (server_up2, _, _sr2) = upgradable_transport(Box::new(server_relay2));
+        let mut server2 = KeepAliveTransport::new(Box::new(server_up2), ka_cfg);
+
+        // Break the client's relay connection
+        client_demux.abort();
+
+        // Drive the client to detect break and reconnect:
+        // demux abort → relay None → upgradable None → keepalive None
+        // → ReconnectTransport dials → re-publishes → new connection
+        for _ in 0..5 {
+            tokio::time::timeout(
+                std::time::Duration::from_millis(200),
+                client.next(),
+            )
+            .await
+            .ok();
+        }
+
+        // --- Round 2: data flows through the new connection ---
+
+        let pkt2 = vec![0x45, 0, 0, 20, 5, 6, 7, 8];
+        Pin::new(&mut client).send(pkt2.clone()).await.unwrap();
+        let received = tokio::time::timeout(TIMEOUT, server2.next())
+            .await
+            .expect("round 2: server should receive data after reconnect")
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, pkt2);
+    }
+
+    /// Multiple disconnections and reconnections: the client keeps
+    /// reconnecting and data keeps flowing each time.
+    #[tokio::test]
+    async fn client_survives_multiple_disconnections() {
+        use crate::transport::{DialFuture, ReconnectTransport};
+
+        let relay_addr = start_fake_relay().await;
+        let ka_cfg = KeepAliveConfig {
+            interval: std::time::Duration::from_secs(300),
+            ..Default::default()
+        };
+        let relay_port = relay_addr.port();
+        let pubsub = PubSubService::new("127.0.0.1", relay_port);
+
+        // Server subscribes for round 1
+        let (server_sock, _) = pubsub.sub("testkey").await.unwrap();
+        let client_sock =
+            PubSubService::publish("127.0.0.1", relay_port, "testkey")
+                .await
+                .unwrap();
+
+        // Server transport
+        let (server_relay, _, _sh) = relay_connection(server_sock);
+        let (server_up, _, _sr) = upgradable_transport(Box::new(server_relay));
+        let mut server = KeepAliveTransport::new(Box::new(server_up), ka_cfg);
+
+        // Client transport with ReconnectTransport.
+        // Store demux handles so we can break subsequent connections too.
+        let demux_handles: Arc<std::sync::Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        let (client_relay, _, initial_demux) = relay_connection(client_sock);
+        let (client_up, _, _cr) = upgradable_transport(Box::new(client_relay));
+        let client_inner: IpTransport =
+            Box::new(KeepAliveTransport::new(Box::new(client_up), ka_cfg));
+
+        let dh = demux_handles.clone();
+        let dialer: Box<dyn FnMut() -> DialFuture + Send> = Box::new(move || {
+            let dh = dh.clone();
+            let port = relay_port;
+            Box::pin(async move {
+                let sock = PubSubService::publish("127.0.0.1", port, "testkey").await?;
+                let (relay, _, demux_h) = relay_connection(sock);
+                dh.lock().unwrap().push(demux_h);
+                let (up, _, _) = upgradable_transport(Box::new(relay));
+                let ka = KeepAliveConfig {
+                    interval: std::time::Duration::from_secs(300),
+                    ..Default::default()
+                };
+                Ok(Box::new(KeepAliveTransport::new(Box::new(up), ka)) as IpTransport)
+            })
+        });
+
+        let mut client = ReconnectTransport::new(client_inner, dialer);
+
+        // Round 1: initial data exchange
+        let pkt = vec![0x45, 0, 0, 20, 0, 0, 0, 1];
+        Pin::new(&mut client).send(pkt.clone()).await.unwrap();
+        let received = tokio::time::timeout(TIMEOUT, server.next())
+            .await
+            .expect("round 1: server should receive data")
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, pkt);
+
+        // Rounds 2 and 3: disconnect and reconnect
+        let mut demux_to_abort = initial_demux;
+        for round in 2..=3u8 {
+            // Server re-subscribes
+            drop(server);
+            let (server_sock, _) = pubsub.sub("testkey").await.unwrap();
+            let (sr, _, _sh) = relay_connection(server_sock);
+            let (su, _, _sr) = upgradable_transport(Box::new(sr));
+            server = KeepAliveTransport::new(Box::new(su), ka_cfg);
+
+            // Break the client's current connection
+            demux_to_abort.abort();
+
+            // Drive reconnection
+            for _ in 0..5 {
+                tokio::time::timeout(
+                    std::time::Duration::from_millis(200),
+                    client.next(),
+                )
+                .await
+                .ok();
+            }
+
+            // Data should flow
+            let pkt = vec![0x45, 0, 0, 20, 0, 0, 0, round];
+            Pin::new(&mut client).send(pkt.clone()).await.unwrap();
+            let received = tokio::time::timeout(TIMEOUT, server.next())
+                .await
+                .unwrap_or_else(|_| panic!("round {}: server should receive data", round))
+                .unwrap()
+                .unwrap();
+            assert_eq!(received, pkt, "round {}", round);
+
+            // Get the new demux handle for the next iteration
+            demux_to_abort = demux_handles.lock().unwrap().pop().unwrap();
+        }
     }
 
     // --- Netstack integration tests ---
