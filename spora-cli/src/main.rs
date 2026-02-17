@@ -16,6 +16,8 @@ struct Args {
 #[derive(Subcommand, Debug, Clone)]
 enum Mode {
     Share {
+        /// Use a specific key instead of generating one
+        key: Option<String>,
     },
 
     Use {
@@ -29,8 +31,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     env_logger::init();
     let args = Args::parse();
     match args.mode{
-        Mode::Share{..} => {
-            let key = make_secret_key();
+        Mode::Share{ key } => {
+            let key = key.unwrap_or_else(make_secret_key);
             let session = share(key, Config::default()).await?;
             println!("Expecting peer negotiation at spora://{}/{}", session.endpoint, session.key);
             println!("Press Ctrl+C to stop sharing.");
