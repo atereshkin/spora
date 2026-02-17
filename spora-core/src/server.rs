@@ -289,15 +289,19 @@ impl PeerPort {
 
     pub async fn run(mut self, cancel: CancellationToken) {
         let mut tunnel_cancel: Option<CancellationToken> = None;
+        let mut iteration = 0u32;
 
         loop {
-            debug!("Waiting for peer to connect...");
+            iteration += 1;
+            info!("[share loop #{}] Waiting for peer to connect...", iteration);
 
             // Use the socket from new() on the first iteration,
             // re-subscribe on subsequent iterations.
             let relay_socket = if let Some(socket) = self.initial_socket.take() {
+                info!("[share loop #{}] Using initial socket", iteration);
                 socket
             } else {
+                info!("[share loop #{}] Re-subscribing to pubsub...", iteration);
                 let result = tokio::select! {
                     _ = cancel.cancelled() => {
                         info!("Share session cancelled");
@@ -306,9 +310,12 @@ impl PeerPort {
                     result = Self::connect_pubsub(&self.key, &self.config) => result,
                 };
                 match result {
-                    Ok((socket, _endpoint)) => socket,
+                    Ok((socket, _endpoint)) => {
+                        info!("[share loop #{}] Re-subscription succeeded", iteration);
+                        socket
+                    }
                     Err(e) => {
-                        warn!("Failed to subscribe to pubsub: {}. Retrying in 5s...", e);
+                        warn!("[share loop #{}] Failed to subscribe to pubsub: {}. Retrying in 5s...", iteration, e);
                         tokio::select! {
                             _ = cancel.cancelled() => {
                                 info!("Share session cancelled during retry delay");
@@ -323,26 +330,40 @@ impl PeerPort {
 
             // Wait for a peer to actually connect. peek() reads without consuming,
             // so relay_connection's demux task will see the same first packet.
+            // While waiting, send periodic keepalive packets to the relay to
+            // prevent NAT mapping expiry (mobile carriers expire UDP after ~30s).
+            info!("[share loop #{}] Waiting for peer data (peek)...", iteration);
             let mut peek_buf = [0u8; 1];
-            let peek_result = tokio::select! {
-                _ = cancel.cancelled() => {
-                    info!("Share session cancelled while waiting for peer");
-                    break;
+            let nat_keepalive = tokio::time::sleep(tokio::time::Duration::from_secs(15));
+            tokio::pin!(nat_keepalive);
+            let peek_result: Option<io::Result<usize>> = loop {
+                tokio::select! {
+                    _ = cancel.cancelled() => {
+                        info!("Share session cancelled while waiting for peer");
+                        break None;
+                    }
+                    result = relay_socket.peek(&mut peek_buf) => break Some(result),
+                    _ = &mut nat_keepalive => {
+                        // 0x00 is not a valid IP version nibble nor a relay protocol
+                        // command, so both the relay and peer demux will ignore it.
+                        let _ = relay_socket.send(&[0x00]).await;
+                        nat_keepalive.as_mut().reset(tokio::time::Instant::now() + tokio::time::Duration::from_secs(15));
+                    }
                 }
-                result = relay_socket.peek(&mut peek_buf) => result,
             };
+            let Some(peek_result) = peek_result else { break };
             if peek_result.is_err() {
-                warn!("Relay socket error while waiting for peer. Retrying...");
+                warn!("[share loop #{}] Relay socket error while waiting for peer. Retrying...", iteration);
                 continue;
             }
 
             // New peer connected — kick out the previous one.
             if let Some(tc) = tunnel_cancel.take() {
-                info!("New peer connected, cancelling previous tunnel");
+                info!("[share loop #{}] New peer connected, cancelling previous tunnel", iteration);
                 tc.cancel();
             }
 
-            debug!("Peer connected. Setting up tunnel...");
+            info!("[share loop #{}] Peer connected. Setting up tunnel...", iteration);
 
             // Demux the relay socket into IP transport and signal channel
             let (relay_transport, signal_channel, demux_handle) =

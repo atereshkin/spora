@@ -95,7 +95,11 @@ pub async fn share(key: String, config: Config) -> Result<ShareSession, String> 
     let endpoint = pp.endpoint.clone();
     let cancel = CancellationToken::new();
     let child = cancel.clone();
-    let task = tokio::spawn(async move { pp.run(child).await });
+    let task = tokio::spawn(async move {
+        info!("PeerPort::run task started");
+        pp.run(child).await;
+        info!("PeerPort::run task exited");
+    });
     Ok(ShareSession { key, endpoint, cancel, task })
 }
 

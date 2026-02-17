@@ -87,6 +87,9 @@ async fn main() {
                     }
                 }
             }
+            0x00 => {
+                // NAT keepalive from subscriber — ignore silently
+            }
             _ => {
                 warn!("Unknown message type 0x{:02x} from unmatched peer {}", msg_type, src);
             }
