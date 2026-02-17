@@ -16,6 +16,11 @@ use crate::IpTransport;
 #[derive(Clone, Copy, Debug)]
 pub struct KeepAliveConfig {
     pub interval: std::time::Duration,
+    /// If no inbound packet arrives within this duration, yield `None` to signal
+    /// the peer is gone. This is separate from `interval` because the keepalive
+    /// timer resets on both inbound and outbound traffic, so it can't detect a
+    /// dead peer on its own.
+    pub recv_timeout: std::time::Duration,
     pub src_ip: Ipv4Addr,
     pub dst_ip: Ipv4Addr,
     pub icmp_id: u16,
@@ -25,6 +30,7 @@ impl Default for KeepAliveConfig {
     fn default() -> Self {
         Self {
             interval: std::time::Duration::from_secs(10),
+            recv_timeout: std::time::Duration::from_secs(30),
             src_ip: Ipv4Addr::new(10, 0, 0, 1),
             dst_ip: Ipv4Addr::new(10, 0, 0, 2),
             icmp_id: 0x5350, // 'SP'
@@ -49,6 +55,9 @@ pub struct KeepAliveTransport {
     cfg: KeepAliveConfig,
     seq: u16,
     timer: Pin<Box<Sleep>>,
+    /// Fires when no inbound packet has arrived for `cfg.recv_timeout`.
+    /// Only reset on inbound traffic — outbound/keepalive packets don't count.
+    recv_timer: Pin<Box<Sleep>>,
     send_state: KeepAliveSendState,
 }
 
@@ -56,10 +65,11 @@ impl KeepAliveTransport {
     pub fn new(inner: IpTransport, cfg: KeepAliveConfig) -> Self {
         Self {
             inner,
-            cfg,
             seq: 0,
             timer: Box::pin(sleep(cfg.interval)),
+            recv_timer: Box::pin(sleep(cfg.recv_timeout)),
             send_state: KeepAliveSendState::Idle,
+            cfg,
         }
     }
 
@@ -67,6 +77,12 @@ impl KeepAliveTransport {
         self.timer
             .as_mut()
             .reset(Instant::now() + self.cfg.interval);
+    }
+
+    fn reset_recv_timer(&mut self) {
+        self.recv_timer
+            .as_mut()
+            .reset(Instant::now() + self.cfg.recv_timeout);
     }
 
     fn build_icmp_echo(&mut self) -> Vec<u8> {
@@ -161,7 +177,18 @@ impl Stream for KeepAliveTransport {
         match Pin::new(&mut this.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(pkt))) => {
                 this.reset_timer();
+                this.reset_recv_timer();
                 Poll::Ready(Some(Ok(pkt)))
+            }
+            Poll::Pending => {
+                // No data from inner — check if recv timeout fired (peer is gone).
+                match this.recv_timer.as_mut().poll(cx) {
+                    Poll::Ready(_) => {
+                        warn!("No inbound traffic for {:?}, peer appears dead", this.cfg.recv_timeout);
+                        Poll::Ready(None)
+                    }
+                    Poll::Pending => Poll::Pending,
+                }
             }
             other => other,
         }
@@ -326,6 +353,93 @@ mod tests {
             .expect("should receive keepalive after full interval since outbound reset")
             .unwrap();
         assert!(is_icmp_echo_request(&pkt));
+    }
+
+    #[tokio::test]
+    async fn recv_timeout_yields_none_when_peer_is_silent() {
+        tokio::time::pause();
+
+        let (local, _remote) = mock_transport_pair();
+        let cfg = KeepAliveConfig {
+            interval: std::time::Duration::from_secs(5),
+            recv_timeout: std::time::Duration::from_secs(15),
+            ..Default::default()
+        };
+        let mut ka = KeepAliveTransport::new(Box::new(local), cfg);
+
+        // Advance past the recv_timeout (no inbound traffic)
+        tokio::time::advance(std::time::Duration::from_secs(16)).await;
+
+        // poll_next should return None (peer dead)
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), ka.next()).await;
+        match result {
+            Ok(None) => {} // expected — stream ended
+            other => panic!("expected None (peer dead), got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_timeout_resets_on_inbound_traffic() {
+        tokio::time::pause();
+
+        let (local, mut remote) = mock_transport_pair();
+        let cfg = KeepAliveConfig {
+            interval: std::time::Duration::from_secs(5),
+            recv_timeout: std::time::Duration::from_secs(15),
+            ..Default::default()
+        };
+        let mut ka = KeepAliveTransport::new(Box::new(local), cfg);
+
+        // Advance 10 seconds (within the 15s recv_timeout)
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+
+        // Inbound traffic resets the recv timer
+        remote.send(vec![1, 2, 3]).await.unwrap();
+        let pkt = ka.next().await.unwrap().unwrap();
+        assert_eq!(pkt, vec![1, 2, 3]);
+
+        // Advance another 10 seconds (20s total, but only 10s since last inbound)
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+
+        // Should still be alive — recv timer was reset at t=10
+        let result = tokio::time::timeout(std::time::Duration::from_millis(10), ka.next()).await;
+        assert!(result.is_err(), "should still be pending (recv timer was reset)");
+
+        // Advance past the recv_timeout from the reset point
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), ka.next()).await;
+        match result {
+            Ok(None) => {} // expected — peer dead
+            other => panic!("expected None after recv_timeout, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn recv_timeout_not_reset_by_outbound_traffic() {
+        tokio::time::pause();
+
+        let (local, mut handle) = mock_transport();
+        let cfg = KeepAliveConfig {
+            interval: std::time::Duration::from_secs(5),
+            recv_timeout: std::time::Duration::from_secs(15),
+            ..Default::default()
+        };
+        let mut ka = KeepAliveTransport::new(Box::new(local), cfg);
+
+        // Advance 10 seconds, then send outbound traffic
+        tokio::time::advance(std::time::Duration::from_secs(10)).await;
+        Pin::new(&mut ka).send(vec![1, 2, 3]).await.unwrap();
+        let _ = handle.recv().await; // consume the packet
+
+        // Advance past recv_timeout from start (outbound should NOT have reset it)
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+
+        let result = tokio::time::timeout(std::time::Duration::from_millis(100), ka.next()).await;
+        match result {
+            Ok(None) => {} // expected — outbound didn't reset recv timer
+            other => panic!("expected None (outbound shouldn't reset recv timer), got {:?}", other),
+        }
     }
 }
 
