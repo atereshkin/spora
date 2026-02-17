@@ -22,9 +22,19 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+pub type SocketProtector = Option<Arc<dyn Fn(i32) + Send + Sync>>;
+
+/// Call the protector callback with the socket's raw fd (unix only).
+pub fn protect_socket(protector: &SocketProtector, _socket: &UdpSocket) {
+    #[cfg(unix)]
+    if let Some(ref f) = protector {
+        use std::os::unix::io::AsRawFd;
+        f(_socket.as_raw_fd());
+    }
+}
+
 pub struct ConnectResult {
     pub transport: IpTransport,
-    pub relay_socket_fd: i32,
     pub cancel: CancellationToken,
 }
 
@@ -33,6 +43,7 @@ pub struct Config {
     pub stun_server: String,
     pub pubsub_host: String,
     pub pubsub_port: u16,
+    pub protector: SocketProtector,
 }
 
 impl Default for Config {
@@ -41,6 +52,7 @@ impl Default for Config {
             stun_server: "stun.l.google.com:19302".into(),
             pubsub_host: "188.166.74.116".into(),
             pubsub_port: 2334,
+            protector: None,
         }
     }
 }
@@ -91,7 +103,7 @@ pub async fn share(key: String, config: Config) -> Result<ShareSession, String> 
 ///
 /// Returns `KeepAlive(Upgradable(Relay))` with a background task attempting
 /// direct UDP upgrade via STUN.
-fn build_client_transport(relay_socket: UdpSocket, stun_server: &str, cancel: CancellationToken) -> IpTransport {
+fn build_client_transport(relay_socket: UdpSocket, stun_server: &str, protector: &SocketProtector, cancel: CancellationToken) -> IpTransport {
     let (relay_transport, signal_channel, demux_handle) = relay_connection(relay_socket);
 
     let (upgradable, upgrade_sender, router_handle) =
@@ -104,8 +116,9 @@ fn build_client_transport(relay_socket: UdpSocket, stun_server: &str, cancel: Ca
     // Spawn background direct upgrade task (client = initiator).
     // Move demux_handle and router_handle into the task to keep them alive.
     let stun_server = stun_server.to_string();
+    let protector = protector.clone();
     tokio::spawn(async move {
-        try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, true, cancel).await;
+        try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, true, &protector, cancel).await;
         drop(demux_handle);
         drop(router_handle);
     });
@@ -127,19 +140,12 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         url.host_str().unwrap(),
         url.port().unwrap(),
         url.path().strip_prefix("/").unwrap(),
+        &config.protector,
     )
     .await
     .map_err(|e| format!("failed to publish to pubsub: {}", e))?;
 
-    #[cfg(unix)]
-    let relay_fd = {
-        use std::os::unix::io::AsRawFd;
-        relay_socket.as_raw_fd()
-    };
-    #[cfg(not(unix))]
-    let relay_fd = -1;
-
-    let initial = build_client_transport(relay_socket, &config.stun_server, cancel.clone());
+    let initial = build_client_transport(relay_socket, &config.stun_server, &config.protector, cancel.clone());
 
     let url_clone = url;
     let config_clone = config.clone();
@@ -153,9 +159,10 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
                 url.host_str().unwrap(),
                 url.port().unwrap(),
                 url.path().strip_prefix("/").unwrap(),
+                &config.protector,
             )
             .await?;
-            Ok(build_client_transport(relay_socket, &config.stun_server, cancel))
+            Ok(build_client_transport(relay_socket, &config.stun_server, &config.protector, cancel))
         })
     });
 
@@ -163,7 +170,6 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
 
     Ok(ConnectResult {
         transport,
-        relay_socket_fd: relay_fd,
         cancel,
     })
 }
@@ -179,6 +185,7 @@ pub(crate) async fn try_direct_upgrade(
     upgrade_sender: UpgradeSender,
     stun_server: &str,
     initiator: bool,
+    protector: &SocketProtector,
     cancel: CancellationToken,
 ) {
     loop {
@@ -187,9 +194,9 @@ pub(crate) async fn try_direct_upgrade(
             return;
         }
         let result = if initiator {
-            try_direct_as_initiator(&mut signal, stun_server).await
+            try_direct_as_initiator(&mut signal, stun_server, protector).await
         } else {
-            try_direct_as_responder(&mut signal, stun_server).await
+            try_direct_as_responder(&mut signal, stun_server, protector).await
         };
         match result {
             Ok(transport) => {
@@ -221,8 +228,9 @@ pub(crate) async fn try_direct_upgrade(
 async fn try_direct_as_initiator(
     signal: &mut SignalChannel,
     stun_server: &str,
+    protector: &SocketProtector,
 ) -> Result<IpTransport, String> {
-    let (socket, external_addr) = pierce_keep_socket(stun_server).await?;
+    let (socket, external_addr) = pierce_keep_socket(stun_server, protector).await?;
 
     let mut neg = SignalNegChannel::new(signal);
     neg.send_endpoint(external_addr)
@@ -244,6 +252,7 @@ async fn try_direct_as_initiator(
 async fn try_direct_as_responder(
     signal: &mut SignalChannel,
     stun_server: &str,
+    protector: &SocketProtector,
 ) -> Result<IpTransport, String> {
     let mut neg = SignalNegChannel::new(signal);
 
@@ -253,7 +262,7 @@ async fn try_direct_as_responder(
         .await
         .map_err(|e| format!("failed to receive peer endpoint: {:?}", e))?;
 
-    let (socket, external_addr) = pierce_keep_socket(stun_server).await?;
+    let (socket, external_addr) = pierce_keep_socket(stun_server, protector).await?;
 
     neg.send_endpoint(external_addr)
         .await
@@ -363,6 +372,7 @@ async fn punch_and_confirm(
 /// so it can be reused for the direct connection (same port = same NAT mapping).
 pub async fn pierce_keep_socket(
     stun_server: &str,
+    protector: &SocketProtector,
 ) -> Result<(UdpSocket, SocketAddr), String> {
     let Some(stun_addr) = stun_server
         .to_socket_addrs()
@@ -382,6 +392,7 @@ pub async fn pierce_keep_socket(
                 continue;
             }
         };
+        protect_socket(protector, &udp);
         debug!("Local addr: {}", &local_addr);
 
         let c = StunClient::new(stun_addr);
@@ -398,7 +409,7 @@ pub async fn pierce_keep_socket(
 }
 
 pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), String> {
-    let (socket, external_addr) = pierce_keep_socket(stun_server).await?;
+    let (socket, external_addr) = pierce_keep_socket(stun_server, &None).await?;
     let local_addr = socket
         .local_addr()
         .map_err(|e| format!("failed to get local addr: {}", e))?;
@@ -480,9 +491,9 @@ mod tests {
     /// Helper: subscribe + publish through a fake relay, return matched socket pair.
     async fn matched_relay_pair(relay_addr: SocketAddr) -> (UdpSocket, UdpSocket) {
         let pubsub = PubSubService::new("127.0.0.1", relay_addr.port());
-        let (server_sock, _endpoint) = pubsub.sub("testkey").await.unwrap();
+        let (server_sock, _endpoint) = pubsub.sub("testkey", &None).await.unwrap();
         let client_sock =
-            PubSubService::publish("127.0.0.1", relay_addr.port(), "testkey")
+            PubSubService::publish("127.0.0.1", relay_addr.port(), "testkey", &None)
                 .await
                 .unwrap();
         (server_sock, client_sock)
@@ -790,7 +801,7 @@ mod tests {
 
         // Server subscribes (like PeerPort::new)
         let pubsub = PubSubService::new("127.0.0.1", relay_addr.port());
-        let (server_sock, _) = pubsub.sub("testkey").await.unwrap();
+        let (server_sock, _) = pubsub.sub("testkey", &None).await.unwrap();
 
         // Server immediately builds its full transport stack (like PeerPort::run)
         let (server_relay, _server_sig, _sh) = relay_connection(server_sock);
@@ -808,7 +819,7 @@ mod tests {
 
         // NOW the client publishes (like connect())
         let client_sock =
-            PubSubService::publish("127.0.0.1", relay_addr.port(), "testkey")
+            PubSubService::publish("127.0.0.1", relay_addr.port(), "testkey", &None)
                 .await
                 .unwrap();
         let (client_relay, _client_sig, _ch) = relay_connection(client_sock);
@@ -838,9 +849,9 @@ mod tests {
         let relay_addr = start_fake_relay().await;
 
         let pubsub = PubSubService::new("127.0.0.1", relay_addr.port());
-        let (server_sock, _) = pubsub.sub("testkey").await.unwrap();
+        let (server_sock, _) = pubsub.sub("testkey", &None).await.unwrap();
         let client_sock =
-            PubSubService::publish("127.0.0.1", relay_addr.port(), "testkey")
+            PubSubService::publish("127.0.0.1", relay_addr.port(), "testkey", &None)
                 .await
                 .unwrap();
 
@@ -862,6 +873,7 @@ mod tests {
                 server_upgrade_tx,
                 "192.0.2.1:19302", // unreachable — upgrade will fail
                 false,
+                &None,
                 CancellationToken::new(),
             )
             .await;
@@ -881,6 +893,7 @@ mod tests {
                 client_upgrade_tx,
                 "192.0.2.1:19302",
                 true,
+                &None,
                 CancellationToken::new(),
             )
             .await;
@@ -922,7 +935,7 @@ mod tests {
 
         // Server subscribes
         let pubsub = PubSubService::new("127.0.0.1", relay_addr.port());
-        let (server_sock, _) = pubsub.sub("testkey").await.unwrap();
+        let (server_sock, _) = pubsub.sub("testkey", &None).await.unwrap();
 
         // Server builds its transport
         let (server_relay, _server_sig, _sh) = relay_connection(server_sock);
@@ -945,6 +958,7 @@ mod tests {
             stun_server: "192.0.2.1:19302".into(),
             pubsub_host: "127.0.0.1".into(),
             pubsub_port: relay_addr.port(),
+            protector: None,
         };
         let mut result = connect(url, &config).await.unwrap();
 
@@ -982,9 +996,9 @@ mod tests {
         // --- Round 1: initial connection ---
 
         let pubsub = PubSubService::new("127.0.0.1", relay_addr.port());
-        let (server_sock, _) = pubsub.sub("testkey").await.unwrap();
+        let (server_sock, _) = pubsub.sub("testkey", &None).await.unwrap();
         let client_sock =
-            PubSubService::publish("127.0.0.1", relay_addr.port(), "testkey")
+            PubSubService::publish("127.0.0.1", relay_addr.port(), "testkey", &None)
                 .await
                 .unwrap();
 
@@ -1003,7 +1017,7 @@ mod tests {
         let dialer: Box<dyn FnMut() -> DialFuture + Send> = Box::new(move || {
             let port = relay_port;
             Box::pin(async move {
-                let sock = PubSubService::publish("127.0.0.1", port, "testkey").await?;
+                let sock = PubSubService::publish("127.0.0.1", port, "testkey", &None).await?;
                 let (relay, _, _) = relay_connection(sock);
                 let (up, _, _) = upgradable_transport(Box::new(relay));
                 let ka = KeepAliveConfig {
@@ -1030,7 +1044,7 @@ mod tests {
 
         // Server re-subscribes FIRST (ready for client's re-publish)
         drop(server1);
-        let (server_sock2, _) = pubsub.sub("testkey").await.unwrap();
+        let (server_sock2, _) = pubsub.sub("testkey", &None).await.unwrap();
         let (server_relay2, _, _sh2) = relay_connection(server_sock2);
         let (server_up2, _, _sr2) = upgradable_transport(Box::new(server_relay2));
         let mut server2 = KeepAliveTransport::new(Box::new(server_up2), ka_cfg);
@@ -1077,9 +1091,9 @@ mod tests {
         let pubsub = PubSubService::new("127.0.0.1", relay_port);
 
         // Server subscribes for round 1
-        let (server_sock, _) = pubsub.sub("testkey").await.unwrap();
+        let (server_sock, _) = pubsub.sub("testkey", &None).await.unwrap();
         let client_sock =
-            PubSubService::publish("127.0.0.1", relay_port, "testkey")
+            PubSubService::publish("127.0.0.1", relay_port, "testkey", &None)
                 .await
                 .unwrap();
 
@@ -1103,7 +1117,7 @@ mod tests {
             let dh = dh.clone();
             let port = relay_port;
             Box::pin(async move {
-                let sock = PubSubService::publish("127.0.0.1", port, "testkey").await?;
+                let sock = PubSubService::publish("127.0.0.1", port, "testkey", &None).await?;
                 let (relay, _, demux_h) = relay_connection(sock);
                 dh.lock().unwrap().push(demux_h);
                 let (up, _, _) = upgradable_transport(Box::new(relay));
@@ -1132,7 +1146,7 @@ mod tests {
         for round in 2..=3u8 {
             // Server re-subscribes
             drop(server);
-            let (server_sock, _) = pubsub.sub("testkey").await.unwrap();
+            let (server_sock, _) = pubsub.sub("testkey", &None).await.unwrap();
             let (sr, _, _sh) = relay_connection(server_sock);
             let (su, _, _sr) = upgradable_transport(Box::new(sr));
             server = KeepAliveTransport::new(Box::new(su), ka_cfg);
@@ -1194,7 +1208,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         tokio::spawn(async move {
-            server::start_tunnel(transport, cancel_clone).await.unwrap();
+            server::start_tunnel(transport, None, cancel_clone).await.unwrap();
         });
 
         // Give the netstack a moment to set up
@@ -1251,7 +1265,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let _tunnel_task = tokio::spawn(async move {
-            server::start_tunnel(server_transport, cancel_clone).await.unwrap();
+            server::start_tunnel(server_transport, None, cancel_clone).await.unwrap();
         });
 
         // Drop the signal channel to avoid the responder blocking on recv
@@ -1307,9 +1321,9 @@ mod tests {
 
         // Server subscribes
         let pubsub = PubSubService::new("127.0.0.1", relay_addr.port());
-        let (server_sock, _) = pubsub.sub("testkey").await.unwrap();
+        let (server_sock, _) = pubsub.sub("testkey", &None).await.unwrap();
         let client_sock =
-            PubSubService::publish("127.0.0.1", relay_addr.port(), "testkey")
+            PubSubService::publish("127.0.0.1", relay_addr.port(), "testkey", &None)
                 .await
                 .unwrap();
 
@@ -1328,6 +1342,7 @@ mod tests {
                 server_upgrade_tx,
                 "192.0.2.1:19302",
                 false,
+                &None,
                 CancellationToken::new(),
             )
             .await;
@@ -1336,7 +1351,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let _tunnel_task = tokio::spawn(async move {
-            server::start_tunnel(server_transport, cancel_clone).await.unwrap();
+            server::start_tunnel(server_transport, None, cancel_clone).await.unwrap();
         });
 
         // Client side: exact same code path as connect()
@@ -1353,6 +1368,7 @@ mod tests {
                 client_upgrade_tx,
                 "192.0.2.1:19302",
                 true,
+                &None,
                 CancellationToken::new(),
             )
             .await;
@@ -1434,7 +1450,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let _tunnel_task = tokio::spawn(async move {
-            server::start_tunnel(server_transport, cancel_clone).await.unwrap();
+            server::start_tunnel(server_transport, None, cancel_clone).await.unwrap();
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1517,6 +1533,7 @@ mod tests {
             stun_server: "192.0.2.1:19302".into(), // unreachable — upgrade will fail
             pubsub_host: "127.0.0.1".into(),
             pubsub_port: relay_addr.port(),
+            protector: None,
         };
 
         // Start sharing (server side) — this subscribes and spawns the tunnel
@@ -1607,6 +1624,7 @@ mod tests {
             stun_server: "192.0.2.1:19302".into(),
             pubsub_host: "192.0.2.1".into(),
             pubsub_port: 1,
+            protector: None,
         };
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(15),

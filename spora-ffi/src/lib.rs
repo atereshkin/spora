@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::os::fd::RawFd;
 use std::os::unix::io::FromRawFd;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicI32, Ordering};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
@@ -16,6 +16,12 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 extern crate android_logger;
 use log::{info, LevelFilter};
+
+/// Callback interface that Kotlin implements to protect sockets from VPN routing.
+#[uniffi::export(callback_interface)]
+pub trait SocketProtectorCallback: Send + Sync {
+    fn protect(&self, fd: i32);
+}
 
 static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
@@ -31,7 +37,6 @@ static SESSIONS: Lazy<Mutex<HashMap<i32, TunnelSession>>> =
 struct TunnelSession {
     cancel: CancellationToken,
     task: JoinHandle<()>,
-    socket_fd: RawFd,
 }
 
 struct ShareSessionEntry {
@@ -75,10 +80,22 @@ pub fn make_secret_key() -> String {
     spora_core::make_secret_key()
 }
 
+/// Wrap a UniFFI callback into the closure type that spora-core expects.
+fn wrap_protector(cb: Box<dyn SocketProtectorCallback>) -> spora_core::SocketProtector {
+    let cb = Arc::new(cb);
+    Some(Arc::new(move |fd: i32| {
+        cb.protect(fd);
+    }))
+}
+
 #[uniffi::export]
-pub fn share(key: String) -> Result<ShareResult, ShareError> {
+pub fn share(key: String, protector: Option<Box<dyn SocketProtectorCallback>>) -> Result<ShareResult, ShareError> {
+    let config = spora_core::Config {
+        protector: protector.and_then(wrap_protector),
+        ..spora_core::Config::default()
+    };
     let session = RUNTIME
-        .block_on(spora_core::share(key, spora_core::Config::default()))
+        .block_on(spora_core::share(key, config))
         .map_err(|e| ShareError::Generic(e.to_string()))?;
 
     let url = format!("spora://{}/{}", session.endpoint, session.key);
@@ -136,12 +153,13 @@ impl std::fmt::Display for TunnelError {
 
 /// Establishes a tunnel connection and returns a handle for managing it.
 ///
-/// Blocks until the connection is established (STUN + pubsub negotiation),
+/// Blocks until the connection is established (relay + pubsub negotiation),
 /// then spawns the tunnel loop in the background and returns immediately.
-/// Use `get_tunnel_socket_fd` to obtain the UDP socket for VPN protection,
-/// and `disconnect` to tear down the tunnel.
+/// The `protector` callback is invoked on every new socket fd so that
+/// Android can call `VpnService.protect()` to bypass VPN routing.
+/// Use `disconnect` to tear down the tunnel.
 #[uniffi::export]
-pub fn connect(url: String, tun_fd: RawFd) -> Result<i32, ConnectError> {
+pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCallback>) -> Result<i32, ConnectError> {
     info!("FFI connect() called with tun_fd={}", tun_fd);
 
     let url = Url::parse(&url).map_err(|_| InvalidUrl)?;
@@ -149,17 +167,19 @@ pub fn connect(url: String, tun_fd: RawFd) -> Result<i32, ConnectError> {
         return Err(InvalidUrl);
     }
 
-    // Block until the connection is established so the socket fd is available
-    // immediately after connect() returns.
+    let config = spora_core::Config {
+        protector: wrap_protector(protector),
+        ..spora_core::Config::default()
+    };
+
     let result = RUNTIME.block_on(async {
-        spora_core::connect(url, &spora_core::Config::default())
+        spora_core::connect(url, &config)
             .await
             .map_err(ConnectError::Generic)
     })?;
 
-    let socket_fd = result.relay_socket_fd;
     let cancel = result.cancel;
-    info!("FFI connect(): relay established, relay_fd={}", socket_fd);
+    info!("FFI connect(): relay established");
 
     // Spawn the tunnel loop in the background.
     let task = RUNTIME.spawn(async move {
@@ -176,20 +196,9 @@ pub fn connect(url: String, tun_fd: RawFd) -> Result<i32, ConnectError> {
     SESSIONS
         .lock()
         .unwrap()
-        .insert(handle, TunnelSession { cancel, task, socket_fd });
+        .insert(handle, TunnelSession { cancel, task });
 
     Ok(handle)
-}
-
-/// Returns the raw file descriptor of the tunnel's UDP socket.
-///
-/// On Android, pass this to `VpnService.protect()` to prevent the tunnel
-/// traffic from being routed back through the VPN.
-#[uniffi::export]
-pub fn get_tunnel_socket_fd(handle: i32) -> Result<i32, TunnelError> {
-    let sessions = SESSIONS.lock().unwrap();
-    let session = sessions.get(&handle).ok_or(TunnelError::InvalidHandle)?;
-    Ok(session.socket_fd)
 }
 
 /// Tears down the tunnel associated with the given handle.

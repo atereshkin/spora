@@ -1,5 +1,6 @@
 use std::io;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use tokio::net::UdpSocket;
 use log::debug;
 
@@ -22,8 +23,15 @@ impl<'a> PubSubService<'a> {
 
     /// Subscribe to a key. Returns a UDP socket connected to the relay and the
     /// advertised endpoint string (host:port) for publishers.
-    pub async fn sub(&self, key: &str) -> io::Result<(UdpSocket, String)> {
+    pub async fn sub(&self, key: &str, protector: &Option<Arc<dyn Fn(i32) + Send + Sync>>) -> io::Result<(UdpSocket, String)> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        #[cfg(unix)]
+        if let Some(f) = protector {
+            use std::os::unix::io::AsRawFd;
+            f(socket.as_raw_fd());
+        }
+        #[cfg(not(unix))]
+        let _ = protector;
         let relay_addr: SocketAddr = format!("{}:{}", self.host, self.port)
             .parse()
             .map_err(|e| io::Error::other(format!("bad relay addr: {}", e)))?;
@@ -69,8 +77,15 @@ impl<'a> PubSubService<'a> {
 
     /// Publish to a key. Returns a UDP socket connected to the relay, ready for
     /// raw data exchange with the matched subscriber.
-    pub async fn publish(host: &str, port: u16, key: &str) -> io::Result<UdpSocket> {
+    pub async fn publish(host: &str, port: u16, key: &str, protector: &Option<Arc<dyn Fn(i32) + Send + Sync>>) -> io::Result<UdpSocket> {
         let socket = UdpSocket::bind("0.0.0.0:0").await?;
+        #[cfg(unix)]
+        if let Some(f) = protector {
+            use std::os::unix::io::AsRawFd;
+            f(socket.as_raw_fd());
+        }
+        #[cfg(not(unix))]
+        let _ = protector;
         let relay_addr: SocketAddr = format!("{}:{}", host, port)
             .parse()
             .map_err(|e| io::Error::other(format!("bad relay addr: {}", e)))?;
@@ -125,7 +140,7 @@ mod tests {
         let relay_addr = relay.local_addr().unwrap();
 
         let svc = PubSubService::new("127.0.0.1", relay_addr.port());
-        let handle = tokio::spawn(async move { svc.sub("testkey").await });
+        let handle = tokio::spawn(async move { svc.sub("testkey", &None).await });
 
         // Relay receives SUB, sends back SUB_ACK with endpoint
         let mut buf = [0u8; 256];
@@ -152,7 +167,7 @@ mod tests {
         let relay_addr = relay.local_addr().unwrap();
 
         let handle = tokio::spawn(async move {
-            PubSubService::publish("127.0.0.1", relay_addr.port(), "testkey").await
+            PubSubService::publish("127.0.0.1", relay_addr.port(), "testkey", &None).await
         });
 
         let mut buf = [0u8; 256];

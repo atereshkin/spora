@@ -13,7 +13,7 @@ use crate::transport::IpTransport;
 use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
 use crate::transport::relay::relay_connection;
 use crate::transport::upgradable::upgradable_transport;
-use crate::Config;
+use crate::{Config, SocketProtector};
 
 const EGRESS_CHANNEL_CAPACITY: usize = 512;
 
@@ -93,11 +93,12 @@ pub(crate) async fn run_tunnel(transport: IpTransport, stack: Stack) {
     }
 }
 
-async fn handle_tcp_streams(mut tcp_listener: TcpListener) {
+async fn handle_tcp_streams(mut tcp_listener: TcpListener, protector: SocketProtector) {
     while let Some((mut stream, local, remote)) = tcp_listener.next().await {
+        let protector = protector.clone();
         tokio::spawn(async move {
             info!("new tcp connection: {:?} => {:?}", local, remote);
-            match new_tcp_stream(remote).await {
+            match new_tcp_stream(remote, &protector).await {
                 Ok(mut remote_stream) => {
                     // pipe between two tcp stream
                     match tokio::io::copy_bidirectional(&mut stream, &mut remote_stream).await {
@@ -117,11 +118,19 @@ async fn handle_tcp_streams(mut tcp_listener: TcpListener) {
     }
 }
 
-async fn new_tcp_stream(addr: SocketAddr) -> std::io::Result<TcpStream> {
+async fn new_tcp_stream(addr: SocketAddr, protector: &SocketProtector) -> std::io::Result<TcpStream> {
     let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
     socket.set_keepalive(true)?;
     socket.set_nodelay(true)?;
     socket.set_nonblocking(true)?;
+
+    #[cfg(unix)]
+    if let Some(ref f) = protector {
+        use std::os::unix::io::AsRawFd;
+        f(socket.as_raw_fd());
+    }
+    #[cfg(not(unix))]
+    let _ = protector;
 
     let stream = TcpSocket::from_std_stream(socket.into())
         .connect(addr)
@@ -134,7 +143,7 @@ async fn new_tcp_stream(addr: SocketAddr) -> std::io::Result<TcpStream> {
 struct NATKey(SocketAddr, SocketAddr);
 
 // TODO: the NAT table entries should expire and be cleaned up
-async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket) {
+async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket, protector: SocketProtector) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let (mut read_half, mut write_half) = udp_socket.split();
     tokio::spawn(async move {
@@ -150,7 +159,7 @@ async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket) {
         let sock = if let Some(sock) = sockets.get_mut(&key) {
             sock
         } else {
-            &mut match new_udp_packet(remote).await {
+            &mut match new_udp_packet(remote, &protector).await {
                 Ok(socket) => {
                     let tx = tx.clone();
                     let socket = Arc::new(socket);
@@ -183,9 +192,17 @@ async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket) {
     }
 }
 
-async fn new_udp_packet(addr: SocketAddr) -> std::io::Result<tokio::net::UdpSocket> {
+async fn new_udp_packet(addr: SocketAddr, protector: &SocketProtector) -> std::io::Result<tokio::net::UdpSocket> {
     let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
     socket.set_nonblocking(true)?;
+
+    #[cfg(unix)]
+    if let Some(ref f) = protector {
+        use std::os::unix::io::AsRawFd;
+        f(socket.as_raw_fd());
+    }
+    #[cfg(not(unix))]
+    let _ = protector;
 
     let socket = tokio::net::UdpSocket::from_std(socket.into());
     if let Ok(ref socket) = socket {
@@ -206,7 +223,7 @@ pub enum TunnelError {
 /// Start the virtual IP stack and tunnel with the given transport.
 ///
 /// Blocks until the tunnel ends or `cancel` is triggered.
-pub(crate) async fn start_tunnel(transport: IpTransport, cancel: CancellationToken) -> io::Result<()> {
+pub(crate) async fn start_tunnel(transport: IpTransport, protector: SocketProtector, cancel: CancellationToken) -> io::Result<()> {
     let builder = StackBuilder::default()
         .stack_buffer_size(4096)
         .enable_tcp(true)
@@ -220,8 +237,8 @@ pub(crate) async fn start_tunnel(transport: IpTransport, cancel: CancellationTok
     let runner_handle = runner.map(|r| tokio::spawn(r));
 
     let w_tunnel = tokio::spawn(run_tunnel(transport, stack));
-    let w_tcp = tokio::spawn(handle_tcp_streams(tcp_listener));
-    let w_udp = tokio::spawn(handle_inbound_datagram(udp_socket));
+    let w_tcp = tokio::spawn(handle_tcp_streams(tcp_listener, protector.clone()));
+    let w_udp = tokio::spawn(handle_inbound_datagram(udp_socket, protector));
 
     let abort_handles = [
         w_tunnel.abort_handle(),
@@ -257,7 +274,7 @@ pub struct PeerPort {
 impl PeerPort {
     async fn connect_pubsub(key: &str, config: &Config) -> io::Result<(UdpSocket, String)> {
         let pubsub = PubSubService::new(&config.pubsub_host, config.pubsub_port);
-        pubsub.sub(key).await
+        pubsub.sub(key, &config.protector).await
     }
 
     pub async fn new(key: String, config: Config) -> io::Result<Self> {
@@ -347,12 +364,14 @@ impl PeerPort {
             // Spawn background direct upgrade task (server = responder).
             let stun_server = self.config.stun_server.clone();
             let upgrade_cancel = child_cancel.clone();
+            let protector = self.config.protector.clone();
+            let protector2 = self.config.protector.clone();
             let upgrade_task = tokio::spawn(async move {
-                crate::try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, false, upgrade_cancel).await;
+                crate::try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, false, &protector, upgrade_cancel).await;
             });
 
             tokio::spawn(async move {
-                let _ = start_tunnel(transport, child_cancel).await;
+                let _ = start_tunnel(transport, protector2, child_cancel).await;
                 // Clean up background tasks
                 upgrade_task.abort();
                 demux_handle.abort();
