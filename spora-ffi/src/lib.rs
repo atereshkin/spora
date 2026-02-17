@@ -15,7 +15,7 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 extern crate android_logger;
-use log::LevelFilter;
+use log::{info, LevelFilter};
 
 static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
@@ -142,6 +142,8 @@ impl std::fmt::Display for TunnelError {
 /// and `disconnect` to tear down the tunnel.
 #[uniffi::export]
 pub fn connect(url: String, tun_fd: RawFd) -> Result<i32, ConnectError> {
+    info!("FFI connect() called with tun_fd={}", tun_fd);
+
     let url = Url::parse(&url).map_err(|_| InvalidUrl)?;
     if url.scheme() != "spora" {
         return Err(InvalidUrl);
@@ -157,16 +159,20 @@ pub fn connect(url: String, tun_fd: RawFd) -> Result<i32, ConnectError> {
 
     let socket_fd = result.relay_socket_fd;
     let cancel = result.cancel;
+    info!("FFI connect(): relay established, relay_fd={}", socket_fd);
 
     // Spawn the tunnel loop in the background.
     let task = RUNTIME.spawn(async move {
+        info!("FFI tunnel task: starting with tun_fd={}", tun_fd);
         let tun = unsafe { tokio::fs::File::from_raw_fd(tun_fd) };
-        if let Err(e) = tun_util::start(result.transport, tun).await {
-            log::error!("Tunnel loop exited with error: {}", e);
+        match tun_util::start(result.transport, tun).await {
+            Ok(()) => info!("FFI tunnel task: exited normally"),
+            Err(e) => log::error!("FFI tunnel task: exited with error: {}", e),
         }
     });
 
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    info!("FFI connect(): returning handle={}", handle);
     SESSIONS
         .lock()
         .unwrap()
@@ -189,9 +195,13 @@ pub fn get_tunnel_socket_fd(handle: i32) -> Result<i32, TunnelError> {
 /// Tears down the tunnel associated with the given handle.
 #[uniffi::export]
 pub fn disconnect(handle: i32) -> Result<(), TunnelError> {
+    info!("FFI disconnect() called with handle={}", handle);
     let mut sessions = SESSIONS.lock().unwrap();
     let session = sessions.remove(&handle).ok_or(TunnelError::InvalidHandle)?;
+    info!("FFI disconnect(): cancelling token...");
     session.cancel.cancel();
+    info!("FFI disconnect(): aborting task...");
     session.task.abort();
+    info!("FFI disconnect(): done");
     Ok(())
 }
