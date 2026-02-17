@@ -25,6 +25,7 @@ use url::Url;
 pub struct ConnectResult {
     pub transport: IpTransport,
     pub relay_socket_fd: i32,
+    pub cancel: CancellationToken,
 }
 
 #[derive(Clone)]
@@ -90,7 +91,7 @@ pub async fn share(key: String, config: Config) -> Result<ShareSession, String> 
 ///
 /// Returns `KeepAlive(Upgradable(Relay))` with a background task attempting
 /// direct UDP upgrade via STUN.
-fn build_client_transport(relay_socket: UdpSocket, stun_server: &str) -> IpTransport {
+fn build_client_transport(relay_socket: UdpSocket, stun_server: &str, cancel: CancellationToken) -> IpTransport {
     let (relay_transport, signal_channel, demux_handle) = relay_connection(relay_socket);
 
     let (upgradable, upgrade_sender, router_handle) =
@@ -104,7 +105,7 @@ fn build_client_transport(relay_socket: UdpSocket, stun_server: &str) -> IpTrans
     // Move demux_handle and router_handle into the task to keep them alive.
     let stun_server = stun_server.to_string();
     tokio::spawn(async move {
-        try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, true).await;
+        try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, true, cancel).await;
         drop(demux_handle);
         drop(router_handle);
     });
@@ -120,6 +121,8 @@ fn build_client_transport(relay_socket: UdpSocket, stun_server: &str) -> IpTrans
 /// 4. Spawns a background task that tries to establish a direct UDP connection
 /// 5. Wraps in ReconnectTransport to auto-reconnect if the relay connection drops
 pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String> {
+    let cancel = CancellationToken::new();
+
     let relay_socket = PubSubService::publish(
         url.host_str().unwrap(),
         url.port().unwrap(),
@@ -136,13 +139,15 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     #[cfg(not(unix))]
     let relay_fd = -1;
 
-    let initial = build_client_transport(relay_socket, &config.stun_server);
+    let initial = build_client_transport(relay_socket, &config.stun_server, cancel.clone());
 
     let url_clone = url;
     let config_clone = config.clone();
+    let dialer_cancel = cancel.clone();
     let dialer: Box<dyn FnMut() -> DialFuture + Send> = Box::new(move || {
         let url = url_clone.clone();
         let config = config_clone.clone();
+        let cancel = dialer_cancel.clone();
         Box::pin(async move {
             let relay_socket = PubSubService::publish(
                 url.host_str().unwrap(),
@@ -150,7 +155,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
                 url.path().strip_prefix("/").unwrap(),
             )
             .await?;
-            Ok(build_client_transport(relay_socket, &config.stun_server))
+            Ok(build_client_transport(relay_socket, &config.stun_server, cancel))
         })
     });
 
@@ -159,6 +164,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     Ok(ConnectResult {
         transport,
         relay_socket_fd: relay_fd,
+        cancel,
     })
 }
 
@@ -173,8 +179,13 @@ pub(crate) async fn try_direct_upgrade(
     upgrade_sender: UpgradeSender,
     stun_server: &str,
     initiator: bool,
+    cancel: CancellationToken,
 ) {
     loop {
+        if cancel.is_cancelled() {
+            info!("Direct upgrade cancelled");
+            return;
+        }
         let result = if initiator {
             try_direct_as_initiator(&mut signal, stun_server).await
         } else {
@@ -192,7 +203,13 @@ pub(crate) async fn try_direct_upgrade(
                 warn!("Direct connection attempt failed: {}.", e);
                 if initiator {
                     warn!("Retrying in 15s...");
-                    tokio::time::sleep(std::time::Duration::from_secs(15)).await;
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            info!("Direct upgrade cancelled during retry wait");
+                            return;
+                        }
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                    }
                 }
                 // Responder loops back immediately to wait for the next signal.
             }
@@ -845,6 +862,7 @@ mod tests {
                 server_upgrade_tx,
                 "192.0.2.1:19302", // unreachable — upgrade will fail
                 false,
+                CancellationToken::new(),
             )
             .await;
         });
@@ -863,6 +881,7 @@ mod tests {
                 client_upgrade_tx,
                 "192.0.2.1:19302",
                 true,
+                CancellationToken::new(),
             )
             .await;
         });
@@ -1309,6 +1328,7 @@ mod tests {
                 server_upgrade_tx,
                 "192.0.2.1:19302",
                 false,
+                CancellationToken::new(),
             )
             .await;
         });
@@ -1333,6 +1353,7 @@ mod tests {
                 client_upgrade_tx,
                 "192.0.2.1:19302",
                 true,
+                CancellationToken::new(),
             )
             .await;
         });

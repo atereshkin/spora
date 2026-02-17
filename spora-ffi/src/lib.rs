@@ -29,6 +29,7 @@ static SESSIONS: Lazy<Mutex<HashMap<i32, TunnelSession>>> =
     Lazy::new(|| Mutex::new(HashMap::new()));
 
 struct TunnelSession {
+    cancel: CancellationToken,
     task: JoinHandle<()>,
     socket_fd: RawFd,
 }
@@ -155,6 +156,7 @@ pub fn connect(url: String, tun_fd: RawFd) -> Result<i32, ConnectError> {
     })?;
 
     let socket_fd = result.relay_socket_fd;
+    let cancel = result.cancel;
 
     // Spawn the tunnel loop in the background.
     let task = RUNTIME.spawn(async move {
@@ -168,7 +170,7 @@ pub fn connect(url: String, tun_fd: RawFd) -> Result<i32, ConnectError> {
     SESSIONS
         .lock()
         .unwrap()
-        .insert(handle, TunnelSession { task, socket_fd });
+        .insert(handle, TunnelSession { cancel, task, socket_fd });
 
     Ok(handle)
 }
@@ -189,6 +191,7 @@ pub fn get_tunnel_socket_fd(handle: i32) -> Result<i32, TunnelError> {
 pub fn disconnect(handle: i32) -> Result<(), TunnelError> {
     let mut sessions = SESSIONS.lock().unwrap();
     let session = sessions.remove(&handle).ok_or(TunnelError::InvalidHandle)?;
+    session.cancel.cancel();
     session.task.abort();
     Ok(())
 }

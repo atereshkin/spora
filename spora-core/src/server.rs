@@ -340,15 +340,16 @@ impl PeerPort {
             let transport: IpTransport =
                 Box::new(KeepAliveTransport::new(Box::new(upgradable), keepalive_cfg));
 
-            // Spawn background direct upgrade task (server = responder).
-            let stun_server = self.config.stun_server.clone();
-            let upgrade_task = tokio::spawn(async move {
-                crate::try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, false).await;
-            });
-
             // Spawn the tunnel — does NOT block the loop.
             let child_cancel = cancel.child_token();
             tunnel_cancel = Some(child_cancel.clone());
+
+            // Spawn background direct upgrade task (server = responder).
+            let stun_server = self.config.stun_server.clone();
+            let upgrade_cancel = child_cancel.clone();
+            let upgrade_task = tokio::spawn(async move {
+                crate::try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, false, upgrade_cancel).await;
+            });
 
             tokio::spawn(async move {
                 let _ = start_tunnel(transport, child_cancel).await;
