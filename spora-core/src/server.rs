@@ -4,7 +4,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::task::AbortHandle;
-use pubsub_client::PubSubService;
+use pubsub_client::{PubSubService, SubConnection};
 use tokio_util::sync::CancellationToken;
 use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
 use log::{debug, error, info, warn};
@@ -266,23 +266,24 @@ pub(crate) async fn start_tunnel(transport: IpTransport, protector: SocketProtec
 pub struct PeerPort {
     pub key: String,
     pub endpoint: String,
-    /// Socket from the initial subscription — used for the first iteration of run().
-    initial_socket: Option<UdpSocket>,
+    /// Connection from the initial subscription — used for the first iteration of run().
+    initial_conn: Option<SubConnection>,
     config: Config,
 }
 
 impl PeerPort {
-    async fn connect_pubsub(key: &str, config: &Config) -> io::Result<(UdpSocket, String)> {
+    async fn connect_pubsub(key: &str, config: &Config) -> io::Result<SubConnection> {
         let pubsub = PubSubService::new(&config.pubsub_host, config.pubsub_port);
         pubsub.sub(key, &config.protector).await
     }
 
     pub async fn new(key: String, config: Config) -> io::Result<Self> {
-        let (socket, endpoint) = Self::connect_pubsub(&key, &config).await?;
+        let sub_conn = Self::connect_pubsub(&key, &config).await?;
+        let endpoint = sub_conn.endpoint.clone();
         Ok(PeerPort {
             key,
             endpoint,
-            initial_socket: Some(socket),
+            initial_conn: Some(sub_conn),
             config,
         })
     }
@@ -295,11 +296,11 @@ impl PeerPort {
             iteration += 1;
             info!("[share loop #{}] Waiting for peer to connect...", iteration);
 
-            // Use the socket from new() on the first iteration,
+            // Use the connection from new() on the first iteration,
             // re-subscribe on subsequent iterations.
-            let relay_socket = if let Some(socket) = self.initial_socket.take() {
-                info!("[share loop #{}] Using initial socket", iteration);
-                socket
+            let mut sub_conn = if let Some(conn) = self.initial_conn.take() {
+                info!("[share loop #{}] Using initial connection", iteration);
+                conn
             } else {
                 info!("[share loop #{}] Re-subscribing to pubsub...", iteration);
                 let result = tokio::select! {
@@ -310,9 +311,9 @@ impl PeerPort {
                     result = Self::connect_pubsub(&self.key, &self.config) => result,
                 };
                 match result {
-                    Ok((socket, _endpoint)) => {
+                    Ok(conn) => {
                         info!("[share loop #{}] Re-subscription succeeded", iteration);
-                        socket
+                        conn
                     }
                     Err(e) => {
                         warn!("[share loop #{}] Failed to subscribe to pubsub: {}. Retrying in 5s...", iteration, e);
@@ -328,32 +329,18 @@ impl PeerPort {
                 }
             };
 
-            // Wait for a peer to actually connect. peek() reads without consuming,
-            // so relay_connection's demux task will see the same first packet.
-            // While waiting, send periodic keepalive packets to the relay to
-            // prevent NAT mapping expiry (mobile carriers expire UDP after ~30s).
-            info!("[share loop #{}] Waiting for peer data (peek)...", iteration);
-            let mut peek_buf = [0u8; 1];
-            let nat_keepalive = tokio::time::sleep(tokio::time::Duration::from_secs(15));
-            tokio::pin!(nat_keepalive);
-            let peek_result: Option<io::Result<usize>> = loop {
-                tokio::select! {
-                    _ = cancel.cancelled() => {
-                        info!("Share session cancelled while waiting for peer");
-                        break None;
-                    }
-                    result = relay_socket.peek(&mut peek_buf) => break Some(result),
-                    _ = &mut nat_keepalive => {
-                        // 0x00 is not a valid IP version nibble nor a relay protocol
-                        // command, so both the relay and peer demux will ignore it.
-                        let _ = relay_socket.send(&[0x00]).await;
-                        nat_keepalive.as_mut().reset(tokio::time::Instant::now() + tokio::time::Duration::from_secs(15));
-                    }
+            // Wait for a peer to connect. QUIC keepalives replace manual 0x00 packets.
+            info!("[share loop #{}] Waiting for peer match...", iteration);
+            let match_result = tokio::select! {
+                _ = cancel.cancelled() => {
+                    info!("Share session cancelled while waiting for peer");
+                    break;
                 }
+                result = sub_conn.wait_for_match() => Some(result),
             };
-            let Some(peek_result) = peek_result else { break };
-            if peek_result.is_err() {
-                warn!("[share loop #{}] Relay socket error while waiting for peer. Retrying...", iteration);
+            let Some(match_result) = match_result else { break };
+            if match_result.is_err() {
+                warn!("[share loop #{}] Relay connection error while waiting for peer. Retrying...", iteration);
                 continue;
             }
 
@@ -365,9 +352,9 @@ impl PeerPort {
 
             info!("[share loop #{}] Peer connected. Setting up tunnel...", iteration);
 
-            // Demux the relay socket into IP transport and signal channel
+            // Demux the relay connection into IP transport and signal channel
             let (relay_transport, signal_channel, demux_handle) =
-                relay_connection(relay_socket);
+                relay_connection(sub_conn.connection);
 
             // Wrap in upgradable transport
             let (upgradable, upgrade_sender, router_handle) =

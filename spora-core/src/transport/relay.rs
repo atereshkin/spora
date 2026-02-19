@@ -1,60 +1,57 @@
 use std::io;
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_util::{Sink, Stream};
 use log::{debug, warn};
-use tokio::net::UdpSocket;
+use quinn::Connection;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-/// Prefix byte for signaling messages on the relay socket.
+/// Prefix byte for signaling messages on the relay connection.
 /// IPv4 packets start with 0x45–0x4F so there's no ambiguity.
 pub const SIGNAL_PREFIX: u8 = 0xFE;
 
-/// Split a relay `UdpSocket` into a `RelayTransport` (IP traffic) and a
-/// `SignalChannel` (signaling messages). A background demux task reads from
-/// the socket and dispatches by first byte.
+/// Split a relay `quinn::Connection` into a `RelayTransport` (IP traffic) and a
+/// `SignalChannel` (signaling messages). A background demux task reads datagrams
+/// from the connection and dispatches by first byte.
 pub fn relay_connection(
-    socket: UdpSocket,
+    conn: Connection,
 ) -> (RelayTransport, SignalChannel, JoinHandle<()>) {
-    let socket = Arc::new(socket);
-
     let (ip_tx, ip_rx) = mpsc::unbounded_channel();
     let (signal_tx, signal_rx) = mpsc::unbounded_channel();
 
-    let recv_socket = socket.clone();
+    let recv_conn = conn.clone();
     let handle = tokio::spawn(async move {
-        let mut buf = vec![0u8; 65535];
         loop {
-            match recv_socket.recv(&mut buf).await {
-                Ok(len) if len > 0 => {
-                    if buf[0] == SIGNAL_PREFIX {
+            match recv_conn.read_datagram().await {
+                Ok(data) if !data.is_empty() => {
+                    if data[0] == SIGNAL_PREFIX {
                         // Strip the prefix byte
-                        if signal_tx.send(buf[1..len].to_vec()).is_err() {
+                        if signal_tx.send(data[1..].to_vec()).is_err() {
                             debug!("Signal channel closed, demux task exiting");
                             break;
                         }
-                    } else if ip_tx.send(buf[..len].to_vec()).is_err() {
+                    } else if ip_tx.send(data.to_vec()).is_err() {
                         debug!("IP channel closed, demux task exiting");
                         break;
                     }
                 }
-                Ok(_) => {} // empty packet, ignore
+                Ok(_) => {} // empty datagram, ignore
                 Err(e) => {
-                    warn!("Relay socket recv error: {}", e);
+                    warn!("Relay connection read_datagram error: {}", e);
                     break;
                 }
             }
         }
     });
 
-    let send_socket = socket.clone();
+    let send_conn = conn.clone();
     let transport_sink =
-        futures_util::sink::unfold(send_socket, move |s, pkt: Vec<u8>| async move {
-            s.send(&pkt).await?;
-            Ok::<_, io::Error>(s)
+        futures_util::sink::unfold(send_conn, move |c, pkt: Vec<u8>| async move {
+            c.send_datagram(pkt.into())
+                .map_err(|e| io::Error::other(format!("send_datagram failed: {}", e)))?;
+            Ok::<_, io::Error>(c)
         });
 
     let transport = RelayTransport {
@@ -63,17 +60,17 @@ pub fn relay_connection(
     };
 
     let channel = SignalChannel {
-        socket,
+        conn,
         signal_rx,
     };
 
     (transport, channel, handle)
 }
 
-/// Transport for IP traffic over the relay socket.
+/// Transport for IP traffic over the relay QUIC connection.
 ///
 /// - `Stream`: yields IP packets from the demux channel
-/// - `Sink`: sends raw bytes directly via the socket
+/// - `Sink`: sends raw bytes as datagrams via the connection
 pub struct RelayTransport {
     ip_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     inner_sink: Pin<Box<dyn Sink<Vec<u8>, Error = io::Error> + Send>>,
@@ -111,11 +108,11 @@ impl Sink<Vec<u8>> for RelayTransport {
     }
 }
 
-/// Channel for signaling messages over the relay socket.
+/// Channel for signaling messages over the relay QUIC connection.
 ///
 /// Signaling messages are prefixed with `SIGNAL_PREFIX` (0xFE) on the wire.
 pub struct SignalChannel {
-    socket: Arc<UdpSocket>,
+    conn: Connection,
     signal_rx: mpsc::UnboundedReceiver<Vec<u8>>,
 }
 
@@ -125,7 +122,9 @@ impl SignalChannel {
         let mut msg = Vec::with_capacity(1 + data.len());
         msg.push(SIGNAL_PREFIX);
         msg.extend_from_slice(data);
-        self.socket.send(&msg).await?;
+        self.conn
+            .send_datagram(msg.into())
+            .map_err(|e| io::Error::other(format!("send_datagram failed: {}", e)))?;
         Ok(())
     }
 
@@ -138,30 +137,97 @@ impl SignalChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tokio::net::UdpSocket;
+    use std::sync::Arc;
 
-    /// Helper: create a connected pair of UDP sockets on loopback.
-    async fn loopback_pair() -> (UdpSocket, UdpSocket) {
-        let a = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let b = UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        a.connect(b.local_addr().unwrap()).await.unwrap();
-        b.connect(a.local_addr().unwrap()).await.unwrap();
-        (a, b)
+    /// Helper: create a QUIC loopback connection pair for testing.
+    async fn quic_loopback_pair() -> (Connection, Connection) {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.distinguished_name = rcgen::DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Test CA");
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let relay_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut relay_params = rcgen::CertificateParams::default();
+        relay_params.distinguished_name = rcgen::DistinguishedName::new();
+        relay_params
+            .subject_alt_names
+            .push(rcgen::SanType::DnsName("localhost".try_into().unwrap()));
+        let relay_cert = relay_params
+            .signed_by(&relay_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let cert = rustls::pki_types::CertificateDer::from(relay_cert.der().to_vec());
+        let key = rustls::pki_types::PrivateKeyDer::try_from(relay_key.serialize_der()).unwrap();
+
+        let mut server_crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        server_crypto.alpn_protocols = vec![b"test".to_vec()];
+
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+        ));
+
+        let server_ep =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server_ep.local_addr().unwrap();
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store
+            .add(rustls::pki_types::CertificateDer::from(
+                ca_cert.der().to_vec(),
+            ))
+            .unwrap();
+
+        let mut client_crypto = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![b"test".to_vec()];
+
+        let client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
+        ));
+
+        let mut client_ep =
+            quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_ep.set_default_client_config(client_config);
+
+        let server_task = tokio::spawn(async move {
+            let incoming = server_ep.accept().await.unwrap();
+            incoming.await.unwrap()
+        });
+
+        let client_conn = client_ep
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+
+        let server_conn = server_task.await.unwrap();
+
+        (client_conn, server_conn)
     }
 
     #[tokio::test]
     async fn relay_demux_routes_ip_and_signal() {
-        let (relay_sock, peer_sock) = loopback_pair().await;
-        let (mut transport, mut signal, _handle) = relay_connection(relay_sock);
+        let (client_conn, server_conn) = quic_loopback_pair().await;
+        let (mut transport, mut signal, _handle) = relay_connection(client_conn);
 
-        // Send an IPv4-like packet from peer (first byte 0x45)
+        // Send an IPv4-like packet from peer
         let ip_pkt = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
-        peer_sock.send(&ip_pkt).await.unwrap();
+        server_conn
+            .send_datagram(ip_pkt.clone().into())
+            .unwrap();
 
         // Send a signaling packet from peer
         let mut sig_pkt = vec![SIGNAL_PREFIX];
         sig_pkt.extend_from_slice(b"192.168.1.1:5000");
-        peer_sock.send(&sig_pkt).await.unwrap();
+        server_conn.send_datagram(sig_pkt.into()).unwrap();
 
         // IP packet arrives on transport
         use futures_util::StreamExt;
@@ -173,7 +239,7 @@ mod tests {
         .expect("timeout")
         .unwrap()
         .unwrap();
-        assert_eq!(received, ip_pkt);
+        assert_eq!(received, vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4]);
 
         // Signal arrives on signal channel (prefix stripped)
         let received = tokio::time::timeout(
@@ -188,43 +254,41 @@ mod tests {
 
     #[tokio::test]
     async fn relay_transport_sends_raw() {
-        let (relay_sock, peer_sock) = loopback_pair().await;
-        let (transport, _signal, _handle) = relay_connection(relay_sock);
+        let (client_conn, server_conn) = quic_loopback_pair().await;
+        let (transport, _signal, _handle) = relay_connection(client_conn);
 
         use futures_util::SinkExt;
         let mut transport = transport;
         let data = vec![0x45, 0x00, 0x00, 0x14, 5, 6, 7, 8];
         Pin::new(&mut transport).send(data.clone()).await.unwrap();
 
-        let mut buf = [0u8; 1500];
-        let len = tokio::time::timeout(
+        let received = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            peer_sock.recv(&mut buf),
+            server_conn.read_datagram(),
         )
         .await
         .expect("timeout")
         .unwrap();
-        assert_eq!(&buf[..len], &data);
+        assert_eq!(&received[..], &data);
     }
 
     #[tokio::test]
     async fn signal_channel_roundtrip() {
-        let (relay_sock, peer_sock) = loopback_pair().await;
-        let (_transport, signal, _handle) = relay_connection(relay_sock);
+        let (client_conn, server_conn) = quic_loopback_pair().await;
+        let (_transport, signal, _handle) = relay_connection(client_conn);
 
         // Send signal from our side
         signal.send_signal(b"hello").await.unwrap();
 
         // Peer receives it with prefix
-        let mut buf = [0u8; 1500];
-        let len = tokio::time::timeout(
+        let received = tokio::time::timeout(
             std::time::Duration::from_secs(1),
-            peer_sock.recv(&mut buf),
+            server_conn.read_datagram(),
         )
         .await
         .expect("timeout")
         .unwrap();
-        assert_eq!(buf[0], SIGNAL_PREFIX);
-        assert_eq!(&buf[1..len], b"hello");
+        assert_eq!(received[0], SIGNAL_PREFIX);
+        assert_eq!(&received[1..], b"hello");
     }
 }
