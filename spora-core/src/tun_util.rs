@@ -33,6 +33,9 @@ pub async fn start(mut transport: IpTransport, mut tun: impl AsyncReadExt+AsyncW
                             error!("Error sending packet to remote peer: {}", e);
                         }
                     }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        // Normal for non-blocking TUN fds (Android); just retry.
+                    }
                     Err(e) => {
                         error!("Error reading from tun device: {}", e);
                     }
