@@ -1745,6 +1745,7 @@ dependencies = [
  "quinn",
  "rand 0.8.5",
  "rcgen",
+ "ring",
  "rustls",
  "socket2 0.5.10",
  "stunclient",

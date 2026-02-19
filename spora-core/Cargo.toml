@@ -16,8 +16,9 @@ url = "2.5.7"
 etherparse = "0.16.0"
 rand = "0.8"
 quinn = { workspace = true }
+rustls = { workspace = true }
+rcgen = "0.13"
+ring = "0.17"
 
 [dev-dependencies]
 tokio = { version = "1.40.0", features = ["full", "test-util"] }
-rcgen = "0.13"
-rustls = { workspace = true }

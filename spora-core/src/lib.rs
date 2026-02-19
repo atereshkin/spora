@@ -10,7 +10,7 @@ pub use crate::transport::IpTransport;
 use crate::transport::relay::{relay_connection, SignalChannel};
 use crate::transport::upgradable::{upgradable_transport, UpgradeSender};
 use crate::transport::ReconnectTransport;
-use crate::transport::UdpTransport;
+use crate::transport::quic::{establish_quic_client, establish_quic_server, generate_self_signed_cert};
 use log::{debug, info, warn};
 use pubsub_client::PubSubService;
 use quinn::Connection;
@@ -229,7 +229,8 @@ pub(crate) async fn try_direct_upgrade(
     }
 }
 
-/// Client-initiated: STUN first, send our endpoint, wait for peer's.
+/// Client-initiated (QUIC client): STUN first, send our endpoint, wait for peer's
+/// endpoint and cert fingerprint, then establish QUIC connection.
 async fn try_direct_as_initiator(
     signal: &mut SignalChannel,
     stun_server: &str,
@@ -237,49 +238,76 @@ async fn try_direct_as_initiator(
 ) -> Result<IpTransport, String> {
     let (socket, external_addr) = pierce_keep_socket(stun_server, protector).await?;
 
-    let mut neg = SignalNegChannel::new(signal);
-    neg.send_endpoint(external_addr)
+    let (peer_addr, fingerprint) = {
+        let mut neg = SignalNegChannel::new(signal);
+        neg.send_endpoint(external_addr)
+            .await
+            .map_err(|_| "failed to send endpoint via signal".to_string())?;
+
+        let peer_addr = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            neg.recv_endpoint(),
+        )
         .await
-        .map_err(|_| "failed to send endpoint via signal".to_string())?;
+        .map_err(|_| "timed out waiting for peer endpoint".to_string())?
+        .map_err(|e| format!("failed to receive peer endpoint: {:?}", e))?;
 
-    let peer_addr = tokio::time::timeout(
-        std::time::Duration::from_secs(10),
-        neg.recv_endpoint(),
-    )
-    .await
-    .map_err(|_| "timed out waiting for peer endpoint".to_string())?
-    .map_err(|e| format!("failed to receive peer endpoint: {:?}", e))?;
+        let fingerprint = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            neg.recv_fingerprint(),
+        )
+        .await
+        .map_err(|_| "timed out waiting for peer fingerprint".to_string())?
+        .map_err(|e| format!("failed to receive peer fingerprint: {:?}", e))?;
 
-    punch_and_confirm(socket, peer_addr).await
+        (peer_addr, fingerprint)
+    };
+
+    let socket = punch_and_verify(socket, peer_addr).await?;
+    let transport = establish_quic_client(socket, peer_addr, &fingerprint).await?;
+    Ok(Box::new(transport))
 }
 
-/// Server-side: wait for client's endpoint first, then STUN and respond.
+/// Server-side (QUIC server): wait for client's endpoint first, then STUN, respond
+/// with our endpoint and cert fingerprint, then establish QUIC connection.
 async fn try_direct_as_responder(
     signal: &mut SignalChannel,
     stun_server: &str,
     protector: &SocketProtector,
 ) -> Result<IpTransport, String> {
-    let mut neg = SignalNegChannel::new(signal);
+    let (cert, key, fingerprint) = generate_self_signed_cert();
 
-    // Block until the client sends its endpoint — this is the trigger.
-    let peer_addr = neg
-        .recv_endpoint()
-        .await
-        .map_err(|e| format!("failed to receive peer endpoint: {:?}", e))?;
+    let (peer_addr, socket) = {
+        let mut neg = SignalNegChannel::new(signal);
 
-    let (socket, external_addr) = pierce_keep_socket(stun_server, protector).await?;
+        // Block until the client sends its endpoint — this is the trigger.
+        let peer_addr = neg
+            .recv_endpoint()
+            .await
+            .map_err(|e| format!("failed to receive peer endpoint: {:?}", e))?;
 
-    neg.send_endpoint(external_addr)
-        .await
-        .map_err(|_| "failed to send endpoint via signal".to_string())?;
+        let (socket, external_addr) = pierce_keep_socket(stun_server, protector).await?;
 
-    punch_and_confirm(socket, peer_addr).await
+        neg.send_endpoint(external_addr)
+            .await
+            .map_err(|_| "failed to send endpoint via signal".to_string())?;
+
+        neg.send_fingerprint(&fingerprint)
+            .await
+            .map_err(|_| "failed to send fingerprint via signal".to_string())?;
+
+        (peer_addr, socket)
+    };
+
+    let socket = punch_and_verify(socket, peer_addr).await?;
+    let transport = establish_quic_server(socket, cert, key).await?;
+    Ok(Box::new(transport))
 }
 
 /// Marker for bidirectional verification packets.
 const VERIFY_MARKER: &[u8; 7] = b"SPORA_V";
 
-/// Punch through NAT and verify *bidirectional* connectivity before upgrading.
+/// Punch through NAT and verify *bidirectional* connectivity.
 ///
 /// Phase 1 — punch exchange: send punch packets repeatedly while waiting for the
 /// peer's punch. Repeated sends handle the timing window where one peer's NAT
@@ -288,10 +316,12 @@ const VERIFY_MARKER: &[u8; 7] = b"SPORA_V";
 /// Phase 2 — bidirectional verify: both sides send VERIFY packets. Receiving the
 /// peer's VERIFY proves they also completed phase 1 (i.e. they received our
 /// punch). Only if both phases succeed is the connection truly bidirectional.
-async fn punch_and_confirm(
+///
+/// Returns the raw UDP socket for QUIC wrapping.
+async fn punch_and_verify(
     socket: UdpSocket,
     peer_addr: SocketAddr,
-) -> Result<IpTransport, String> {
+) -> Result<UdpSocket, String> {
     debug!("Direct connection: punching {}", peer_addr);
 
     // Phase 1: Exchange punch packets.
@@ -369,8 +399,7 @@ async fn punch_and_confirm(
         }
     }
 
-    let socket = Arc::new(socket);
-    Ok(Box::new(UdpTransport::new(socket, peer_addr)))
+    Ok(socket)
 }
 
 /// Like `pierce()` but returns the UDP socket along with the addresses,
@@ -1837,5 +1866,123 @@ mod tests {
             Ok(Err(_)) => {}
             Err(_) => {}
         }
+    }
+
+    // --- QUIC P2P transport tests ---
+
+    use crate::transport::quic::{
+        cert_fingerprint, establish_quic_client, establish_quic_server, generate_self_signed_cert,
+    };
+
+    /// Helper: create a localhost UDP socket pair bound to ephemeral ports.
+    async fn quic_socket_pair() -> (tokio::net::UdpSocket, tokio::net::UdpSocket, std::net::SocketAddr, std::net::SocketAddr) {
+        let server_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_sock.local_addr().unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+        (server_sock, client_sock, server_addr, client_addr)
+    }
+
+    #[tokio::test]
+    async fn quic_peer_transport_roundtrip() {
+        let (server_sock, client_sock, server_addr, _client_addr) = quic_socket_pair().await;
+
+        let (cert, key, fingerprint) = generate_self_signed_cert();
+
+        let server_task = tokio::spawn(async move {
+            establish_quic_server(server_sock, cert, key).await.unwrap()
+        });
+
+        let client_task = tokio::spawn(async move {
+            establish_quic_client(client_sock, server_addr, &fingerprint).await.unwrap()
+        });
+
+        let (server_result, client_result) = tokio::join!(server_task, client_task);
+        let mut server_transport = server_result.unwrap();
+        let mut client_transport = client_result.unwrap();
+
+        // Client → Server
+        let pkt1 = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
+        Pin::new(&mut client_transport).send(pkt1.clone()).await.unwrap();
+        let received = tokio::time::timeout(TIMEOUT, server_transport.next())
+            .await
+            .expect("server should receive packet from client")
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, pkt1);
+
+        // Server → Client
+        let pkt2 = vec![0x45, 0x00, 0x00, 0x14, 5, 6, 7, 8];
+        Pin::new(&mut server_transport).send(pkt2.clone()).await.unwrap();
+        let received = tokio::time::timeout(TIMEOUT, client_transport.next())
+            .await
+            .expect("client should receive packet from server")
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, pkt2);
+    }
+
+    #[tokio::test]
+    async fn quic_peer_rejects_wrong_fingerprint() {
+        let (server_sock, client_sock, server_addr, _client_addr) = quic_socket_pair().await;
+
+        let (cert, key, _correct_fp) = generate_self_signed_cert();
+
+        // Generate a different cert to get a different fingerprint
+        let (other_cert, _, _) = generate_self_signed_cert();
+        let wrong_fingerprint = cert_fingerprint(other_cert.as_ref());
+
+        let server_task = tokio::spawn(async move {
+            establish_quic_server(server_sock, cert, key).await
+        });
+
+        let client_result = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            establish_quic_client(client_sock, server_addr, &wrong_fingerprint),
+        ).await;
+
+        // Client should fail due to fingerprint mismatch
+        match client_result {
+            Ok(Ok(_)) => panic!("client should reject wrong fingerprint"),
+            Ok(Err(_)) => {} // expected: handshake failed
+            Err(_) => {}     // timeout is also acceptable
+        }
+
+        // Server may fail too (client resets connection)
+        let _ = server_task.await;
+    }
+
+    #[tokio::test]
+    async fn quic_peer_drops_oversized_datagram() {
+        let (server_sock, client_sock, server_addr, _client_addr) = quic_socket_pair().await;
+
+        let (cert, key, fingerprint) = generate_self_signed_cert();
+
+        let server_task = tokio::spawn(async move {
+            establish_quic_server(server_sock, cert, key).await.unwrap()
+        });
+
+        let client_task = tokio::spawn(async move {
+            establish_quic_client(client_sock, server_addr, &fingerprint).await.unwrap()
+        });
+
+        let (server_result, client_result) = tokio::join!(server_task, client_task);
+        let mut server_transport = server_result.unwrap();
+        let mut client_transport = client_result.unwrap();
+
+        // Send an oversized datagram (2000 bytes, exceeds QUIC datagram limit)
+        let oversized = vec![0u8; 2000];
+        let send_result = Pin::new(&mut client_transport).send(oversized).await;
+        assert!(send_result.is_ok(), "oversized datagram should be silently dropped, not error");
+
+        // Verify transport is still alive by sending a normal-sized packet
+        let normal_pkt = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
+        Pin::new(&mut client_transport).send(normal_pkt.clone()).await.unwrap();
+        let received = tokio::time::timeout(TIMEOUT, server_transport.next())
+            .await
+            .expect("transport should still work after dropping oversized datagram")
+            .unwrap()
+            .unwrap();
+        assert_eq!(received, normal_pkt);
     }
 }
