@@ -1213,6 +1213,442 @@ mod tests {
         cancel.cancel();
     }
 
+    // --- Relay tunnel setup helper ---
+
+    struct TunnelPair {
+        client_transport: KeepAliveTransport,
+        server_cancel: CancellationToken,
+        _handles: Vec<JoinHandle<()>>,
+    }
+
+    async fn setup_relay_tunnel() -> TunnelPair {
+        let (port, crypto) = start_fake_relay();
+        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
+
+        let (server_relay, _server_signal, server_demux) = relay_connection(server_conn);
+        let (server_upgradable, _server_upgrade_tx, server_router) =
+            upgradable_transport(Box::new(server_relay));
+        let ka_cfg = KeepAliveConfig {
+            interval: std::time::Duration::from_secs(300),
+            ..Default::default()
+        };
+        let server_transport: IpTransport =
+            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg));
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let tunnel_handle = tokio::spawn(async move {
+            server::start_tunnel(server_transport, None, cancel_clone).await.unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let (client_relay, _client_signal, client_demux) = relay_connection(client_conn);
+        let (client_upgradable, _client_upgrade_tx, client_router) =
+            upgradable_transport(Box::new(client_relay));
+        let client_transport = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
+
+        TunnelPair {
+            client_transport,
+            server_cancel: cancel,
+            _handles: vec![tunnel_handle, server_demux, server_router, client_demux, client_router],
+        }
+    }
+
+    // --- Raw TCP client for packet-level handshake + data ---
+
+    struct RawTcpClient {
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        seq: u32,
+        ack: u32,
+    }
+
+    impl RawTcpClient {
+        fn new(src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16) -> Self {
+            Self {
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+                seq: 1000,
+                ack: 0,
+            }
+        }
+
+        fn build_syn(&mut self) -> Vec<u8> {
+            let mut pkt = Vec::new();
+            etherparse::PacketBuilder::ipv4(self.src_ip, self.dst_ip, 64)
+                .tcp(self.src_port, self.dst_port, self.seq, 65535)
+                .syn()
+                .write(&mut pkt, &[])
+                .unwrap();
+            self.seq += 1; // SYN consumes one sequence number
+            pkt
+        }
+
+        fn process_syn_ack(&mut self, pkt: &[u8]) {
+            let parsed = etherparse::SlicedPacket::from_ip(pkt).unwrap();
+            if let Some(etherparse::TransportSlice::Tcp(tcp)) = parsed.transport {
+                self.ack = tcp.sequence_number() + 1;
+            }
+        }
+
+        fn build_ack(&self) -> Vec<u8> {
+            let mut pkt = Vec::new();
+            etherparse::PacketBuilder::ipv4(self.src_ip, self.dst_ip, 64)
+                .tcp(self.src_port, self.dst_port, self.seq, 65535)
+                .ack(self.ack)
+                .write(&mut pkt, &[])
+                .unwrap();
+            pkt
+        }
+
+        fn build_data(&mut self, payload: &[u8]) -> Vec<u8> {
+            let mut pkt = Vec::new();
+            etherparse::PacketBuilder::ipv4(self.src_ip, self.dst_ip, 64)
+                .tcp(self.src_port, self.dst_port, self.seq, 65535)
+                .ack(self.ack)
+                .psh()
+                .write(&mut pkt, payload)
+                .unwrap();
+            self.seq += payload.len() as u32;
+            pkt
+        }
+
+        fn build_fin(&mut self) -> Vec<u8> {
+            let mut pkt = Vec::new();
+            etherparse::PacketBuilder::ipv4(self.src_ip, self.dst_ip, 64)
+                .tcp(self.src_port, self.dst_port, self.seq, 65535)
+                .ack(self.ack)
+                .fin()
+                .write(&mut pkt, &[])
+                .unwrap();
+            self.seq += 1; // FIN consumes one sequence number
+            pkt
+        }
+
+        /// Parse a TCP response, update ack number, return payload bytes (if any).
+        fn process_response(&mut self, pkt: &[u8]) -> Vec<u8> {
+            let parsed = etherparse::SlicedPacket::from_ip(pkt).unwrap();
+            if let Some(etherparse::TransportSlice::Tcp(tcp)) = parsed.transport {
+                let payload = tcp.payload().to_vec();
+                let seg_len = payload.len() as u32
+                    + if tcp.syn() { 1 } else { 0 }
+                    + if tcp.fin() { 1 } else { 0 };
+                if seg_len > 0 {
+                    self.ack = tcp.sequence_number() + seg_len;
+                }
+                payload
+            } else {
+                Vec::new()
+            }
+        }
+    }
+
+    // --- Packet filter helpers ---
+
+    async fn recv_tcp(transport: &mut KeepAliveTransport, timeout: std::time::Duration) -> Vec<u8> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                match transport.next().await {
+                    Some(Ok(pkt)) if pkt.len() >= 20 && (pkt[0] >> 4) == 4 && pkt[9] == 6 => {
+                        return pkt;
+                    }
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => panic!("transport error: {}", e),
+                    None => panic!("transport closed"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for TCP packet")
+    }
+
+    async fn recv_udp_pkt(transport: &mut KeepAliveTransport, timeout: std::time::Duration) -> Vec<u8> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                match transport.next().await {
+                    Some(Ok(pkt)) if pkt.len() >= 20 && (pkt[0] >> 4) == 4 && pkt[9] == 17 => {
+                        return pkt;
+                    }
+                    Some(Ok(_)) => continue,
+                    Some(Err(e)) => panic!("transport error: {}", e),
+                    None => panic!("transport closed"),
+                }
+            }
+        })
+        .await
+        .expect("timed out waiting for UDP packet")
+    }
+
+    // --- End-to-end integration tests ---
+
+    #[tokio::test]
+    async fn tcp_echo_through_relay_tunnel() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener as TokioTcpListener;
+
+        // Start a real TCP echo server
+        let echo_server = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo_server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = echo_server.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => { let _ = stream.write_all(&buf[..n]).await; }
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut tunnel = setup_relay_tunnel().await;
+        let timeout = std::time::Duration::from_secs(5);
+
+        // TCP 3-way handshake
+        let mut tcp = RawTcpClient::new([10, 0, 0, 2], [127, 0, 0, 1], 40001, echo_port);
+
+        // SYN
+        let syn = tcp.build_syn();
+        Pin::new(&mut tunnel.client_transport).send(syn).await.unwrap();
+
+        // Receive SYN-ACK
+        let syn_ack = recv_tcp(&mut tunnel.client_transport, timeout).await;
+        let parsed = etherparse::SlicedPacket::from_ip(&syn_ack).unwrap();
+        if let Some(etherparse::TransportSlice::Tcp(ref t)) = parsed.transport {
+            assert!(t.syn() && t.ack(), "expected SYN-ACK, got flags: syn={} ack={}", t.syn(), t.ack());
+        }
+        tcp.process_syn_ack(&syn_ack);
+
+        // ACK (completes handshake)
+        let ack = tcp.build_ack();
+        Pin::new(&mut tunnel.client_transport).send(ack).await.unwrap();
+
+        // Send data
+        let payload = b"Hello, tunnel!";
+        let data_pkt = tcp.build_data(payload);
+        Pin::new(&mut tunnel.client_transport).send(data_pkt).await.unwrap();
+
+        // Receive echoed data
+        let mut received_data = Vec::new();
+        let result = tokio::time::timeout(timeout, async {
+            while received_data.len() < payload.len() {
+                let response = recv_tcp(&mut tunnel.client_transport, timeout).await;
+                let data = tcp.process_response(&response);
+                received_data.extend_from_slice(&data);
+            }
+        }).await;
+        assert!(result.is_ok(), "timed out waiting for echo data");
+        assert_eq!(&received_data[..payload.len()], payload);
+
+        // ACK the received data
+        let ack = tcp.build_ack();
+        Pin::new(&mut tunnel.client_transport).send(ack).await.unwrap();
+
+        // FIN
+        let fin = tcp.build_fin();
+        Pin::new(&mut tunnel.client_transport).send(fin).await.unwrap();
+
+        // Wait for FIN-ACK from server (may be ACK or FIN+ACK)
+        let fin_response = recv_tcp(&mut tunnel.client_transport, timeout).await;
+        let parsed = etherparse::SlicedPacket::from_ip(&fin_response).unwrap();
+        if let Some(etherparse::TransportSlice::Tcp(ref t)) = parsed.transport {
+            assert!(t.ack(), "expected ACK in FIN response");
+        }
+
+        tunnel.server_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn udp_echo_through_relay_tunnel() {
+        // Start a real UDP echo server
+        let echo_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo_socket.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            let mut buf = [0u8; 4096];
+            loop {
+                match echo_socket.recv_from(&mut buf).await {
+                    Ok((n, addr)) => { let _ = echo_socket.send_to(&buf[..n], addr).await; }
+                    Err(_) => break,
+                }
+            }
+        });
+
+        let mut tunnel = setup_relay_tunnel().await;
+        let timeout = std::time::Duration::from_secs(5);
+
+        // Craft and send a UDP packet
+        let payload = b"Hello, UDP tunnel!";
+        let mut udp_pkt = Vec::new();
+        etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [127, 0, 0, 1], 64)
+            .udp(50001, echo_port)
+            .write(&mut udp_pkt, payload)
+            .unwrap();
+
+        Pin::new(&mut tunnel.client_transport).send(udp_pkt).await.unwrap();
+
+        // Receive echoed UDP response
+        let response = recv_udp_pkt(&mut tunnel.client_transport, timeout).await;
+        let parsed = etherparse::SlicedPacket::from_ip(&response).unwrap();
+        if let Some(etherparse::TransportSlice::Udp(udp)) = parsed.transport {
+            assert_eq!(udp.payload(), payload);
+        } else {
+            panic!("expected UDP transport slice");
+        }
+
+        tunnel.server_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn multiple_tcp_connections_through_tunnel() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener as TokioTcpListener;
+
+        let echo_server = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo_server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = echo_server.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => { let _ = stream.write_all(&buf[..n]).await; }
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut tunnel = setup_relay_tunnel().await;
+        let timeout = std::time::Duration::from_secs(5);
+
+        // Connection #1
+        let mut tcp1 = RawTcpClient::new([10, 0, 0, 2], [127, 0, 0, 1], 40001, echo_port);
+        Pin::new(&mut tunnel.client_transport).send(tcp1.build_syn()).await.unwrap();
+        let syn_ack1 = recv_tcp(&mut tunnel.client_transport, timeout).await;
+        tcp1.process_syn_ack(&syn_ack1);
+        Pin::new(&mut tunnel.client_transport).send(tcp1.build_ack()).await.unwrap();
+
+        let data1 = b"conn1-data";
+        Pin::new(&mut tunnel.client_transport).send(tcp1.build_data(data1)).await.unwrap();
+
+        let mut received1 = Vec::new();
+        let result = tokio::time::timeout(timeout, async {
+            while received1.len() < data1.len() {
+                let resp = recv_tcp(&mut tunnel.client_transport, timeout).await;
+                received1.extend_from_slice(&tcp1.process_response(&resp));
+            }
+        }).await;
+        assert!(result.is_ok(), "conn1 echo timed out");
+        assert_eq!(&received1[..data1.len()], data1);
+
+        // Connection #2 (different src port)
+        let mut tcp2 = RawTcpClient::new([10, 0, 0, 2], [127, 0, 0, 1], 40002, echo_port);
+        Pin::new(&mut tunnel.client_transport).send(tcp2.build_syn()).await.unwrap();
+        let syn_ack2 = recv_tcp(&mut tunnel.client_transport, timeout).await;
+        tcp2.process_syn_ack(&syn_ack2);
+        Pin::new(&mut tunnel.client_transport).send(tcp2.build_ack()).await.unwrap();
+
+        let data2 = b"conn2-data";
+        Pin::new(&mut tunnel.client_transport).send(tcp2.build_data(data2)).await.unwrap();
+
+        let mut received2 = Vec::new();
+        let result = tokio::time::timeout(timeout, async {
+            while received2.len() < data2.len() {
+                let resp = recv_tcp(&mut tunnel.client_transport, timeout).await;
+                // Determine which connection this packet belongs to
+                let parsed = etherparse::SlicedPacket::from_ip(&resp).unwrap();
+                if let Some(etherparse::TransportSlice::Tcp(ref t)) = parsed.transport {
+                    if t.source_port() == echo_port {
+                        // Check destination port to route to correct client
+                        if t.destination_port() == 40002 {
+                            received2.extend_from_slice(&tcp2.process_response(&resp));
+                        } else {
+                            // Data for conn1, just process to keep ack updated
+                            tcp1.process_response(&resp);
+                        }
+                    }
+                }
+            }
+        }).await;
+        assert!(result.is_ok(), "conn2 echo timed out");
+        assert_eq!(&received2[..data2.len()], data2);
+
+        tunnel.server_cancel.cancel();
+    }
+
+    #[tokio::test]
+    async fn large_payload_tcp_through_tunnel() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener as TokioTcpListener;
+
+        let echo_server = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo_server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = echo_server.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => { let _ = stream.write_all(&buf[..n]).await; }
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut tunnel = setup_relay_tunnel().await;
+        let timeout = std::time::Duration::from_secs(10);
+
+        let mut tcp = RawTcpClient::new([10, 0, 0, 2], [127, 0, 0, 1], 40001, echo_port);
+
+        // Handshake
+        Pin::new(&mut tunnel.client_transport).send(tcp.build_syn()).await.unwrap();
+        let syn_ack = recv_tcp(&mut tunnel.client_transport, timeout).await;
+        tcp.process_syn_ack(&syn_ack);
+        Pin::new(&mut tunnel.client_transport).send(tcp.build_ack()).await.unwrap();
+
+        // Build a 4KB payload, send in ~500-byte segments to stay under MTU
+        let total_size = 4096;
+        let segment_size = 500;
+        let full_payload: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
+
+        for chunk in full_payload.chunks(segment_size) {
+            let data_pkt = tcp.build_data(chunk);
+            Pin::new(&mut tunnel.client_transport).send(data_pkt).await.unwrap();
+            // Small delay to avoid overwhelming the netstack
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        // Collect echoed data
+        let mut received = Vec::new();
+        let result = tokio::time::timeout(timeout, async {
+            while received.len() < total_size {
+                let resp = recv_tcp(&mut tunnel.client_transport, timeout).await;
+                let data = tcp.process_response(&resp);
+                if !data.is_empty() {
+                    received.extend_from_slice(&data);
+                    // ACK the data
+                    let ack = tcp.build_ack();
+                    Pin::new(&mut tunnel.client_transport).send(ack).await.unwrap();
+                }
+            }
+        }).await;
+
+        assert!(result.is_ok(), "timed out, received {}/{} bytes", received.len(), total_size);
+        assert_eq!(received.len(), total_size);
+        assert_eq!(received, full_payload);
+
+        tunnel.server_cancel.cancel();
+    }
+
     // --- Existing tests ---
 
     #[tokio::test]
