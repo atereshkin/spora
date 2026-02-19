@@ -2,8 +2,9 @@ use std::collections::HashMap;
 use std::io;
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
-use tokio::task::AbortHandle;
+use tokio::task::{AbortHandle, JoinHandle};
 use pubsub_client::{PubSubService, SubConnection};
 use tokio_util::sync::CancellationToken;
 use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
@@ -142,7 +143,15 @@ async fn new_tcp_stream(addr: SocketAddr, protector: &SocketProtector) -> std::i
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct NATKey(SocketAddr, SocketAddr);
 
-// TODO: the NAT table entries should expire and be cleaned up
+const UDP_NAT_TIMEOUT: Duration = Duration::from_secs(30);
+const UDP_NAT_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+
+struct NATEntry {
+    socket: Arc<UdpSocket>,
+    task: JoinHandle<()>,
+    last_activity: Instant,
+}
+
 async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket, protector: SocketProtector) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let (mut read_half, mut write_half) = udp_socket.split();
@@ -152,43 +161,66 @@ async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket, protec
         }
     });
 
-    let mut sockets: HashMap<NATKey, Arc<UdpSocket>> = HashMap::new();
+    let mut entries: HashMap<NATKey, NATEntry> = HashMap::new();
+    let mut sweep_interval = tokio::time::interval(UDP_NAT_SWEEP_INTERVAL);
 
-    while let Some((data, local, remote)) = read_half.next().await {
-        let key = NATKey(local, remote);
-        let sock = if let Some(sock) = sockets.get_mut(&key) {
-            sock
-        } else {
-            &mut match new_udp_packet(remote, &protector).await {
-                Ok(socket) => {
-                    let tx = tx.clone();
-                    let socket = Arc::new(socket);
-                    sockets.insert(key, socket.clone());
-                    let recv_socket = socket.clone();
-                    tokio::spawn(async move {
-                        loop {
-                            let mut buf = vec![0; 1500];
-                            match recv_socket.recv_from(&mut buf).await {
-                                Ok((len, _)) => {
-                                    let _ = tx.send((buf[..len].to_vec(), local, remote));
+    loop {
+        tokio::select! {
+            packet = read_half.next() => {
+                let Some((data, local, remote)) = packet else { break };
+                let key = NATKey(local, remote);
+
+                if let Some(entry) = entries.get_mut(&key) {
+                    entry.last_activity = Instant::now();
+                    let _ = entry.socket.send(&data).await;
+                } else {
+                    match new_udp_packet(remote, &protector).await {
+                        Ok(socket) => {
+                            let socket = Arc::new(socket);
+                            let recv_socket = socket.clone();
+                            let tx = tx.clone();
+                            let task = tokio::spawn(async move {
+                                let mut buf = vec![0; 1500];
+                                loop {
+                                    match recv_socket.recv_from(&mut buf).await {
+                                        Ok((len, _)) => {
+                                            let _ = tx.send((buf[..len].to_vec(), local, remote));
+                                        }
+                                        Err(e) => {
+                                            warn!(
+                                                "failed to recv udp datagram {:?}<->{:?}: {:?}",
+                                                local, remote, e
+                                            );
+                                            break;
+                                        }
+                                    }
                                 }
-                                Err(e) => {
-                                    warn!(
-                                        "failed to recv udp datagram {:?}<->{:?}: {:?}",
-                                        local, remote, e
-                                    );
-                                    break;
-                                }
-                            }
+                            });
+                            let _ = socket.send(&data).await;
+                            entries.insert(key, NATEntry {
+                                socket,
+                                task,
+                                last_activity: Instant::now(),
+                            });
                         }
-                    });
-                    socket
-                },
-                Err(e) => panic!("failed to create udp socket: {:?}", e)
+                        Err(e) => {
+                            warn!("failed to create udp socket for {:?}<->{:?}: {:?}", local, remote, e);
+                        }
+                    }
+                }
             }
-
-        };
-        let _ = sock.send(&data).await;
+            _ = sweep_interval.tick() => {
+                entries.retain(|key, entry| {
+                    if entry.last_activity.elapsed() > UDP_NAT_TIMEOUT {
+                        debug!("UDP NAT entry expired: {:?} => {:?}", key.0, key.1);
+                        entry.task.abort();
+                        false
+                    } else {
+                        true
+                    }
+                });
+            }
+        }
     }
 }
 
