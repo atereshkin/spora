@@ -1649,6 +1649,148 @@ mod tests {
         tunnel.server_cancel.cancel();
     }
 
+    // --- Certificate pinning tests ---
+
+    /// Like `test_certs()` but allows specifying the SAN on the relay certificate.
+    fn test_certs_with_san(san: &str) -> (quinn::ServerConfig, rustls::ClientConfig) {
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.distinguished_name = rcgen::DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Test CA");
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let relay_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut relay_params = rcgen::CertificateParams::default();
+        relay_params.distinguished_name = rcgen::DistinguishedName::new();
+        relay_params
+            .subject_alt_names
+            .push(rcgen::SanType::DnsName(san.try_into().unwrap()));
+        let relay_cert = relay_params
+            .signed_by(&relay_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let cert = rustls::pki_types::CertificateDer::from(relay_cert.der().to_vec());
+        let key = rustls::pki_types::PrivateKeyDer::try_from(relay_key.serialize_der()).unwrap();
+
+        let mut server_crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        server_crypto.alpn_protocols = vec![ALPN.to_vec()];
+
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+        ));
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store
+            .add(rustls::pki_types::CertificateDer::from(
+                ca_cert.der().to_vec(),
+            ))
+            .unwrap();
+
+        let mut client_crypto = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![ALPN.to_vec()];
+
+        (server_config, client_crypto)
+    }
+
+    /// Start a fake relay with a specific server TLS config. Returns the port.
+    fn start_fake_relay_with_config(server_config: quinn::ServerConfig) -> u16 {
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = endpoint.local_addr().unwrap().port();
+        tokio::spawn(fake_relay(endpoint));
+        port
+    }
+
+    /// Try a raw QUIC connection to a relay, bypassing pubsub-client's retry loop.
+    /// Returns Ok(Connection) on success, Err on TLS/handshake failure.
+    async fn try_quic_connect(
+        client_crypto: rustls::ClientConfig,
+        port: u16,
+    ) -> Result<quinn::Connection, quinn::ConnectionError> {
+        let ep = build_endpoint_with_crypto(client_crypto, &None).unwrap();
+        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+        let connecting = ep.connect(addr, "relay.spora.dev").unwrap();
+        connecting.await
+    }
+
+    #[tokio::test]
+    async fn relay_rejects_connection_with_wrong_ca() {
+        // Server has cert signed by CA_A
+        let (server_config, _correct_crypto) = test_certs();
+        // Client trusts a completely different CA_B
+        let (_, wrong_crypto) = test_certs();
+
+        let port = start_fake_relay_with_config(server_config);
+        let result = try_quic_connect(wrong_crypto, port).await;
+
+        assert!(result.is_err(), "connection should fail when client trusts a different CA");
+    }
+
+    #[tokio::test]
+    async fn relay_rejects_connection_with_wrong_san() {
+        // Server cert has SAN "wrong.example.com" instead of "relay.spora.dev"
+        // Client trusts the correct CA but connects with SNI "relay.spora.dev"
+        let (server_config, correct_crypto) = test_certs_with_san("wrong.example.com");
+
+        let port = start_fake_relay_with_config(server_config);
+        let result = try_quic_connect(correct_crypto, port).await;
+
+        assert!(result.is_err(), "connection should fail when server SAN doesn't match SNI");
+    }
+
+    #[tokio::test]
+    async fn relay_rejects_self_signed_server_cert() {
+        // Server uses a self-signed cert (acts as its own CA)
+        let relay_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut relay_params = rcgen::CertificateParams::default();
+        relay_params.distinguished_name = rcgen::DistinguishedName::new();
+        relay_params
+            .subject_alt_names
+            .push(rcgen::SanType::DnsName("relay.spora.dev".try_into().unwrap()));
+        let self_signed = relay_params.self_signed(&relay_key).unwrap();
+
+        let cert = rustls::pki_types::CertificateDer::from(self_signed.der().to_vec());
+        let key = rustls::pki_types::PrivateKeyDer::try_from(relay_key.serialize_der()).unwrap();
+
+        let mut server_crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        server_crypto.alpn_protocols = vec![ALPN.to_vec()];
+        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+        ));
+
+        // Client trusts a separate CA (not the self-signed cert)
+        let (_, client_crypto) = test_certs();
+
+        let port = start_fake_relay_with_config(server_config);
+        let result = try_quic_connect(client_crypto, port).await;
+
+        assert!(result.is_err(), "connection should fail with self-signed server cert");
+    }
+
+    #[tokio::test]
+    async fn relay_accepts_connection_with_correct_pinned_ca() {
+        // Positive control: matching CA, correct SAN → connection succeeds
+        let (server_config, client_crypto) = test_certs();
+        let port = start_fake_relay_with_config(server_config);
+
+        let ep = build_endpoint_with_crypto(client_crypto, &None).unwrap();
+        let svc = PubSubService::new("127.0.0.1", port);
+        let result = svc.sub_with_endpoint("testkey", &ep).await;
+
+        assert!(result.is_ok(), "connection should succeed with correct pinned CA: {:?}", result.err());
+    }
+
     // --- Existing tests ---
 
     #[tokio::test]
