@@ -1,6 +1,8 @@
 use std::io;
 use std::sync::Arc;
+use std::time::Instant;
 use log::debug;
+use quinn::congestion;
 
 const MSG_SUB: u8 = 0x01;
 const MSG_PUB: u8 = 0x02;
@@ -11,6 +13,26 @@ const RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 const TOTAL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 
 const ALPN: &[u8] = b"spora-relay/1";
+
+#[derive(Debug, Clone)]
+struct NoopCc { mtu: u16 }
+
+impl congestion::Controller for NoopCc {
+    fn on_congestion_event(&mut self, _now: Instant, _sent: Instant, _is_persistent: bool, _lost_bytes: u64) {}
+    fn on_mtu_update(&mut self, new_mtu: u16) { self.mtu = new_mtu; }
+    fn window(&self) -> u64 { u64::MAX / 2 }
+    fn clone_box(&self) -> Box<dyn congestion::Controller> { Box::new(self.clone()) }
+    fn initial_window(&self) -> u64 { u64::MAX / 2 }
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> { self }
+}
+
+struct NoopCcFactory;
+
+impl congestion::ControllerFactory for NoopCcFactory {
+    fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn congestion::Controller> {
+        Box::new(NoopCc { mtu: 1200 })
+    }
+}
 
 /// Embedded CA certificate for verifying relay TLS.
 const CA_DER: &[u8] = include_bytes!("../ca.der");
@@ -74,10 +96,15 @@ pub fn build_endpoint_with_crypto(
     let _ = protector;
     std_socket.set_nonblocking(true)?;
 
-    let client_config = quinn::ClientConfig::new(Arc::new(
+    let mut client_config = quinn::ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .expect("failed to build QUIC client config"),
     ));
+    let mut transport = quinn::TransportConfig::default();
+    transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+    transport.datagram_send_buffer_size(8 * 1024 * 1024);
+    transport.congestion_controller_factory(Arc::new(NoopCcFactory));
+    client_config.transport_config(Arc::new(transport));
 
     let runtime = quinn::default_runtime()
         .ok_or_else(|| io::Error::other("no async runtime available"))?;

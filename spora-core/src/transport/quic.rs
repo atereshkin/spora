@@ -2,11 +2,12 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures_util::{Sink, Stream};
 use log::debug;
 use quinn::Connection;
+use quinn::congestion;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -178,12 +179,40 @@ impl Sink<Vec<u8>> for QuicPeerTransport {
     }
 }
 
+/// No-op congestion controller — always allows sending.
+///
+/// We carry IP packets as QUIC datagrams; the inner TCP (smoltcp) already
+/// handles its own congestion control, so QUIC-level CC just adds latency
+/// and causes send-buffer eviction under load.
+#[derive(Debug, Clone)]
+struct NoopCc {
+    mtu: u16,
+}
+
+impl congestion::Controller for NoopCc {
+    fn on_congestion_event(&mut self, _now: Instant, _sent: Instant, _is_persistent: bool, _lost_bytes: u64) {}
+    fn on_mtu_update(&mut self, new_mtu: u16) { self.mtu = new_mtu; }
+    fn window(&self) -> u64 { u64::MAX / 2 }
+    fn clone_box(&self) -> Box<dyn congestion::Controller> { Box::new(self.clone()) }
+    fn initial_window(&self) -> u64 { u64::MAX / 2 }
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> { self }
+}
+
+struct NoopCcFactory;
+
+impl congestion::ControllerFactory for NoopCcFactory {
+    fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn congestion::Controller> {
+        Box::new(NoopCc { mtu: 1200 })
+    }
+}
+
 fn build_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(QUIC_IDLE_TIMEOUT.try_into().unwrap()));
     transport.keep_alive_interval(Some(QUIC_KEEP_ALIVE));
-    transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
-    transport.datagram_send_buffer_size(4 * 1024 * 1024);
+    transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+    transport.datagram_send_buffer_size(8 * 1024 * 1024);
+    transport.congestion_controller_factory(Arc::new(NoopCcFactory));
     transport
 }
 

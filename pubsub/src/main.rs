@@ -1,14 +1,36 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Instant;
 use clap::Parser;
 use log::{info, warn};
 use quinn::Connection;
+use quinn::congestion;
 use tokio::sync::Mutex;
 
 const MSG_SUB: u8 = 0x01;
 const MSG_PUB: u8 = 0x02;
 const MSG_MATCH: u8 = 0x03;
 const RESP_ERROR: u8 = 0xFF;
+
+#[derive(Debug, Clone)]
+struct NoopCc { mtu: u16 }
+
+impl congestion::Controller for NoopCc {
+    fn on_congestion_event(&mut self, _now: Instant, _sent: Instant, _is_persistent: bool, _lost_bytes: u64) {}
+    fn on_mtu_update(&mut self, new_mtu: u16) { self.mtu = new_mtu; }
+    fn window(&self) -> u64 { u64::MAX / 2 }
+    fn clone_box(&self) -> Box<dyn congestion::Controller> { Box::new(self.clone()) }
+    fn initial_window(&self) -> u64 { u64::MAX / 2 }
+    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> { self }
+}
+
+struct NoopCcFactory;
+
+impl congestion::ControllerFactory for NoopCcFactory {
+    fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn congestion::Controller> {
+        Box::new(NoopCc { mtu: 1200 })
+    }
+}
 
 const ALPN: &[u8] = b"spora-relay/1";
 
@@ -68,7 +90,9 @@ async fn main() {
     transport.max_idle_timeout(Some(
         std::time::Duration::from_secs(120).try_into().unwrap(),
     ));
-    transport.datagram_receive_buffer_size(Some(65535));
+    transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+    transport.datagram_send_buffer_size(8 * 1024 * 1024);
+    transport.congestion_controller_factory(Arc::new(NoopCcFactory));
     server_config.transport_config(Arc::new(transport));
 
     let endpoint = quinn::Endpoint::server(server_config, ([0, 0, 0, 0], args.port).into())
