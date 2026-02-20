@@ -49,8 +49,15 @@ pub fn relay_connection(
     let send_conn = conn.clone();
     let transport_sink =
         futures_util::sink::unfold(send_conn, move |c, pkt: Vec<u8>| async move {
-            c.send_datagram(pkt.into())
-                .map_err(|e| io::Error::other(format!("send_datagram failed: {}", e)))?;
+            match c.send_datagram(pkt.into()) {
+                Ok(()) => {}
+                Err(quinn::SendDatagramError::TooLarge) => {
+                    debug!("Relay datagram too large, dropping");
+                }
+                Err(e) => {
+                    return Err(io::Error::other(format!("send_datagram failed: {}", e)));
+                }
+            }
             Ok::<_, io::Error>(c)
         });
 

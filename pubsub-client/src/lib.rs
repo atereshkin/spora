@@ -103,6 +103,7 @@ pub fn build_endpoint_with_crypto(
     let mut transport = quinn::TransportConfig::default();
     transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     transport.datagram_send_buffer_size(8 * 1024 * 1024);
+    transport.initial_mtu(1452);
     transport.congestion_controller_factory(Arc::new(NoopCcFactory));
     client_config.transport_config(Arc::new(transport));
 

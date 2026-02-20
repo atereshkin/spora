@@ -212,6 +212,7 @@ fn build_transport_config() -> quinn::TransportConfig {
     transport.keep_alive_interval(Some(QUIC_KEEP_ALIVE));
     transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     transport.datagram_send_buffer_size(8 * 1024 * 1024);
+    transport.initial_mtu(1452);
     transport.congestion_controller_factory(Arc::new(NoopCcFactory));
     transport
 }

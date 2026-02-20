@@ -9,7 +9,7 @@ use pubsub_client::{PubSubService, SubConnection};
 use tokio_util::sync::CancellationToken;
 use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
 use log::{debug, error, info, warn};
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, Stream, SinkExt, StreamExt};
 use crate::transport::IpTransport;
 use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
 use crate::transport::relay::relay_connection;
@@ -29,19 +29,19 @@ impl Drop for AbortOnDrop {
     }
 }
 
-pub(crate) async fn run_tunnel(transport: IpTransport, stack: Stack) {
-    let (mut stack_sink, mut stack_stream) = stack.split();
+pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
     let (mut peer_sink, mut peer_stream) = transport.split();
 
     let (egress_tx, mut egress_rx) = tokio::sync::mpsc::channel::<Vec<u8>>(EGRESS_CHANNEL_CAPACITY);
+    let (ingress_tx, mut ingress_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
-    // Ingress: transport → stack (can .await freely, stack ingress is unbounded)
+    // Task 1 — Transport reader: transport → unbounded ingress channel.
     let ingress = tokio::spawn(async move {
         while let Some(res) = peer_stream.next().await {
             match res {
-                Ok(v_buf) => {
-                    if let Err(e) = stack_sink.send(v_buf).await {
-                        error!("Error writing to stack: {}", e);
+                Ok(pkt) => {
+                    if ingress_tx.send(pkt).is_err() {
+                        break;
                     }
                 }
                 Err(e) => {
@@ -53,24 +53,102 @@ pub(crate) async fn run_tunnel(transport: IpTransport, stack: Stack) {
         info!("Transport stream closed.");
     });
 
-    // Stack drain: stack → bounded channel (never blocks on transport I/O)
-    let drain = tokio::spawn(async move {
-        while let Some(res) = stack_stream.next().await {
-            match res {
-                Ok(pkt) => {
-                    if egress_tx.try_send(pkt.to_vec()).is_err() {
-                        debug!("Egress channel full, dropping packet");
+    // Task 2 — Stack driver: polls both Stream (egress) and Sink (ingress) on
+    // the Stack *without* `split()`.  This avoids the BiLock that couples the
+    // two directions and works around a waker bug in the upstream Sink impl
+    // (poll_ready / poll_flush return Pending without registering a waker when
+    // the internal tcp_tx channel is full, which permanently parks the caller).
+    let stack_driver = tokio::spawn(async move {
+        use std::pin::Pin;
+        use std::task::Poll;
+
+        let mut pending_ingress: Option<Vec<u8>> = None;
+
+        futures_util::future::poll_fn(|cx| {
+            // --- Egress: drain stack output → bounded egress channel ---
+            loop {
+                match Pin::new(&mut stack).poll_next(cx) {
+                    Poll::Ready(Some(Ok(pkt))) => {
+                        if egress_tx.try_send(pkt.to_vec()).is_err() {
+                            debug!("Egress channel full, dropping packet");
+                        }
                     }
-                }
-                Err(e) => {
-                    error!("Stack read error: {}", e);
+                    Poll::Ready(Some(Err(e))) => {
+                        error!("Stack read error: {}", e);
+                    }
+                    Poll::Ready(None) => return Poll::Ready(()),
+                    Poll::Pending => break, // waker registered on stack_rx
                 }
             }
-        }
-        info!("Stack stream closed.");
+
+            // --- Ingress: feed transport data into stack ---
+            // First flush any buffered send in the sink.
+            match Pin::new(&mut stack).poll_flush(cx) {
+                Poll::Ready(Ok(())) => {
+                    // Sink is flushed — push packets while it stays ready.
+                    loop {
+                        let pkt = pending_ingress
+                            .take()
+                            .or_else(|| ingress_rx.try_recv().ok());
+                        let Some(pkt) = pkt else { break };
+
+                        match Pin::new(&mut stack).poll_ready(cx) {
+                            Poll::Ready(Ok(())) => {
+                                if let Err(e) = Pin::new(&mut stack).start_send(pkt) {
+                                    error!("Stack send error: {}", e);
+                                }
+                                // Flush after each send so the next poll_ready
+                                // reflects the true state.
+                                match Pin::new(&mut stack).poll_flush(cx) {
+                                    Poll::Ready(Ok(())) => continue,
+                                    Poll::Ready(Err(e)) => {
+                                        error!("Stack flush error: {}", e);
+                                        return Poll::Ready(());
+                                    }
+                                    Poll::Pending => break, // sink busy
+                                }
+                            }
+                            Poll::Ready(Err(e)) => {
+                                error!("Stack sink error: {}", e);
+                                return Poll::Ready(());
+                            }
+                            Poll::Pending => {
+                                pending_ingress = Some(pkt);
+                                break;
+                            }
+                        }
+                    }
+                }
+                Poll::Ready(Err(e)) => {
+                    error!("Stack flush error: {}", e);
+                    return Poll::Ready(());
+                }
+                Poll::Pending => {
+                    // Sink busy — can't accept data yet.  We'll retry when
+                    // woken by poll_next (stack output) or ingress_rx below.
+                }
+            }
+
+            // Register waker for incoming transport data so we re-enter
+            // this poll_fn when new packets arrive.
+            if pending_ingress.is_none() {
+                match ingress_rx.poll_recv(cx) {
+                    Poll::Ready(Some(pkt)) => {
+                        pending_ingress = Some(pkt);
+                        cx.waker().wake_by_ref();
+                    }
+                    Poll::Ready(None) => return Poll::Ready(()),
+                    Poll::Pending => {} // waker registered on ingress_rx
+                }
+            }
+
+            Poll::Pending
+        })
+        .await;
+        info!("Stack driver ended.");
     });
 
-    // Egress: bounded channel → transport (can be slow without affecting drain)
+    // Task 3 — Egress writer: bounded channel → transport.
     let egress = tokio::spawn(async move {
         while let Some(pkt) = egress_rx.recv().await {
             if let Err(e) = peer_sink.send(pkt).await {
@@ -82,14 +160,14 @@ pub(crate) async fn run_tunnel(transport: IpTransport, stack: Stack) {
 
     let _guard = AbortOnDrop(vec![
         ingress.abort_handle(),
-        drain.abort_handle(),
+        stack_driver.abort_handle(),
         egress.abort_handle(),
     ]);
 
     // Wait until any task finishes — then the guard aborts the rest.
     tokio::select! {
         _ = ingress => {}
-        _ = drain => {}
+        _ = stack_driver => {}
         _ = egress => {}
     }
 }
