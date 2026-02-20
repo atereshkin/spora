@@ -1985,4 +1985,537 @@ mod tests {
             .unwrap();
         assert_eq!(received, normal_pkt);
     }
+
+    // --- Constrained relay: simulates a bandwidth-limited link with finite buffer ---
+
+    use std::collections::VecDeque;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    #[derive(Default)]
+    struct RelayStats {
+        a_to_b: AtomicU64,       // client→server packets forwarded
+        b_to_a_fwd: AtomicU64,   // server→client packets forwarded
+        b_to_a_evict: AtomicU64, // server→client packets evicted
+        b_to_a_recv: AtomicU64,  // server→client packets received (before buffering)
+    }
+
+    /// Like `fake_relay` but constrains the b→a (server→client) forwarding direction.
+    ///
+    /// - `buffer_cap`: max datagrams buffered; when full the oldest is evicted (like
+    ///   `send_datagram`'s FIFO eviction). 0 means unlimited.
+    /// - `drain_interval`: minimum time between forwarding two datagrams. Simulates
+    ///   a bandwidth-limited link.
+    /// - `latency`: artificial one-way delay added to BOTH forwarding directions.
+    ///   Simulates real network RTT (total RTT = 2 × latency).
+    async fn fake_relay_constrained(
+        endpoint: quinn::Endpoint,
+        buffer_cap: usize,
+        drain_interval: std::time::Duration,
+        latency: std::time::Duration,
+        stats: Arc<RelayStats>,
+    ) {
+        let subscribers: Arc<TokioMutex<HashMap<Vec<u8>, FakeSubscriber>>> =
+            Arc::new(TokioMutex::new(HashMap::new()));
+
+        while let Some(incoming) = endpoint.accept().await {
+            let subscribers = subscribers.clone();
+            let endpoint_str = endpoint.local_addr().unwrap().to_string();
+            let stats = stats.clone();
+            tokio::spawn(async move {
+                let conn = match incoming.await {
+                    Ok(c) => c,
+                    Err(_) => return,
+                };
+                let (mut send, mut recv) = match conn.accept_bi().await {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let handshake = match recv.read_to_end(65535).await {
+                    Ok(h) => h,
+                    Err(_) => return,
+                };
+                if handshake.is_empty() {
+                    return;
+                }
+
+                let msg_type = handshake[0];
+                let key = handshake[1..].to_vec();
+
+                match msg_type {
+                    0x01 => {
+                        let mut resp = vec![0x01];
+                        resp.extend_from_slice(endpoint_str.as_bytes());
+                        let _ = send.write_all(&resp).await;
+                        subscribers.lock().await.insert(
+                            key,
+                            FakeSubscriber {
+                                connection: conn,
+                                send_stream: send,
+                            },
+                        );
+                    }
+                    0x02 => {
+                        let mut subs = subscribers.lock().await;
+                        if let Some(mut sub) = subs.remove(&key) {
+                            let _ = send.write_all(&[0x02]).await;
+                            let _ = send.finish();
+                            let _ = sub.send_stream.write_all(&[0x03]).await;
+                            let _ = sub.send_stream.finish();
+
+                            let a = conn; // publisher (client)
+                            let b = sub.connection; // subscriber (server)
+                            let a2 = a.clone();
+                            let b2 = b.clone();
+
+                            // a → b: unconstrained throughput, but with latency
+                            let stats_ab = stats.clone();
+                            tokio::spawn(async move {
+                                loop {
+                                    match a.read_datagram().await {
+                                        Ok(d) => {
+                                            stats_ab.a_to_b.fetch_add(1, Ordering::Relaxed);
+                                            if latency > std::time::Duration::ZERO {
+                                                tokio::time::sleep(latency).await;
+                                            }
+                                            if b.send_datagram(d).is_err() {
+                                                break;
+                                            }
+                                        }
+                                        Err(_) => break,
+                                    }
+                                }
+                            });
+
+                            // b → a: constrained (server→client)
+                            let stats_ba = stats.clone();
+                            tokio::spawn(async move {
+                                let mut buffer: VecDeque<Vec<u8>> = VecDeque::new();
+                                let mut drain_timer = tokio::time::interval(
+                                    if drain_interval > std::time::Duration::ZERO {
+                                        drain_interval
+                                    } else {
+                                        std::time::Duration::from_nanos(1)
+                                    },
+                                );
+                                drain_timer.set_missed_tick_behavior(
+                                    tokio::time::MissedTickBehavior::Skip,
+                                );
+
+                                loop {
+                                    tokio::select! {
+                                        biased;
+                                        dgram = b2.read_datagram() => {
+                                            match dgram {
+                                                Ok(d) => {
+                                                    stats_ba.b_to_a_recv.fetch_add(1, Ordering::Relaxed);
+                                                    if buffer_cap > 0 && buffer.len() >= buffer_cap {
+                                                        buffer.pop_front(); // evict oldest
+                                                        stats_ba.b_to_a_evict.fetch_add(1, Ordering::Relaxed);
+                                                    }
+                                                    buffer.push_back(d.to_vec());
+                                                }
+                                                Err(_) => break,
+                                            }
+                                        }
+                                        _ = drain_timer.tick() => {
+                                            if let Some(pkt) = buffer.pop_front() {
+                                                stats_ba.b_to_a_fwd.fetch_add(1, Ordering::Relaxed);
+                                                if latency > std::time::Duration::ZERO {
+                                                    tokio::time::sleep(latency).await;
+                                                }
+                                                if a2.send_datagram(pkt.into()).is_err() {
+                                                    break;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            });
+                        } else {
+                            let mut resp = vec![0xFF];
+                            resp.extend_from_slice(b"unknown subscriber");
+                            let _ = send.write_all(&resp).await;
+                            let _ = send.finish();
+                        }
+                    }
+                    _ => {}
+                }
+            });
+        }
+    }
+
+    fn start_constrained_relay(
+        buffer_cap: usize,
+        drain_interval: std::time::Duration,
+        latency: std::time::Duration,
+    ) -> (u16, rustls::ClientConfig, Arc<RelayStats>) {
+        let (server_config, client_crypto) = test_certs();
+        let endpoint =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let port = endpoint.local_addr().unwrap().port();
+        let stats = Arc::new(RelayStats::default());
+        tokio::spawn(fake_relay_constrained(endpoint, buffer_cap, drain_interval, latency, stats.clone()));
+        (port, client_crypto, stats)
+    }
+
+    struct ConstrainedTunnel {
+        tunnel: TunnelPair,
+        relay_stats: Arc<RelayStats>,
+    }
+
+    async fn setup_constrained_tunnel(
+        buffer_cap: usize,
+        drain_interval: std::time::Duration,
+        latency: std::time::Duration,
+    ) -> ConstrainedTunnel {
+        let (port, crypto, relay_stats) = start_constrained_relay(buffer_cap, drain_interval, latency);
+        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
+
+        let (server_relay, _server_signal, server_demux) = relay_connection(server_conn);
+        let (server_upgradable, _server_upgrade_tx, server_router) =
+            upgradable_transport(Box::new(server_relay));
+        let ka_cfg = KeepAliveConfig {
+            interval: std::time::Duration::from_secs(300),
+            ..Default::default()
+        };
+        let server_transport: IpTransport =
+            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg));
+
+        let cancel = CancellationToken::new();
+        let cancel_clone = cancel.clone();
+        let tunnel_handle = tokio::spawn(async move {
+            server::start_tunnel(server_transport, None, cancel_clone)
+                .await
+                .unwrap();
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+        let (client_relay, _client_signal, client_demux) = relay_connection(client_conn);
+        let (client_upgradable, _client_upgrade_tx, client_router) =
+            upgradable_transport(Box::new(client_relay));
+        let client_transport = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
+
+        ConstrainedTunnel {
+            tunnel: TunnelPair {
+                client_transport,
+                server_cancel: cancel,
+                _handles: vec![
+                    tunnel_handle,
+                    server_demux,
+                    server_router,
+                    client_demux,
+                    client_router,
+                ],
+            },
+            relay_stats,
+        }
+    }
+
+    /// TCP receiver that handles out-of-order delivery for bulk downloads.
+    /// Tracks received bytes with a bitmap and sends correct cumulative ACKs.
+    struct BulkTcpReceiver {
+        src_ip: [u8; 4],
+        dst_ip: [u8; 4],
+        src_port: u16,
+        dst_port: u16,
+        local_seq: u32,
+        initial_remote_seq: u32,
+        received: Vec<bool>,
+        contiguous_end: usize,
+        fin_received: bool,
+    }
+
+    impl BulkTcpReceiver {
+        fn new(src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16) -> Self {
+            Self {
+                src_ip,
+                dst_ip,
+                src_port,
+                dst_port,
+                local_seq: 1000,
+                initial_remote_seq: 0,
+                received: vec![false; 256 * 1024],
+                contiguous_end: 0,
+                fin_received: false,
+            }
+        }
+
+        fn process_segment(&mut self, pkt: &[u8]) -> Vec<u8> {
+            let parsed = etherparse::SlicedPacket::from_ip(pkt).unwrap();
+            if let Some(etherparse::TransportSlice::Tcp(tcp)) = parsed.transport {
+                let seg_seq = tcp.sequence_number();
+                let payload = tcp.payload();
+
+                if !payload.is_empty() {
+                    let offset = seg_seq.wrapping_sub(self.initial_remote_seq) as usize;
+                    let end = offset + payload.len();
+                    if end > self.received.len() {
+                        self.received.resize(end, false);
+                    }
+                    for i in offset..end {
+                        self.received[i] = true;
+                    }
+                }
+
+                if tcp.fin() {
+                    self.fin_received = true;
+                }
+
+                while self.contiguous_end < self.received.len()
+                    && self.received[self.contiguous_end]
+                {
+                    self.contiguous_end += 1;
+                }
+            }
+            self.build_ack()
+        }
+
+        fn build_ack(&self) -> Vec<u8> {
+            let ack_num = self.initial_remote_seq + self.contiguous_end as u32;
+            let mut pkt = Vec::new();
+            etherparse::PacketBuilder::ipv4(self.src_ip, self.dst_ip, 64)
+                .tcp(self.src_port, self.dst_port, self.local_seq, 65535)
+                .ack(ack_num)
+                .write(&mut pkt, &[])
+                .unwrap();
+            pkt
+        }
+
+        fn contiguous_bytes(&self) -> usize {
+            self.contiguous_end
+        }
+    }
+
+    // --- Constrained relay tests ---
+
+    /// Baseline: 64KB echo through unconstrained relay. Verifies the test
+    /// infrastructure (BulkTcpReceiver + bulk_download) works.
+    #[tokio::test]
+    async fn tcp_bulk_download_baseline() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener as TokioTcpListener;
+
+        const DOWNLOAD_SIZE: usize = 65536;
+
+        // Echo server (proven pattern from existing tests)
+        let echo_server = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo_server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = echo_server.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => { let _ = stream.write_all(&buf[..n]).await; }
+                        }
+                    }
+                });
+            }
+        });
+
+        let mut tunnel = setup_relay_tunnel().await;
+        let timeout = std::time::Duration::from_secs(10);
+
+        // Handshake using proven RawTcpClient
+        let mut tcp = RawTcpClient::new([10, 0, 0, 2], [127, 0, 0, 1], 40001, echo_port);
+        Pin::new(&mut tunnel.client_transport).send(tcp.build_syn()).await.unwrap();
+        let syn_ack = recv_tcp(&mut tunnel.client_transport, timeout).await;
+        tcp.process_syn_ack(&syn_ack);
+        Pin::new(&mut tunnel.client_transport).send(tcp.build_ack()).await.unwrap();
+
+        // Send data in segments (client→server, unconstrained)
+        let full_payload: Vec<u8> = (0..DOWNLOAD_SIZE).map(|i| (i % 256) as u8).collect();
+        for chunk in full_payload.chunks(500) {
+            Pin::new(&mut tunnel.client_transport)
+                .send(tcp.build_data(chunk))
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        // Now receive echoed data using BulkTcpReceiver for out-of-order handling
+        let mut receiver = BulkTcpReceiver::new([10, 0, 0, 2], [127, 0, 0, 1], 40001, echo_port);
+        // Set initial_remote_seq from the handshake we already did
+        receiver.initial_remote_seq = tcp.ack;
+        receiver.local_seq = tcp.seq;
+
+        let result = tokio::time::timeout(timeout, async {
+            loop {
+                let pkt = recv_tcp(&mut tunnel.client_transport, timeout).await;
+                let ack = receiver.process_segment(&pkt);
+                Pin::new(&mut tunnel.client_transport)
+                    .send(ack)
+                    .await
+                    .unwrap();
+
+                if receiver.contiguous_bytes() >= DOWNLOAD_SIZE {
+                    break;
+                }
+            }
+        })
+        .await;
+
+        let received = receiver.contiguous_bytes();
+        tunnel.server_cancel.cancel();
+        assert!(
+            result.is_ok(),
+            "baseline: expected {} bytes, got {} ({:.1}%)",
+            DOWNLOAD_SIZE,
+            received,
+            received as f64 / DOWNLOAD_SIZE as f64 * 100.0,
+        );
+    }
+
+    struct EchoResult {
+        received_bytes: usize,
+        elapsed: std::time::Duration,
+        segments_from_server: u64,
+        dup_acks_sent: u64,
+        relay_a_to_b: u64,
+        relay_b_to_a_recv: u64,
+        relay_b_to_a_fwd: u64,
+        relay_b_to_a_evict: u64,
+    }
+
+    /// Helper to run a constrained relay echo test with full instrumentation.
+    async fn run_constrained_echo(
+        buffer_cap: usize,
+        drain_interval: std::time::Duration,
+        latency: std::time::Duration,
+        download_size: usize,
+        timeout_secs: u64,
+    ) -> EchoResult {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener as TokioTcpListener;
+
+        let echo_server = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
+        let echo_port = echo_server.local_addr().unwrap().port();
+        tokio::spawn(async move {
+            while let Ok((mut stream, _)) = echo_server.accept().await {
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 4096];
+                    loop {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => break,
+                            Ok(n) => { let _ = stream.write_all(&buf[..n]).await; }
+                        }
+                    }
+                });
+            }
+        });
+
+        let ct = setup_constrained_tunnel(buffer_cap, drain_interval, latency).await;
+        let relay_stats = ct.relay_stats.clone();
+        let mut tunnel = ct.tunnel;
+        let timeout = std::time::Duration::from_secs(timeout_secs);
+
+        // Handshake
+        let mut tcp = RawTcpClient::new([10, 0, 0, 2], [127, 0, 0, 1], 40001, echo_port);
+        Pin::new(&mut tunnel.client_transport).send(tcp.build_syn()).await.unwrap();
+        let syn_ack = recv_tcp(&mut tunnel.client_transport, timeout).await;
+        tcp.process_syn_ack(&syn_ack);
+        Pin::new(&mut tunnel.client_transport).send(tcp.build_ack()).await.unwrap();
+
+        // Send data in segments (client→server, unconstrained)
+        let full_payload: Vec<u8> = (0..download_size).map(|i| (i % 256) as u8).collect();
+        for chunk in full_payload.chunks(500) {
+            Pin::new(&mut tunnel.client_transport)
+                .send(tcp.build_data(chunk))
+                .await
+                .unwrap();
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+
+        // Receive echoed data (server→client, constrained)
+        let mut receiver = BulkTcpReceiver::new([10, 0, 0, 2], [127, 0, 0, 1], 40001, echo_port);
+        receiver.initial_remote_seq = tcp.ack;
+        receiver.local_seq = tcp.seq;
+
+        let mut segments_from_server: u64 = 0;
+        let mut dup_acks_sent: u64 = 0;
+        let mut last_ack_num: u32 = 0;
+
+        let start = std::time::Instant::now();
+        let _ = tokio::time::timeout(timeout, async {
+            loop {
+                let pkt = recv_tcp(&mut tunnel.client_transport, timeout).await;
+                segments_from_server += 1;
+
+                let prev_contiguous = receiver.contiguous_end;
+                let ack = receiver.process_segment(&pkt);
+
+                // Check if this ACK is a duplicate (same ack number as last)
+                let ack_num = receiver.initial_remote_seq + receiver.contiguous_end as u32;
+                if ack_num == last_ack_num && receiver.contiguous_end == prev_contiguous {
+                    dup_acks_sent += 1;
+                }
+                last_ack_num = ack_num;
+
+                Pin::new(&mut tunnel.client_transport)
+                    .send(ack)
+                    .await
+                    .unwrap();
+
+                if receiver.contiguous_bytes() >= download_size {
+                    break;
+                }
+            }
+        })
+        .await;
+        let elapsed = start.elapsed();
+
+        let received = receiver.contiguous_bytes();
+        tunnel.server_cancel.cancel();
+
+        EchoResult {
+            received_bytes: received,
+            elapsed,
+            segments_from_server,
+            dup_acks_sent,
+            relay_a_to_b: relay_stats.a_to_b.load(Ordering::Relaxed),
+            relay_b_to_a_recv: relay_stats.b_to_a_recv.load(Ordering::Relaxed),
+            relay_b_to_a_fwd: relay_stats.b_to_a_fwd.load(Ordering::Relaxed),
+            relay_b_to_a_evict: relay_stats.b_to_a_evict.load(Ordering::Relaxed),
+        }
+    }
+
+    /// 256KB echo through a constrained relay that simulates the production
+    /// bottleneck: finite buffer (FIFO eviction) + drain rate + network latency.
+    ///
+    /// Reproduces the death spiral:
+    ///   smoltcp blasts data → buffer fills → oldest evicted (including ACKs)
+    ///   → smoltcp retransmits → more data → more eviction → throughput collapses
+    ///
+    /// Parameters: buf=5, drain=5ms (200 pkt/s), latency=100ms (200ms RTT).
+    /// A successful fix should complete 256KB within the 60s timeout.
+    #[tokio::test]
+    async fn tcp_bulk_download_constrained_relay() {
+        const DOWNLOAD_SIZE: usize = 256 * 1024; // 256KB
+        let r = run_constrained_echo(
+            5,
+            std::time::Duration::from_millis(5),
+            std::time::Duration::from_millis(100),
+            DOWNLOAD_SIZE,
+            60,
+        ).await;
+
+        let throughput_kbps = if r.elapsed.as_secs_f64() > 0.0 {
+            r.received_bytes as f64 / r.elapsed.as_secs_f64() / 1024.0
+        } else {
+            0.0
+        };
+        let pct = r.received_bytes as f64 / DOWNLOAD_SIZE as f64 * 100.0;
+        eprintln!("=== Constrained relay (buf=5, drain=5ms, lat=100ms, 256KB) ===");
+        eprintln!("  Data: {}/{} bytes ({:.1}%) in {:.2}s = {:.1} KB/s",
+            r.received_bytes, DOWNLOAD_SIZE, pct, r.elapsed.as_secs_f64(), throughput_kbps);
+        eprintln!("  Client: {} segments received, {} dup ACKs sent",
+            r.segments_from_server, r.dup_acks_sent);
+        eprintln!("  Relay client→server: {} pkts forwarded", r.relay_a_to_b);
+        eprintln!("  Relay server→client: {} recv, {} forwarded, {} evicted ({:.1}% loss)",
+            r.relay_b_to_a_recv, r.relay_b_to_a_fwd, r.relay_b_to_a_evict,
+            if r.relay_b_to_a_recv > 0 {
+                r.relay_b_to_a_evict as f64 / r.relay_b_to_a_recv as f64 * 100.0
+            } else { 0.0 });
+    }
 }
