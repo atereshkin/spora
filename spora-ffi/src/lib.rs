@@ -57,8 +57,8 @@ pub struct ShareResult {
 pub fn init_android_logging() {
     let _ = android_logger::init_once(
         android_logger::Config::default()
-            .with_tag("my-rust-lib") // shows as the Logcat tag
-            .with_max_level(LevelFilter::Trace),
+            .with_tag("spora")
+            .with_max_level(LevelFilter::Debug),
     );
 }
 

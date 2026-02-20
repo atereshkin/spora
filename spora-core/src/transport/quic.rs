@@ -182,8 +182,8 @@ fn build_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(QUIC_IDLE_TIMEOUT.try_into().unwrap()));
     transport.keep_alive_interval(Some(QUIC_KEEP_ALIVE));
-    transport.datagram_receive_buffer_size(Some(65536));
-    transport.datagram_send_buffer_size(65536);
+    transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
+    transport.datagram_send_buffer_size(4 * 1024 * 1024);
     transport
 }
 

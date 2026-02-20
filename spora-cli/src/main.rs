@@ -28,7 +28,13 @@ enum Mode {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .filter_module("quinn", log::LevelFilter::Warn)
+        .filter_module("quinn_proto", log::LevelFilter::Warn)
+        .filter_module("quinn_udp", log::LevelFilter::Warn)
+        .filter_module("tracing", log::LevelFilter::Warn)
+        .filter_module("smoltcp", log::LevelFilter::Warn)
+        .init();
     let args = Args::parse();
     match args.mode{
         Mode::Share{ key } => {

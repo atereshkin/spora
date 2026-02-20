@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::task::Poll::Ready;
-use log::{debug, trace, warn};
+use log::{debug, warn};
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, Sleep};
 
@@ -207,13 +207,12 @@ impl Sink<Vec<u8>> for ReconnectTransport {
             ReconnectState::Connected(inner) => Pin::new(inner).poll_ready(cx),
             ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
         };
-        trace!("poll_ready: {:?}", ret);
         ret
     }
 
     fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
         let this = self.get_mut();
-        let ret = match &mut this.state {
+        match &mut this.state {
             ReconnectState::Connected(inner) => {
                 if let Err(e) = Pin::new(inner).start_send(item) {
                     warn!("start_send failed: {}. Reconnecting...", e);
@@ -222,9 +221,7 @@ impl Sink<Vec<u8>> for ReconnectTransport {
                 Ok(())
             },
             ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Ok(()), // drop policy
-        };
-        trace!("start_send: {:?}", ret);
-        ret
+        }
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {

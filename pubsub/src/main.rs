@@ -38,7 +38,12 @@ type Subscribers = Arc<Mutex<HashMap<Vec<u8>, Subscriber>>>;
 
 #[tokio::main]
 async fn main() {
-    env_logger::init();
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .filter_module("quinn", log::LevelFilter::Warn)
+        .filter_module("quinn_proto", log::LevelFilter::Warn)
+        .filter_module("quinn_udp", log::LevelFilter::Warn)
+        .filter_module("tracing", log::LevelFilter::Warn)
+        .init();
     let args = Args::parse();
 
     let cert_der = std::fs::read(&args.cert).expect("failed to read cert file");
