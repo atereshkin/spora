@@ -92,6 +92,9 @@ async fn main() {
     ));
     transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     transport.datagram_send_buffer_size(8 * 1024 * 1024);
+    transport.initial_mtu(1452);
+    transport.min_mtu(1452);
+    transport.mtu_discovery_config(None);
     transport.congestion_controller_factory(Arc::new(NoopCcFactory));
     server_config.transport_config(Arc::new(transport));
 
