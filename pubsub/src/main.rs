@@ -236,7 +236,15 @@ fn spawn_datagram_forwarding(a: Connection, b: Connection) {
         loop {
             match a.read_datagram().await {
                 Ok(data) => {
-                    if let Err(e) = b.send_datagram(data) {
+                    // send_datagram_wait blocks when the send buffer is full,
+                    // which stops us reading from `a`.  This provides natural
+                    // back-pressure: when `b` can't keep up, `a`'s newest
+                    // datagrams are dropped at the QUIC receive buffer (drop-
+                    // newest) instead of evicting the oldest from the send
+                    // buffer (FIFO).  Drop-newest is critical for TCP: the
+                    // oldest segments are needed for the receiver's contiguous
+                    // window to advance.
+                    if let Err(e) = b.send_datagram_wait(data).await {
                         warn!("Failed to forward datagram a→b: {}", e);
                         break;
                     }
@@ -254,7 +262,7 @@ fn spawn_datagram_forwarding(a: Connection, b: Connection) {
         loop {
             match b2.read_datagram().await {
                 Ok(data) => {
-                    if let Err(e) = a2.send_datagram(data) {
+                    if let Err(e) = a2.send_datagram_wait(data).await {
                         warn!("Failed to forward datagram b→a: {}", e);
                         break;
                     }

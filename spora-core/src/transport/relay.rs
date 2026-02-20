@@ -49,6 +49,12 @@ pub fn relay_connection(
     let send_conn = conn.clone();
     let transport_sink =
         futures_util::sink::unfold(send_conn, move |c, pkt: Vec<u8>| async move {
+            // Fire-and-forget: don't use send_datagram_wait here because the
+            // UpgradableTransport router couples send and receive in a single
+            // select loop.  Blocking here would prevent ACKs from flowing
+            // back, stalling the QUIC connection and triggering PMTUD failures.
+            // Back-pressure is applied at the relay (pubsub) side instead,
+            // where each direction runs in its own task.
             match c.send_datagram(pkt.into()) {
                 Ok(()) => {}
                 Err(quinn::SendDatagramError::TooLarge) => {

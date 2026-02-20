@@ -2067,7 +2067,7 @@ mod tests {
                             let a2 = a.clone();
                             let b2 = b.clone();
 
-                            // a → b: unconstrained throughput, but with latency
+                            // a → b: unconstrained throughput, latency via spawned delay
                             let stats_ab = stats.clone();
                             tokio::spawn(async move {
                                 loop {
@@ -2075,9 +2075,12 @@ mod tests {
                                         Ok(d) => {
                                             stats_ab.a_to_b.fetch_add(1, Ordering::Relaxed);
                                             if latency > std::time::Duration::ZERO {
-                                                tokio::time::sleep(latency).await;
-                                            }
-                                            if b.send_datagram(d).is_err() {
+                                                let b = b.clone();
+                                                tokio::spawn(async move {
+                                                    tokio::time::sleep(latency).await;
+                                                    let _ = b.send_datagram(d);
+                                                });
+                                            } else if b.send_datagram(d).is_err() {
                                                 break;
                                             }
                                         }
@@ -2087,6 +2090,9 @@ mod tests {
                             });
 
                             // b → a: constrained (server→client)
+                            // Latency is applied via spawned delay so the drain loop
+                            // isn't blocked — models production where send_datagram()
+                            // returns instantly and latency is on the wire.
                             let stats_ba = stats.clone();
                             tokio::spawn(async move {
                                 let mut buffer: VecDeque<Vec<u8>> = VecDeque::new();
@@ -2109,10 +2115,14 @@ mod tests {
                                                 Ok(d) => {
                                                     stats_ba.b_to_a_recv.fetch_add(1, Ordering::Relaxed);
                                                     if buffer_cap > 0 && buffer.len() >= buffer_cap {
-                                                        buffer.pop_front(); // evict oldest
+                                                        // Drop newest (incoming) — oldest in buffer survive.
+                                                        // This is critical for TCP: oldest segments are
+                                                        // needed for the client's contiguous window to
+                                                        // advance; dropping them causes a death spiral.
                                                         stats_ba.b_to_a_evict.fetch_add(1, Ordering::Relaxed);
+                                                    } else {
+                                                        buffer.push_back(d.to_vec());
                                                     }
-                                                    buffer.push_back(d.to_vec());
                                                 }
                                                 Err(_) => break,
                                             }
@@ -2121,9 +2131,12 @@ mod tests {
                                             if let Some(pkt) = buffer.pop_front() {
                                                 stats_ba.b_to_a_fwd.fetch_add(1, Ordering::Relaxed);
                                                 if latency > std::time::Duration::ZERO {
-                                                    tokio::time::sleep(latency).await;
-                                                }
-                                                if a2.send_datagram(pkt.into()).is_err() {
+                                                    let a2 = a2.clone();
+                                                    tokio::spawn(async move {
+                                                        tokio::time::sleep(latency).await;
+                                                        let _ = a2.send_datagram(pkt.into());
+                                                    });
+                                                } else if a2.send_datagram(pkt.into()).is_err() {
                                                     break;
                                                 }
                                             }
