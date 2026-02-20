@@ -298,4 +298,209 @@ mod tests {
         assert_eq!(received[0], SIGNAL_PREFIX);
         assert_eq!(&received[1..], b"hello");
     }
+
+    /// Create a QUIC loopback pair with a custom transport config applied to both sides.
+    async fn quic_loopback_pair_with_config(
+        transport: quinn::TransportConfig,
+    ) -> (Connection, Connection) {
+        let transport = Arc::new(transport);
+
+        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut ca_params = rcgen::CertificateParams::default();
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.distinguished_name = rcgen::DistinguishedName::new();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Test CA");
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+
+        let relay_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
+        let mut relay_params = rcgen::CertificateParams::default();
+        relay_params.distinguished_name = rcgen::DistinguishedName::new();
+        relay_params
+            .subject_alt_names
+            .push(rcgen::SanType::DnsName("localhost".try_into().unwrap()));
+        let relay_cert = relay_params
+            .signed_by(&relay_key, &ca_cert, &ca_key)
+            .unwrap();
+
+        let cert = rustls::pki_types::CertificateDer::from(relay_cert.der().to_vec());
+        let key = rustls::pki_types::PrivateKeyDer::try_from(relay_key.serialize_der()).unwrap();
+
+        let mut server_crypto = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(vec![cert], key)
+            .unwrap();
+        server_crypto.alpn_protocols = vec![b"test".to_vec()];
+
+        let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
+            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
+        ));
+        server_config.transport_config(transport.clone());
+
+        let server_ep =
+            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
+        let server_addr = server_ep.local_addr().unwrap();
+
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store
+            .add(rustls::pki_types::CertificateDer::from(
+                ca_cert.der().to_vec(),
+            ))
+            .unwrap();
+
+        let mut client_crypto = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        client_crypto.alpn_protocols = vec![b"test".to_vec()];
+
+        let mut client_config = quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto).unwrap(),
+        ));
+        client_config.transport_config(transport);
+
+        let mut client_ep =
+            quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client_ep.set_default_client_config(client_config);
+
+        let server_task = tokio::spawn(async move {
+            let incoming = server_ep.accept().await.unwrap();
+            incoming.await.unwrap()
+        });
+
+        let client_conn = client_ep
+            .connect(server_addr, "localhost")
+            .unwrap()
+            .await
+            .unwrap();
+
+        let server_conn = server_task.await.unwrap();
+        (client_conn, server_conn)
+    }
+
+    /// Demonstrates that quinn's send_datagram() silently evicts oldest
+    /// datagrams when the send buffer fills, causing packet loss under load.
+    #[tokio::test]
+    async fn send_datagram_evicts_under_pressure() {
+        const NUM_DATAGRAMS: usize = 500;
+        const PAYLOAD_SIZE: usize = 1000;
+
+        // Buffer can hold ~50 datagrams.  Larger than a "tiny" buffer so
+        // the runtime has a chance to transmit *some*, making the eviction
+        // pattern visible (only the newest survive).
+        let mut transport = quinn::TransportConfig::default();
+        transport.datagram_send_buffer_size(PAYLOAD_SIZE * 50);
+        transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
+
+        let (client_conn, server_conn) =
+            quic_loopback_pair_with_config(transport).await;
+
+        // Let QUIC handshake fully settle so datagrams are accepted.
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Blast numbered datagrams.  send_datagram() is synchronous — the
+        // QUIC runtime doesn't get to transmit between calls, so the buffer
+        // fills and the oldest datagrams get evicted.
+        for i in 0..NUM_DATAGRAMS {
+            let mut pkt = vec![0u8; PAYLOAD_SIZE];
+            pkt[0..4].copy_from_slice(&(i as u32).to_be_bytes());
+            let _ = client_conn.send_datagram(pkt.into());
+        }
+
+        // Give the runtime time to transmit whatever remains in the buffer.
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        // Collect all datagrams that arrived.
+        let mut received = Vec::new();
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                server_conn.read_datagram(),
+            )
+            .await
+            {
+                Ok(Ok(data)) => {
+                    let seq = u32::from_be_bytes(data[0..4].try_into().unwrap());
+                    received.push(seq);
+                }
+                _ => break,
+            }
+        }
+
+        eprintln!(
+            "send_datagram: sent {NUM_DATAGRAMS}, received {}, lost {}",
+            received.len(),
+            NUM_DATAGRAMS - received.len(),
+        );
+        if !received.is_empty() {
+            eprintln!(
+                "  received seq#s: {:?}",
+                &received,
+            );
+        }
+
+        // The whole point: with burst sends, send_datagram silently drops packets.
+        assert!(
+            received.len() < NUM_DATAGRAMS,
+            "expected packet loss from send_datagram eviction, but all {} arrived",
+            NUM_DATAGRAMS,
+        );
+    }
+
+    /// Shows that send_datagram_wait delivers all datagrams without loss,
+    /// because it blocks until buffer space is available.
+    #[tokio::test]
+    async fn send_datagram_wait_delivers_all() {
+        const NUM_DATAGRAMS: usize = 500;
+        const PAYLOAD_SIZE: usize = 1000;
+
+        let mut transport = quinn::TransportConfig::default();
+        transport.datagram_send_buffer_size(PAYLOAD_SIZE * 50);
+        transport.datagram_receive_buffer_size(Some(4 * 1024 * 1024));
+
+        let (client_conn, server_conn) =
+            quic_loopback_pair_with_config(transport).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // Send with backpressure — send_datagram_wait blocks when full.
+        for i in 0..NUM_DATAGRAMS {
+            let mut pkt = vec![0u8; PAYLOAD_SIZE];
+            pkt[0..4].copy_from_slice(&(i as u32).to_be_bytes());
+            client_conn
+                .send_datagram_wait(pkt.into())
+                .await
+                .expect("send_datagram_wait failed");
+        }
+
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let mut received = Vec::new();
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                server_conn.read_datagram(),
+            )
+            .await
+            {
+                Ok(Ok(data)) => {
+                    let seq = u32::from_be_bytes(data[0..4].try_into().unwrap());
+                    received.push(seq);
+                }
+                _ => break,
+            }
+        }
+
+        eprintln!(
+            "send_datagram_wait: sent {NUM_DATAGRAMS}, received {}",
+            received.len(),
+        );
+
+        assert_eq!(
+            received.len(),
+            NUM_DATAGRAMS,
+            "send_datagram_wait should deliver all datagrams, but lost {}",
+            NUM_DATAGRAMS - received.len(),
+        );
+    }
 }
