@@ -6,8 +6,7 @@ use spora_core;
 use spora_core::tun_util;
 use std::collections::HashMap;
 use std::fmt::Formatter;
-use std::os::fd::RawFd;
-use std::os::unix::io::FromRawFd;
+use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicI32, Ordering};
 use tokio::runtime::Runtime;
@@ -184,8 +183,8 @@ pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCal
     // Spawn the tunnel loop in the background.
     let task = RUNTIME.spawn(async move {
         info!("FFI tunnel task: starting with tun_fd={}", tun_fd);
-        let tun = unsafe { tokio::fs::File::from_raw_fd(tun_fd) };
-        match tun_util::start(result.transport, tun).await {
+        let tun = unsafe { OwnedFd::from_raw_fd(tun_fd) };
+        match tun_util::start_fd(result.transport, tun).await {
             Ok(()) => info!("FFI tunnel task: exited normally"),
             Err(e) => log::error!("FFI tunnel task: exited with error: {}", e),
         }
