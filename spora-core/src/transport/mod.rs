@@ -468,7 +468,7 @@ mod tests {
         let ka_cfg = KeepAliveConfig {
             mode: KeepAliveMode::Periodic {
                 interval: std::time::Duration::from_secs(5),
-                recv_timeout: std::time::Duration::from_secs(30),
+                recv_timeout: Some(std::time::Duration::from_secs(30)),
             },
             ..Default::default()
         };
@@ -529,7 +529,7 @@ mod tests {
         let ka_cfg = KeepAliveConfig {
             mode: KeepAliveMode::Periodic {
                 interval: std::time::Duration::from_secs(5),
-                recv_timeout: std::time::Duration::from_secs(30),
+                recv_timeout: Some(std::time::Duration::from_secs(30)),
             },
             ..Default::default()
         };
