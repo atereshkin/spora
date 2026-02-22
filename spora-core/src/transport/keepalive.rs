@@ -166,22 +166,92 @@ fn flush_send_state(inner: &mut IpTransport, send_state: &mut KeepAliveSendState
 
 /// Check if a packet is an ICMP Echo Reply matching our keepalive id.
 fn is_icmp_echo_reply(pkt: &[u8], expected_id: u16) -> bool {
-    // IPv4 header: protocol at byte 9 (ICMP = 1), IHL in low nibble of byte 0.
+    if let Some((1, icmp)) = parse_icmp(pkt) {
+        // Type 0 = Echo Reply
+        icmp[0] == 0 && icmp[1] == 0 && u16::from_be_bytes([icmp[4], icmp[5]]) == expected_id
+    } else {
+        false
+    }
+}
+
+/// Check if a packet is an ICMP Echo Request matching our keepalive id.
+fn is_icmp_echo_request(pkt: &[u8], expected_id: u16) -> bool {
+    if let Some((1, icmp)) = parse_icmp(pkt) {
+        // Type 8 = Echo Request
+        icmp[0] == 8 && icmp[1] == 0 && u16::from_be_bytes([icmp[4], icmp[5]]) == expected_id
+    } else {
+        false
+    }
+}
+
+/// Parse an IPv4 packet and return (protocol, icmp_slice) if it's ICMP.
+fn parse_icmp(pkt: &[u8]) -> Option<(u8, &[u8])> {
     if pkt.len() < 20 {
-        return false;
+        return None;
     }
     let ihl = ((pkt[0] & 0x0F) as usize) * 4;
-    if pkt[9] != 1 || pkt.len() < ihl + 8 {
-        return false;
+    let proto = pkt[9];
+    if proto != 1 || pkt.len() < ihl + 8 {
+        return None;
     }
-    let icmp = &pkt[ihl..];
-    // Type 0 = Echo Reply, code 0
-    if icmp[0] != 0 || icmp[1] != 0 {
-        return false;
+    Some((proto, &pkt[ihl..]))
+}
+
+/// Build an ICMP Echo Reply from an incoming Echo Request.
+/// Swaps src/dst IPs and changes type 8→0, recalculating the ICMP checksum.
+fn build_echo_reply(request: &[u8]) -> Option<Vec<u8>> {
+    if request.len() < 28 {
+        return None;
     }
-    // Identifier at offset 4-5 (big-endian)
-    let id = u16::from_be_bytes([icmp[4], icmp[5]]);
-    id == expected_id
+    let ihl = ((request[0] & 0x0F) as usize) * 4;
+    if request.len() < ihl + 8 {
+        return None;
+    }
+
+    let mut reply = request.to_vec();
+
+    // Swap src and dst IP addresses (bytes 12-15 and 16-19).
+    // Must copy dst first (from original request) since reply starts as a clone.
+    reply[12..16].copy_from_slice(&request[16..20]); // src ← old dst
+    reply[16..20].copy_from_slice(&request[12..16]); // dst ← old src
+
+    // Change ICMP type from 8 (Echo Request) to 0 (Echo Reply).
+    reply[ihl] = 0;
+
+    // Recalculate ICMP checksum.
+    // Zero out the checksum field first.
+    reply[ihl + 2] = 0;
+    reply[ihl + 3] = 0;
+    let icmp_data = &reply[ihl..];
+    let checksum = internet_checksum(icmp_data);
+    reply[ihl + 2] = (checksum >> 8) as u8;
+    reply[ihl + 3] = (checksum & 0xFF) as u8;
+
+    // Recalculate IPv4 header checksum.
+    reply[10] = 0;
+    reply[11] = 0;
+    let ip_checksum = internet_checksum(&reply[..ihl]);
+    reply[10] = (ip_checksum >> 8) as u8;
+    reply[11] = (ip_checksum & 0xFF) as u8;
+
+    Some(reply)
+}
+
+/// Standard internet checksum (RFC 1071).
+fn internet_checksum(data: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < data.len() {
+        sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < data.len() {
+        sum += (data[i] as u32) << 8;
+    }
+    while sum > 0xFFFF {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    !sum as u16
 }
 
 /// A best-effort keepalive wrapper that periodically injects an IPv4+ICMP Echo Request packet
@@ -297,25 +367,28 @@ impl KeepAliveTransport {
                 timer.as_mut().reset(Instant::now() + *interval);
             }
             ModeState::Adaptive { knob, state } => {
-                let was_idle = Instant::now().duration_since(state.last_real_outbound) > IDLE_THRESHOLD;
                 state.last_real_outbound = Instant::now();
 
-                if matches!(state.probe, ProbeState::Dormant) && was_idle {
-                    let knob_val = knob.load(Ordering::Relaxed);
-                    let interval = if knob_val > 0 {
-                        std::time::Duration::from_secs(knob_val)
-                    } else {
-                        IDLE_THRESHOLD
-                    };
-                    info!("Keepalive: Dormant -> Probing (outbound after idle gap)");
-                    if matches!(self.send_state, KeepAliveSendState::Idle) {
-                        let pkt = build_icmp_echo(&self.cfg, &mut self.seq);
-                        self.send_state = KeepAliveSendState::Sending(pkt);
+                let knob_val = knob.load(Ordering::Relaxed);
+                if knob_val == 0 {
+                    // Dormant mode (screen OFF) — don't activate probing.
+                    return;
+                }
+
+                if matches!(state.probe, ProbeState::Dormant) {
+                    let was_idle = Instant::now().duration_since(state.last_real_outbound) > IDLE_THRESHOLD;
+                    if was_idle {
+                        let interval = std::time::Duration::from_secs(knob_val);
+                        info!("Keepalive: Dormant -> Probing (outbound after idle gap)");
+                        if matches!(self.send_state, KeepAliveSendState::Idle) {
+                            let pkt = build_icmp_echo(&self.cfg, &mut self.seq);
+                            self.send_state = KeepAliveSendState::Sending(pkt);
+                        }
+                        state.probe = ProbeState::Probing {
+                            ping_timer: Box::pin(sleep(interval)),
+                            response_deadline: Box::pin(sleep(RESPONSE_TIMEOUT)),
+                        };
                     }
-                    state.probe = ProbeState::Probing {
-                        ping_timer: Box::pin(sleep(interval)),
-                        response_deadline: Box::pin(sleep(RESPONSE_TIMEOUT)),
-                    };
                 }
             }
         }
@@ -403,6 +476,19 @@ impl Stream for KeepAliveTransport {
             Poll::Ready(Some(Ok(pkt))) => {
                 if is_icmp_echo_reply(&pkt, this.cfg.icmp_id) {
                     debug!("Keepalive: received ICMP echo reply (ping response)");
+                } else if is_icmp_echo_request(&pkt, this.cfg.icmp_id) {
+                    // Peer's keepalive ping — auto-reply so the peer knows we're alive.
+                    // Don't forward to TUN (the kernel may not respond to these IPs).
+                    debug!("Keepalive: received peer's ICMP echo request, auto-replying");
+                    this.on_inbound();
+                    if let Some(reply) = build_echo_reply(&pkt) {
+                        if matches!(this.send_state, KeepAliveSendState::Idle) {
+                            this.send_state = KeepAliveSendState::Sending(reply);
+                        }
+                    }
+                    // Re-poll to flush the reply and check for more packets.
+                    cx.waker().wake_by_ref();
+                    return Poll::Pending;
                 } else {
                     trace!("Keepalive: inbound packet ({} bytes)", pkt.len());
                 }
@@ -687,7 +773,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adaptive_outbound_after_idle_triggers_ping() {
+    async fn adaptive_knob_zero_outbound_stays_dormant() {
+        // With knob=0 (screen OFF), outbound traffic should NOT activate probing.
         tokio::time::pause();
 
         let (local, mut handle) = mock_transport();
@@ -695,50 +782,40 @@ mod tests {
         let cfg = adaptive_config(knob.clone());
         let mut ka = KeepAliveTransport::new(Box::new(local), cfg);
 
-        // Advance past IDLE_THRESHOLD so that the next outbound triggers activation.
+        // Advance past IDLE_THRESHOLD.
         tokio::time::advance(IDLE_THRESHOLD + std::time::Duration::from_secs(1)).await;
 
         // Send outbound traffic.
         Pin::new(&mut ka).send(vec![1, 2, 3]).await.unwrap();
-        // Consume the user packet.
         let pkt = handle.recv().await.unwrap();
         assert_eq!(pkt, vec![1, 2, 3]);
 
-        // Drive poll to flush the scheduled ping.
+        // Drive poll — should NOT send any ping.
         drive_poll(&mut ka).await;
 
-        // Should receive the ICMP ping.
-        let pkt = tokio::time::timeout(std::time::Duration::from_millis(100), handle.recv())
-            .await
-            .expect("should receive ping after outbound-after-idle")
-            .unwrap();
-        assert!(is_icmp_echo_request(&pkt), "expected ICMP echo request");
+        let result = tokio::time::timeout(std::time::Duration::from_millis(10), handle.recv()).await;
+        assert!(result.is_err(), "knob=0: outbound should not trigger probing");
     }
 
     #[tokio::test]
-    async fn adaptive_deactivates_when_idle() {
+    async fn adaptive_deactivates_when_knob_goes_zero() {
+        // knob > 0 activates probing, then knob → 0 goes dormant immediately.
         tokio::time::pause();
 
         let (local, mut handle) = mock_transport();
-        let knob = Arc::new(AtomicU64::new(0));
+        let knob = Arc::new(AtomicU64::new(20));
         let cfg = adaptive_config(knob.clone());
         let mut ka = KeepAliveTransport::new(Box::new(local), cfg);
 
-        // Activate by sending after idle gap.
-        tokio::time::advance(IDLE_THRESHOLD + std::time::Duration::from_secs(1)).await;
-        Pin::new(&mut ka).send(vec![1, 2, 3]).await.unwrap();
-        let _ = handle.recv().await; // user pkt
-
-        // Drive to flush the activation ping.
+        // Activate — consume initial ping.
         drive_poll(&mut ka).await;
-        // Consume the ICMP ping.
         let _ = tokio::time::timeout(std::time::Duration::from_millis(100), handle.recv()).await;
 
-        // Now stop sending. Advance past IDLE_THRESHOLD.
-        tokio::time::advance(IDLE_THRESHOLD + std::time::Duration::from_secs(1)).await;
+        // Go dormant.
+        knob.store(0, Ordering::Relaxed);
         drive_poll(&mut ka).await;
 
-        // Further time passes — no more pings (dormant).
+        // Further time passes — no more pings.
         tokio::time::advance(std::time::Duration::from_secs(60)).await;
         drive_poll(&mut ka).await;
 
@@ -945,5 +1022,60 @@ mod tests {
 
         let result = tokio::time::timeout(std::time::Duration::from_millis(10), handle.recv()).await;
         assert!(result.is_err(), "should not ping after switching to on-demand and going idle");
+    }
+
+    #[tokio::test]
+    async fn auto_replies_to_peer_keepalive_ping() {
+        // When the peer (server) sends an ICMP echo request with our keepalive ID,
+        // we should auto-reply without forwarding to TUN.
+        tokio::time::pause();
+
+        let (local, mut remote) = mock_transport_pair();
+        let knob = Arc::new(AtomicU64::new(0)); // dormant
+        let cfg = adaptive_config(knob.clone());
+        let mut ka = KeepAliveTransport::new(Box::new(local), cfg);
+
+        // Build an ICMP echo request as if from the peer's keepalive.
+        // Use the default keepalive IPs and ID.
+        let peer_ping = {
+            let payload: [u8; 4] = *b"spka";
+            let mut pkt = Vec::with_capacity(64);
+            // Peer sends from its src_ip (10.0.0.1) to its dst_ip (10.0.0.2).
+            // But from our perspective, the packet arrives with src=10.0.0.1, dst=10.0.0.2.
+            let builder = etherparse::PacketBuilder::ipv4(
+                [10, 0, 0, 1], // peer's src
+                [10, 0, 0, 2], // peer's dst
+                64,
+            )
+            .icmpv4_echo_request(0x5350, 42); // our keepalive ID
+            builder.write(&mut pkt, &payload).unwrap();
+            pkt
+        };
+
+        // Peer sends the ping.
+        remote.send(peer_ping).await.unwrap();
+
+        // Drive poll — should intercept the ping and auto-reply.
+        // The ping should NOT be yielded to the caller (not forwarded to TUN).
+        drive_poll(&mut ka).await;
+
+        // Drive again to flush the reply.
+        drive_poll(&mut ka).await;
+
+        // Remote should receive an ICMP echo reply.
+        let reply = tokio::time::timeout(std::time::Duration::from_millis(100), remote.next())
+            .await
+            .expect("should receive auto-reply")
+            .unwrap()
+            .unwrap();
+
+        // Verify it's an echo reply (type 0) with swapped IPs.
+        assert!(reply.len() >= 28, "reply too short");
+        let ihl = ((reply[0] & 0x0F) as usize) * 4;
+        assert_eq!(reply[9], 1, "should be ICMP");
+        assert_eq!(reply[ihl], 0, "should be Echo Reply (type 0)");
+        // src should be 10.0.0.2 (was dst), dst should be 10.0.0.1 (was src)
+        assert_eq!(&reply[12..16], &[10, 0, 0, 2], "reply src should be swapped");
+        assert_eq!(&reply[16..20], &[10, 0, 0, 1], "reply dst should be swapped");
     }
 }

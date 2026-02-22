@@ -1,9 +1,58 @@
 use futures_util::SinkExt;
 use futures_util::stream::StreamExt;
-use log::{error, info};
+use log::{debug, error, info};
 use std::io;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::IpTransport;
+
+/// Summarise an IPv4 packet for debug logging.
+fn describe_ip_packet(pkt: &[u8]) -> String {
+    if pkt.len() < 20 {
+        return format!("too short ({} bytes)", pkt.len());
+    }
+    let version = pkt[0] >> 4;
+    if version != 4 {
+        return format!("IPv{} ({} bytes)", version, pkt.len());
+    }
+    let proto = pkt[9];
+    let src = std::net::Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+    let dst = std::net::Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+    let ihl = ((pkt[0] & 0x0F) as usize) * 4;
+    let proto_str = match proto {
+        1 => {
+            if pkt.len() > ihl {
+                let icmp_type = pkt[ihl];
+                match icmp_type {
+                    0 => "ICMP EchoReply".into(),
+                    8 => "ICMP EchoRequest".into(),
+                    _ => format!("ICMP type={}", icmp_type),
+                }
+            } else {
+                "ICMP".into()
+            }
+        }
+        6 => {
+            if pkt.len() >= ihl + 4 {
+                let sport = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
+                let dport = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
+                format!("TCP {}→{}", sport, dport)
+            } else {
+                "TCP".into()
+            }
+        }
+        17 => {
+            if pkt.len() >= ihl + 4 {
+                let sport = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
+                let dport = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
+                format!("UDP {}→{}", sport, dport)
+            } else {
+                "UDP".into()
+            }
+        }
+        _ => format!("proto={}", proto),
+    };
+    format!("{} {}→{} ({} bytes)", proto_str, src, dst, pkt.len())
+}
 
 pub async fn start(mut transport: IpTransport, mut tun: impl AsyncReadExt+AsyncWriteExt+Unpin) -> io::Result<()> {
     let mut buffer = vec![0u8; 1500];
@@ -13,6 +62,7 @@ pub async fn start(mut transport: IpTransport, mut tun: impl AsyncReadExt+AsyncW
             res = transport.next() => {
                 match res {
                     Some(Ok(pkt)) => {
+                        debug!("tunnel ← peer: {}", describe_ip_packet(&pkt));
                         // Use write() not write_all(): TUN writes are
                         // packet-atomic — one write() = one IP packet.
                         // write_all() retries partial writes, which doesn't
@@ -33,6 +83,7 @@ pub async fn start(mut transport: IpTransport, mut tun: impl AsyncReadExt+AsyncW
             res = tun.read(&mut buffer) => {
                 match res {
                     Ok(n) if n > 0 => {
+                        debug!("tunnel → peer: {}", describe_ip_packet(&buffer[..n]));
                         if let Err(e) = transport.send(buffer[..n].to_vec()).await {
                             error!("Error sending packet to remote peer: {}", e);
                         }
@@ -128,6 +179,7 @@ pub async fn start_fd(mut transport: IpTransport, fd: std::os::fd::OwnedFd) -> i
             res = transport.next() => {
                 match res {
                     Some(Ok(pkt)) => {
+                        debug!("tunnel ← peer: {}", describe_ip_packet(&pkt));
                         if tun_write_tx.send(pkt).await.is_err() {
                             info!("TUN writer thread exited.");
                             break;
@@ -145,6 +197,7 @@ pub async fn start_fd(mut transport: IpTransport, fd: std::os::fd::OwnedFd) -> i
             pkt = tun_read_rx.recv() => {
                 match pkt {
                     Some(data) => {
+                        debug!("tunnel → peer: {}", describe_ip_packet(&data));
                         if let Err(e) = transport.send(data).await {
                             error!("Error sending packet to remote peer: {}", e);
                         }
