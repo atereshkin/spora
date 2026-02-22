@@ -367,28 +367,25 @@ impl KeepAliveTransport {
                 timer.as_mut().reset(Instant::now() + *interval);
             }
             ModeState::Adaptive { knob, state } => {
+                let was_idle = Instant::now().duration_since(state.last_real_outbound) > IDLE_THRESHOLD;
                 state.last_real_outbound = Instant::now();
 
-                let knob_val = knob.load(Ordering::Relaxed);
-                if knob_val == 0 {
-                    // Dormant mode (screen OFF) — don't activate probing.
-                    return;
-                }
-
-                if matches!(state.probe, ProbeState::Dormant) {
-                    let was_idle = Instant::now().duration_since(state.last_real_outbound) > IDLE_THRESHOLD;
-                    if was_idle {
-                        let interval = std::time::Duration::from_secs(knob_val);
-                        info!("Keepalive: Dormant -> Probing (outbound after idle gap)");
-                        if matches!(self.send_state, KeepAliveSendState::Idle) {
-                            let pkt = build_icmp_echo(&self.cfg, &mut self.seq);
-                            self.send_state = KeepAliveSendState::Sending(pkt);
-                        }
-                        state.probe = ProbeState::Probing {
-                            ping_timer: Box::pin(sleep(interval)),
-                            response_deadline: Box::pin(sleep(RESPONSE_TIMEOUT)),
-                        };
+                if matches!(state.probe, ProbeState::Dormant) && was_idle {
+                    let knob_val = knob.load(Ordering::Relaxed);
+                    let interval = if knob_val > 0 {
+                        std::time::Duration::from_secs(knob_val)
+                    } else {
+                        IDLE_THRESHOLD
+                    };
+                    info!("Keepalive: Dormant -> Probing (outbound after idle gap)");
+                    if matches!(self.send_state, KeepAliveSendState::Idle) {
+                        let pkt = build_icmp_echo(&self.cfg, &mut self.seq);
+                        self.send_state = KeepAliveSendState::Sending(pkt);
                     }
+                    state.probe = ProbeState::Probing {
+                        ping_timer: Box::pin(sleep(interval)),
+                        response_deadline: Box::pin(sleep(RESPONSE_TIMEOUT)),
+                    };
                 }
             }
         }
@@ -773,8 +770,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn adaptive_knob_zero_outbound_stays_dormant() {
-        // With knob=0 (screen OFF), outbound traffic should NOT activate probing.
+    async fn adaptive_outbound_after_idle_triggers_ping() {
         tokio::time::pause();
 
         let (local, mut handle) = mock_transport();
@@ -782,40 +778,50 @@ mod tests {
         let cfg = adaptive_config(knob.clone());
         let mut ka = KeepAliveTransport::new(Box::new(local), cfg);
 
-        // Advance past IDLE_THRESHOLD.
+        // Advance past IDLE_THRESHOLD so that the next outbound triggers activation.
         tokio::time::advance(IDLE_THRESHOLD + std::time::Duration::from_secs(1)).await;
 
         // Send outbound traffic.
         Pin::new(&mut ka).send(vec![1, 2, 3]).await.unwrap();
+        // Consume the user packet.
         let pkt = handle.recv().await.unwrap();
         assert_eq!(pkt, vec![1, 2, 3]);
 
-        // Drive poll — should NOT send any ping.
+        // Drive poll to flush the scheduled ping.
         drive_poll(&mut ka).await;
 
-        let result = tokio::time::timeout(std::time::Duration::from_millis(10), handle.recv()).await;
-        assert!(result.is_err(), "knob=0: outbound should not trigger probing");
+        // Should receive the ICMP ping.
+        let pkt = tokio::time::timeout(std::time::Duration::from_millis(100), handle.recv())
+            .await
+            .expect("should receive ping after outbound-after-idle")
+            .unwrap();
+        assert!(is_icmp_echo_request(&pkt), "expected ICMP echo request");
     }
 
     #[tokio::test]
-    async fn adaptive_deactivates_when_knob_goes_zero() {
-        // knob > 0 activates probing, then knob → 0 goes dormant immediately.
+    async fn adaptive_deactivates_when_idle() {
         tokio::time::pause();
 
         let (local, mut handle) = mock_transport();
-        let knob = Arc::new(AtomicU64::new(20));
+        let knob = Arc::new(AtomicU64::new(0));
         let cfg = adaptive_config(knob.clone());
         let mut ka = KeepAliveTransport::new(Box::new(local), cfg);
 
-        // Activate — consume initial ping.
+        // Activate by sending after idle gap.
+        tokio::time::advance(IDLE_THRESHOLD + std::time::Duration::from_secs(1)).await;
+        Pin::new(&mut ka).send(vec![1, 2, 3]).await.unwrap();
+        let _ = handle.recv().await; // user pkt
+
+        // Drive to flush the activation ping.
         drive_poll(&mut ka).await;
+        // Consume the ICMP ping.
         let _ = tokio::time::timeout(std::time::Duration::from_millis(100), handle.recv()).await;
 
-        // Go dormant.
-        knob.store(0, Ordering::Relaxed);
+        // Now stop sending. Advance past IDLE_THRESHOLD → goes dormant (knob=0).
+        tokio::time::advance(IDLE_THRESHOLD + std::time::Duration::from_secs(1)).await;
         drive_poll(&mut ka).await;
 
-        // Further time passes — no more pings.
+        // Further time passes — no more pings (dormant).
         tokio::time::advance(std::time::Duration::from_secs(60)).await;
         drive_poll(&mut ka).await;
 
