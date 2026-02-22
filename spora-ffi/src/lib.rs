@@ -37,6 +37,7 @@ struct TunnelSession {
     cancel: CancellationToken,
     task: JoinHandle<()>,
     keepalive_knob: Arc<AtomicU64>,
+    keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
 }
 
 struct ShareSessionEntry {
@@ -180,6 +181,7 @@ pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCal
 
     let cancel = result.cancel;
     let keepalive_knob = result.keepalive_knob;
+    let keepalive_waker = result.keepalive_waker;
     info!("FFI connect(): relay established");
 
     // Spawn the tunnel loop in the background.
@@ -197,7 +199,7 @@ pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCal
     SESSIONS
         .lock()
         .unwrap()
-        .insert(handle, TunnelSession { cancel, task, keepalive_knob });
+        .insert(handle, TunnelSession { cancel, task, keepalive_knob, keepalive_waker });
 
     Ok(handle)
 }
@@ -228,5 +230,11 @@ pub fn set_keepalive(handle: i32, interval_secs: u32) -> Result<(), TunnelError>
     let sessions = SESSIONS.lock().unwrap();
     let session = sessions.get(&handle).ok_or(TunnelError::InvalidHandle)?;
     session.keepalive_knob.store(interval_secs as u64, Ordering::Relaxed);
+    // Wake the transport task so it notices the knob change immediately.
+    // Without this, a Dormant transport has no timers and would sleep until
+    // the next inbound/outbound packet.
+    if let Some(w) = session.keepalive_waker.lock().unwrap().take() {
+        w.wake();
+    }
     Ok(())
 }

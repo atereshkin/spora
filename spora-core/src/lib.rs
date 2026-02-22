@@ -39,6 +39,7 @@ pub struct ConnectResult {
     pub transport: IpTransport,
     pub cancel: CancellationToken,
     pub keepalive_knob: Arc<AtomicU64>,
+    pub keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
 }
 
 #[derive(Clone)]
@@ -116,6 +117,7 @@ fn build_client_transport(
     protector: &SocketProtector,
     cancel: CancellationToken,
     keepalive_knob: Arc<AtomicU64>,
+    keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
 ) -> IpTransport {
     let (relay_transport, signal_channel, demux_handle) = relay_connection(relay_conn);
 
@@ -123,7 +125,7 @@ fn build_client_transport(
         upgradable_transport(Box::new(relay_transport));
 
     let keepalive_cfg = KeepAliveConfig {
-        mode: KeepAliveMode::Adaptive { knob: keepalive_knob },
+        mode: KeepAliveMode::Adaptive { knob: keepalive_knob, waker: keepalive_waker },
         ..Default::default()
     };
     let transport: IpTransport =
@@ -152,6 +154,8 @@ fn build_client_transport(
 pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String> {
     let cancel = CancellationToken::new();
     let keepalive_knob = Arc::new(AtomicU64::new(0));
+    let keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
     let relay_conn = PubSubService::publish(
         url.host_str().unwrap(),
@@ -162,17 +166,19 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     .await
     .map_err(|e| format!("failed to publish to pubsub: {}", e))?;
 
-    let initial = build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel.clone(), keepalive_knob.clone());
+    let initial = build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel.clone(), keepalive_knob.clone(), keepalive_waker.clone());
 
     let url_clone = url;
     let config_clone = config.clone();
     let dialer_cancel = cancel.clone();
     let dialer_knob = keepalive_knob.clone();
+    let dialer_waker = keepalive_waker.clone();
     let dialer: Box<dyn FnMut() -> DialFuture + Send> = Box::new(move || {
         let url = url_clone.clone();
         let config = config_clone.clone();
         let cancel = dialer_cancel.clone();
         let knob = dialer_knob.clone();
+        let waker = dialer_waker.clone();
         Box::pin(async move {
             let relay_conn = PubSubService::publish(
                 url.host_str().unwrap(),
@@ -181,7 +187,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
                 &config.protector,
             )
             .await?;
-            Ok(build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel, knob))
+            Ok(build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel, knob, waker))
         })
     });
 
@@ -191,6 +197,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         transport,
         cancel,
         keepalive_knob,
+        keepalive_waker,
     })
 }
 

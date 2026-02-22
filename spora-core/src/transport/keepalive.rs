@@ -24,8 +24,12 @@ pub enum KeepAliveMode {
     /// Externally controlled via a shared atomic.
     /// Value 0 = on-demand (probe only after idle gap when traffic resumes).
     /// Value >0 = always probe at that interval in seconds.
+    /// The `waker` is shared with the FFI layer so that `set_keepalive()` can
+    /// wake the transport task when the knob changes (otherwise a Dormant
+    /// transport with no timers would never notice the knob change).
     Adaptive {
         knob: Arc<AtomicU64>,
+        waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
     },
 }
 
@@ -98,6 +102,7 @@ enum ModeState {
     },
     Adaptive {
         knob: Arc<AtomicU64>,
+        waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
         state: AdaptiveState,
     },
 }
@@ -207,11 +212,12 @@ impl KeepAliveTransport {
                     recv_timeout: *recv_timeout,
                 }
             }
-            KeepAliveMode::Adaptive { knob } => {
+            KeepAliveMode::Adaptive { knob, waker } => {
                 let initial = knob.load(Ordering::Relaxed);
                 info!("Keepalive: Adaptive mode (initial knob={})", initial);
                 ModeState::Adaptive {
                     knob: knob.clone(),
+                    waker: waker.clone(),
                     state: AdaptiveState {
                         last_real_outbound: Instant::now(),
                         last_inbound: Instant::now(),
@@ -245,7 +251,7 @@ impl KeepAliveTransport {
                 }
                 flush_send_state(&mut self.inner, &mut self.send_state, cx)
             }
-            ModeState::Adaptive { knob, state } => {
+            ModeState::Adaptive { knob, waker, state } => {
                 let knob_val = knob.load(Ordering::Relaxed);
 
                 match &mut state.probe {
@@ -259,6 +265,10 @@ impl KeepAliveTransport {
                                 ping_timer: Box::pin(sleep(interval)),
                                 response_deadline: Box::pin(sleep(RESPONSE_TIMEOUT)),
                             };
+                        } else {
+                            // Park the task — set_keepalive() will wake us via the
+                            // shared waker when the knob changes.
+                            *waker.lock().unwrap() = Some(cx.waker().clone());
                         }
                     }
                     ProbeState::Probing { ping_timer, response_deadline } => {
@@ -292,7 +302,7 @@ impl KeepAliveTransport {
             ModeState::Periodic { timer, interval, .. } => {
                 timer.as_mut().reset(Instant::now() + *interval);
             }
-            ModeState::Adaptive { knob, state } => {
+            ModeState::Adaptive { knob, state, .. } => {
                 let was_idle = Instant::now().duration_since(state.last_real_outbound) > IDLE_THRESHOLD;
                 state.last_real_outbound = Instant::now();
 
@@ -657,7 +667,10 @@ mod tests {
 
     fn adaptive_config(knob: Arc<AtomicU64>) -> KeepAliveConfig {
         KeepAliveConfig {
-            mode: KeepAliveMode::Adaptive { knob },
+            mode: KeepAliveMode::Adaptive {
+                knob,
+                waker: Arc::new(std::sync::Mutex::new(None)),
+            },
             ..Default::default()
         }
     }
