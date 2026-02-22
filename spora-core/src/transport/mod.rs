@@ -263,7 +263,7 @@ impl Sink<Vec<u8>> for ReconnectTransport {
 mod tests {
     use super::*;
     use super::mock::{mock_transport, mock_transport_pair, is_icmp_echo_request, MockTransportHandle};
-    use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
+    use crate::transport::keepalive::{KeepAliveConfig, KeepAliveMode, KeepAliveTransport};
     use futures_util::{SinkExt, StreamExt};
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
@@ -466,7 +466,10 @@ mod tests {
         let reconnect = Box::new(ReconnectTransport::new(Box::new(local), dialer)) as IpTransport;
 
         let ka_cfg = KeepAliveConfig {
-            interval: std::time::Duration::from_secs(5),
+            mode: KeepAliveMode::Periodic {
+                interval: std::time::Duration::from_secs(5),
+                recv_timeout: std::time::Duration::from_secs(30),
+            },
             ..Default::default()
         };
         let mut stack = KeepAliveTransport::new(reconnect, ka_cfg);
@@ -524,7 +527,10 @@ mod tests {
         let reconnect = Box::new(ReconnectTransport::new(Box::new(local), dialer)) as IpTransport;
 
         let ka_cfg = KeepAliveConfig {
-            interval: std::time::Duration::from_secs(5),
+            mode: KeepAliveMode::Periodic {
+                interval: std::time::Duration::from_secs(5),
+                recv_timeout: std::time::Duration::from_secs(30),
+            },
             ..Default::default()
         };
         let mut stack = KeepAliveTransport::new(reconnect, ka_cfg);

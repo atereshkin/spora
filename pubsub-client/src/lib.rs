@@ -62,7 +62,7 @@ impl SubConnection {
     }
 }
 
-fn build_client_crypto() -> rustls::ClientConfig {
+pub fn build_client_crypto() -> rustls::ClientConfig {
     let mut root_store = rustls::RootCertStore::empty();
     let ca_cert = rustls::pki_types::CertificateDer::from(CA_DER.to_vec());
     root_store.add(ca_cert).expect("failed to add CA cert");
@@ -72,6 +72,22 @@ fn build_client_crypto() -> rustls::ClientConfig {
         .with_no_client_auth();
     crypto.alpn_protocols = vec![ALPN.to_vec()];
     crypto
+}
+
+/// Build a `TransportConfig` with the shared MTU, buffer, and CC settings used
+/// by all pubsub QUIC endpoints.
+pub fn default_transport_config() -> quinn::TransportConfig {
+    let mut transport = quinn::TransportConfig::default();
+    transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
+    transport.datagram_send_buffer_size(8 * 1024 * 1024);
+    transport.initial_mtu(1452);
+    transport.min_mtu(1452);
+    transport.mtu_discovery_config(None);
+    transport.congestion_controller_factory(Arc::new(NoopCcFactory));
+    transport.max_idle_timeout(Some(
+        std::time::Duration::from_secs(120).try_into().unwrap(),
+    ));
+    transport
 }
 
 fn build_endpoint(
@@ -84,6 +100,16 @@ fn build_endpoint(
 /// Build a QUIC endpoint using a custom client config (for tests with ephemeral certs).
 pub fn build_endpoint_with_crypto(
     crypto: rustls::ClientConfig,
+    protector: &Option<Arc<dyn Fn(i32) + Send + Sync>>,
+) -> io::Result<quinn::Endpoint> {
+    let transport = default_transport_config();
+    build_endpoint_with_transport_config(crypto, transport, protector)
+}
+
+/// Build a QUIC endpoint with a custom transport config (e.g. for adding keepalives).
+pub fn build_endpoint_with_transport_config(
+    crypto: rustls::ClientConfig,
+    transport: quinn::TransportConfig,
     protector: &Option<Arc<dyn Fn(i32) + Send + Sync>>,
 ) -> io::Result<quinn::Endpoint> {
     let std_socket = std::net::UdpSocket::bind("0.0.0.0:0")?;
@@ -100,13 +126,6 @@ pub fn build_endpoint_with_crypto(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
             .expect("failed to build QUIC client config"),
     ));
-    let mut transport = quinn::TransportConfig::default();
-    transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
-    transport.datagram_send_buffer_size(8 * 1024 * 1024);
-    transport.initial_mtu(1452);
-    transport.min_mtu(1452);
-    transport.mtu_discovery_config(None);
-    transport.congestion_controller_factory(Arc::new(NoopCcFactory));
     client_config.transport_config(Arc::new(transport));
 
     let runtime = quinn::default_runtime()

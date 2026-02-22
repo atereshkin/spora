@@ -4,7 +4,7 @@ pub mod transport;
 pub mod tun_util;
 
 use crate::neg::{NegChannel, SignalNegChannel};
-use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
+use crate::transport::keepalive::{KeepAliveConfig, KeepAliveMode, KeepAliveTransport};
 use crate::transport::DialFuture;
 pub use crate::transport::IpTransport;
 use crate::transport::relay::{relay_connection, SignalChannel};
@@ -17,6 +17,7 @@ use quinn::Connection;
 use server::PeerPort;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 use stunclient::StunClient;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
@@ -37,6 +38,7 @@ pub fn protect_socket(protector: &SocketProtector, _socket: &UdpSocket) {
 pub struct ConnectResult {
     pub transport: IpTransport,
     pub cancel: CancellationToken,
+    pub keepalive_knob: Arc<AtomicU64>,
 }
 
 #[derive(Clone)]
@@ -106,15 +108,24 @@ pub async fn share(key: String, config: Config) -> Result<ShareSession, String> 
 
 /// Build a relay-based client transport stack and spawn a background upgrade task.
 ///
-/// Returns `KeepAlive(Upgradable(Relay))` with a background task attempting
-/// direct UDP upgrade via STUN.
-fn build_client_transport(relay_conn: Connection, stun_server: &str, protector: &SocketProtector, cancel: CancellationToken) -> IpTransport {
+/// Returns `(transport, keepalive_knob)` where `keepalive_knob` is the adaptive
+/// keepalive control (0 = on-demand, >0 = always-probe at that interval in seconds).
+fn build_client_transport(
+    relay_conn: Connection,
+    stun_server: &str,
+    protector: &SocketProtector,
+    cancel: CancellationToken,
+    keepalive_knob: Arc<AtomicU64>,
+) -> IpTransport {
     let (relay_transport, signal_channel, demux_handle) = relay_connection(relay_conn);
 
     let (upgradable, upgrade_sender, router_handle) =
         upgradable_transport(Box::new(relay_transport));
 
-    let keepalive_cfg = KeepAliveConfig::default();
+    let keepalive_cfg = KeepAliveConfig {
+        mode: KeepAliveMode::Adaptive { knob: keepalive_knob },
+        ..Default::default()
+    };
     let transport: IpTransport =
         Box::new(KeepAliveTransport::new(Box::new(upgradable), keepalive_cfg));
 
@@ -140,6 +151,7 @@ fn build_client_transport(relay_conn: Connection, stun_server: &str, protector: 
 /// 5. Wraps in ReconnectTransport to auto-reconnect if the relay connection drops
 pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String> {
     let cancel = CancellationToken::new();
+    let keepalive_knob = Arc::new(AtomicU64::new(0));
 
     let relay_conn = PubSubService::publish(
         url.host_str().unwrap(),
@@ -150,15 +162,17 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     .await
     .map_err(|e| format!("failed to publish to pubsub: {}", e))?;
 
-    let initial = build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel.clone());
+    let initial = build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel.clone(), keepalive_knob.clone());
 
     let url_clone = url;
     let config_clone = config.clone();
     let dialer_cancel = cancel.clone();
+    let dialer_knob = keepalive_knob.clone();
     let dialer: Box<dyn FnMut() -> DialFuture + Send> = Box::new(move || {
         let url = url_clone.clone();
         let config = config_clone.clone();
         let cancel = dialer_cancel.clone();
+        let knob = dialer_knob.clone();
         Box::pin(async move {
             let relay_conn = PubSubService::publish(
                 url.host_str().unwrap(),
@@ -167,7 +181,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
                 &config.protector,
             )
             .await?;
-            Ok(build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel))
+            Ok(build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel, knob))
         })
     });
 
@@ -176,6 +190,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     Ok(ConnectResult {
         transport,
         cancel,
+        keepalive_knob,
     })
 }
 
@@ -196,6 +211,10 @@ pub(crate) async fn try_direct_upgrade(
     loop {
         if cancel.is_cancelled() {
             info!("Direct upgrade cancelled");
+            return;
+        }
+        if upgrade_sender.is_closed() {
+            info!("Upgrade channel closed (transport replaced), stopping direct upgrade");
             return;
         }
         let result = if initiator {
@@ -453,7 +472,7 @@ pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
+    use crate::transport::keepalive::{KeepAliveConfig, KeepAliveMode, KeepAliveTransport};
     use crate::transport::relay::relay_connection;
     use crate::transport::upgradable::upgradable_transport;
     use futures_util::{SinkExt, StreamExt};
@@ -754,10 +773,13 @@ mod tests {
         let (server_upgradable, _server_upgrade_tx, _sr) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
-            interval: std::time::Duration::from_secs(60),
+            mode: KeepAliveMode::Periodic {
+                interval: std::time::Duration::from_secs(60),
+                recv_timeout: std::time::Duration::from_secs(30),
+            },
             ..Default::default()
         };
-        let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg);
+        let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
 
         let (client_relay, _client_sig, _crh) = relay_connection(client_conn);
         let (client_upgradable, _client_upgrade_tx, _cr) =
@@ -786,10 +808,13 @@ mod tests {
         let (server_upgradable, _server_upgrade_tx, _sr) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
-            interval: std::time::Duration::from_secs(60),
+            mode: KeepAliveMode::Periodic {
+                interval: std::time::Duration::from_secs(60),
+                recv_timeout: std::time::Duration::from_secs(30),
+            },
             ..Default::default()
         };
-        let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg);
+        let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
 
         let (client_relay, _client_sig, _ch) = relay_connection(client_conn);
         let (client_upgradable, client_upgrade_tx, _cr) =
@@ -829,10 +854,13 @@ mod tests {
         let (server_upgradable, server_upgrade_tx, _sr) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
-            interval: std::time::Duration::from_secs(300),
+            mode: KeepAliveMode::Periodic {
+                interval: std::time::Duration::from_secs(300),
+                recv_timeout: std::time::Duration::from_secs(30),
+            },
             ..Default::default()
         };
-        let mut server_transport = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg);
+        let mut server_transport = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
 
         let (client_relay, _client_sig, _ch) = relay_connection(client_conn);
         let (client_upgradable, _client_upgrade_tx, _cr) =
@@ -885,10 +913,13 @@ mod tests {
         let (server_upgradable, _server_up_tx, _sr) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
-            interval: std::time::Duration::from_secs(60),
+            mode: KeepAliveMode::Periodic {
+                interval: std::time::Duration::from_secs(60),
+                recv_timeout: std::time::Duration::from_secs(30),
+            },
             ..Default::default()
         };
-        let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg);
+        let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
 
         let client_conn = pub_handle.await.unwrap();
         let (client_relay, _client_sig, _ch) = relay_connection(client_conn);
@@ -912,10 +943,13 @@ mod tests {
         let (server_upgradable, server_upgrade_tx, _sr) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
-            interval: std::time::Duration::from_secs(60),
+            mode: KeepAliveMode::Periodic {
+                interval: std::time::Duration::from_secs(60),
+                recv_timeout: std::time::Duration::from_secs(30),
+            },
             ..Default::default()
         };
-        let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg);
+        let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
 
         let _server_upgrade = tokio::spawn(async move {
             try_direct_upgrade(server_signal, server_upgrade_tx, "192.0.2.1:19302", false, &None, CancellationToken::new()).await;
@@ -951,7 +985,10 @@ mod tests {
 
         let (port, crypto) = start_fake_relay();
         let ka_cfg = KeepAliveConfig {
-            interval: std::time::Duration::from_secs(300),
+            mode: KeepAliveMode::Periodic {
+                interval: std::time::Duration::from_secs(300),
+                recv_timeout: std::time::Duration::from_secs(30),
+            },
             ..Default::default()
         };
 
@@ -960,11 +997,11 @@ mod tests {
 
         let (server_relay, _, _sh) = relay_connection(server_conn);
         let (server_up, _, _sr) = upgradable_transport(Box::new(server_relay));
-        let mut server1 = KeepAliveTransport::new(Box::new(server_up), ka_cfg);
+        let mut server1 = KeepAliveTransport::new(Box::new(server_up), ka_cfg.clone());
 
         let (client_relay, _, client_demux) = relay_connection(client_conn);
         let (client_up, _, _cr) = upgradable_transport(Box::new(client_relay));
-        let client_inner: IpTransport = Box::new(KeepAliveTransport::new(Box::new(client_up), ka_cfg));
+        let client_inner: IpTransport = Box::new(KeepAliveTransport::new(Box::new(client_up), ka_cfg.clone()));
 
         let crypto_clone = crypto.clone();
         let dialer: Box<dyn FnMut() -> DialFuture + Send> = Box::new(move || {
@@ -974,7 +1011,13 @@ mod tests {
                 let conn = PubSubService::publish_with_endpoint("127.0.0.1", port, "testkey", &ep).await?;
                 let (relay, _, _) = relay_connection(conn);
                 let (up, _, _) = upgradable_transport(Box::new(relay));
-                let ka = KeepAliveConfig { interval: std::time::Duration::from_secs(300), ..Default::default() };
+                let ka = KeepAliveConfig {
+                    mode: KeepAliveMode::Periodic {
+                        interval: std::time::Duration::from_secs(300),
+                        recv_timeout: std::time::Duration::from_secs(30),
+                    },
+                    ..Default::default()
+                };
                 Ok(Box::new(KeepAliveTransport::new(Box::new(up), ka)) as IpTransport)
             })
         });
@@ -1076,11 +1119,14 @@ mod tests {
         let (server_upgradable, _server_upgrade_tx, _server_router) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
-            interval: std::time::Duration::from_secs(300),
+            mode: KeepAliveMode::Periodic {
+                interval: std::time::Duration::from_secs(300),
+                recv_timeout: std::time::Duration::from_secs(30),
+            },
             ..Default::default()
         };
         let server_transport: IpTransport =
-            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg));
+            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone()));
 
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -1128,7 +1174,7 @@ mod tests {
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig::default();
         let server_transport: IpTransport =
-            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg));
+            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone()));
 
         let _server_upgrade = tokio::spawn(async move {
             try_direct_upgrade(server_signal, server_upgrade_tx, "192.0.2.1:19302", false, &None, CancellationToken::new()).await;
@@ -1193,11 +1239,14 @@ mod tests {
         let (server_upgradable, _server_upgrade_tx, _server_router) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
-            interval: std::time::Duration::from_secs(300),
+            mode: KeepAliveMode::Periodic {
+                interval: std::time::Duration::from_secs(300),
+                recv_timeout: std::time::Duration::from_secs(30),
+            },
             ..Default::default()
         };
         let server_transport: IpTransport =
-            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg));
+            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone()));
 
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -1258,11 +1307,14 @@ mod tests {
         let (server_upgradable, _server_upgrade_tx, server_router) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
-            interval: std::time::Duration::from_secs(300),
+            mode: KeepAliveMode::Periodic {
+                interval: std::time::Duration::from_secs(300),
+                recv_timeout: std::time::Duration::from_secs(30),
+            },
             ..Default::default()
         };
         let server_transport: IpTransport =
-            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg));
+            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone()));
 
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -2188,11 +2240,14 @@ mod tests {
         let (server_upgradable, _server_upgrade_tx, server_router) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
-            interval: std::time::Duration::from_secs(300),
+            mode: KeepAliveMode::Periodic {
+                interval: std::time::Duration::from_secs(300),
+                recv_timeout: std::time::Duration::from_secs(30),
+            },
             ..Default::default()
         };
         let server_transport: IpTransport =
-            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg));
+            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone()));
 
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();

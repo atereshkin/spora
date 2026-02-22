@@ -86,7 +86,6 @@ async fn main() {
     ));
 
     let mut transport = quinn::TransportConfig::default();
-    transport.keep_alive_interval(Some(std::time::Duration::from_secs(15)));
     transport.max_idle_timeout(Some(
         std::time::Duration::from_secs(120).try_into().unwrap(),
     ));

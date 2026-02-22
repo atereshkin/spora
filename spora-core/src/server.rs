@@ -383,8 +383,14 @@ pub struct PeerPort {
 
 impl PeerPort {
     async fn connect_pubsub(key: &str, config: &Config) -> io::Result<SubConnection> {
+        let crypto = pubsub_client::build_client_crypto();
+        let mut transport = pubsub_client::default_transport_config();
+        transport.keep_alive_interval(Some(Duration::from_secs(20)));
+        let endpoint = pubsub_client::build_endpoint_with_transport_config(
+            crypto, transport, &config.protector,
+        )?;
         let pubsub = PubSubService::new(&config.pubsub_host, config.pubsub_port);
-        pubsub.sub(key, &config.protector).await
+        pubsub.sub_with_endpoint(key, &endpoint).await
     }
 
     pub async fn new(key: String, config: Config) -> io::Result<Self> {

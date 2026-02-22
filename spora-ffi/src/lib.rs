@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
@@ -36,6 +36,7 @@ static SESSIONS: Lazy<Mutex<HashMap<i32, TunnelSession>>> =
 struct TunnelSession {
     cancel: CancellationToken,
     task: JoinHandle<()>,
+    keepalive_knob: Arc<AtomicU64>,
 }
 
 struct ShareSessionEntry {
@@ -178,6 +179,7 @@ pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCal
     })?;
 
     let cancel = result.cancel;
+    let keepalive_knob = result.keepalive_knob;
     info!("FFI connect(): relay established");
 
     // Spawn the tunnel loop in the background.
@@ -195,7 +197,7 @@ pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCal
     SESSIONS
         .lock()
         .unwrap()
-        .insert(handle, TunnelSession { cancel, task });
+        .insert(handle, TunnelSession { cancel, task, keepalive_knob });
 
     Ok(handle)
 }
@@ -211,5 +213,20 @@ pub fn disconnect(handle: i32) -> Result<(), TunnelError> {
     info!("FFI disconnect(): aborting task...");
     session.task.abort();
     info!("FFI disconnect(): done");
+    Ok(())
+}
+
+/// Controls the keepalive behavior for a client tunnel.
+///
+/// - `interval_secs = 0`: on-demand mode (dormant when idle, probes on traffic after gap).
+/// - `interval_secs > 0`: always probe at that interval (e.g. 20 when screen is on).
+///
+/// Transition from 0→N sends an immediate ping to detect dead connections.
+#[uniffi::export]
+pub fn set_keepalive(handle: i32, interval_secs: u32) -> Result<(), TunnelError> {
+    info!("FFI set_keepalive(handle={}, interval_secs={})", handle, interval_secs);
+    let sessions = SESSIONS.lock().unwrap();
+    let session = sessions.get(&handle).ok_or(TunnelError::InvalidHandle)?;
+    session.keepalive_knob.store(interval_secs as u64, Ordering::Relaxed);
     Ok(())
 }
