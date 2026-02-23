@@ -1739,6 +1739,7 @@ version = "0.1.0"
 dependencies = [
  "etherparse",
  "futures-util",
+ "libc",
  "log",
  "netstack-smoltcp",
  "pubsub-client",

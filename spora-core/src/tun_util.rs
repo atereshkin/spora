@@ -134,8 +134,34 @@ pub async fn start_fd(mut transport: IpTransport, fd: std::os::fd::OwnedFd) -> i
     let reader = std::thread::Builder::new()
         .name("tun-read".into())
         .spawn(move || {
+            use std::os::fd::AsRawFd;
+            let raw_fd = reader_file.as_raw_fd();
             let mut buf = vec![0u8; 1500];
             loop {
+                // Wait for the fd to become readable instead of busy-looping
+                // on WouldBlock.  The 100ms timeout lets us detect shutdown
+                // (channel receiver dropped) without sleeping forever.
+                let mut pfd = libc::pollfd { fd: raw_fd, events: libc::POLLIN, revents: 0 };
+                let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
+                if ret < 0 {
+                    let e = io::Error::last_os_error();
+                    if e.kind() == io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    error!("TUN poll error: {}", e);
+                    break;
+                }
+                if ret == 0 {
+                    // Timeout — check if the async side dropped the receiver.
+                    if tun_read_tx.is_closed() {
+                        break;
+                    }
+                    continue;
+                }
+                // POLLERR/POLLHUP/POLLNVAL without POLLIN means the fd is gone.
+                if pfd.revents & libc::POLLIN == 0 {
+                    break;
+                }
                 match (&*reader_file).read(&mut buf) {
                     Ok(0) => break, // TUN closed
                     Ok(n) => {
