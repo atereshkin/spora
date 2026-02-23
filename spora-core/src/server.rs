@@ -491,7 +491,7 @@ impl PeerPort {
             let protector = self.config.protector.clone();
             let protector2 = self.config.protector.clone();
             let upgrade_task = tokio::spawn(async move {
-                crate::try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, false, &protector, upgrade_cancel).await;
+                crate::try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, false, &protector, upgrade_cancel, None).await;
             });
 
             tokio::spawn(async move {

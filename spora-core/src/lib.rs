@@ -124,6 +124,7 @@ fn build_client_transport(
     let (upgradable, upgrade_sender, router_handle) =
         upgradable_transport(Box::new(relay_transport));
 
+    let upgrade_knob = keepalive_knob.clone();
     let keepalive_cfg = KeepAliveConfig {
         mode: KeepAliveMode::Adaptive { knob: keepalive_knob, waker: keepalive_waker },
         ..Default::default()
@@ -136,7 +137,7 @@ fn build_client_transport(
     let stun_server = stun_server.to_string();
     let protector = protector.clone();
     tokio::spawn(async move {
-        try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, true, &protector, cancel).await;
+        try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, true, &protector, cancel, Some(upgrade_knob)).await;
         drop(demux_handle);
         drop(router_handle);
     });
@@ -214,7 +215,12 @@ pub(crate) async fn try_direct_upgrade(
     initiator: bool,
     protector: &SocketProtector,
     cancel: CancellationToken,
+    keepalive_knob: Option<Arc<AtomicU64>>,
 ) {
+    const MAX_DORMANT_ATTEMPTS: u32 = 3;
+    let mut dormant_attempts: u32 = 0;
+    let mut was_active = false;
+
     loop {
         if cancel.is_cancelled() {
             info!("Direct upgrade cancelled");
@@ -224,6 +230,44 @@ pub(crate) async fn try_direct_upgrade(
             info!("Upgrade channel closed (transport replaced), stopping direct upgrade");
             return;
         }
+
+        // Check keepalive knob for dormant retry limiting (initiator only).
+        if initiator {
+            if let Some(ref knob) = keepalive_knob {
+                let knob_val = knob.load(std::sync::atomic::Ordering::Relaxed);
+                let active = knob_val > 0;
+
+                // Knob transitioned 0→N: reset attempt counter
+                if active && !was_active {
+                    dormant_attempts = 0;
+                }
+                was_active = active;
+
+                // Dormant and attempts exhausted: park until knob changes
+                if !active && dormant_attempts >= MAX_DORMANT_ATTEMPTS {
+                    info!("Direct upgrade: dormant attempts exhausted, waiting for screen-on");
+                    loop {
+                        tokio::select! {
+                            _ = cancel.cancelled() => {
+                                info!("Direct upgrade cancelled while parked");
+                                return;
+                            }
+                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
+                        }
+                        if upgrade_sender.is_closed() {
+                            info!("Upgrade channel closed while parked");
+                            return;
+                        }
+                        if knob.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                            dormant_attempts = 0;
+                            was_active = true;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
         let result = if initiator {
             try_direct_as_initiator(&mut signal, stun_server, protector).await
         } else {
@@ -240,6 +284,12 @@ pub(crate) async fn try_direct_upgrade(
             Err(e) => {
                 warn!("Direct connection attempt failed: {}.", e);
                 if initiator {
+                    // Track dormant attempts
+                    if let Some(ref knob) = keepalive_knob {
+                        if knob.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                            dormant_attempts += 1;
+                        }
+                    }
                     warn!("Retrying in 15s...");
                     tokio::select! {
                         _ = cancel.cancelled() => {
@@ -959,7 +1009,7 @@ mod tests {
         let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
 
         let _server_upgrade = tokio::spawn(async move {
-            try_direct_upgrade(server_signal, server_upgrade_tx, "192.0.2.1:19302", false, &None, CancellationToken::new()).await;
+            try_direct_upgrade(server_signal, server_upgrade_tx, "192.0.2.1:19302", false, &None, CancellationToken::new(), None).await;
         });
 
         let (client_relay, client_signal, _ch) = relay_connection(client_conn);
@@ -968,7 +1018,7 @@ mod tests {
         let mut client_stack = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
 
         let _client_upgrade = tokio::spawn(async move {
-            try_direct_upgrade(client_signal, client_upgrade_tx, "192.0.2.1:19302", true, &None, CancellationToken::new()).await;
+            try_direct_upgrade(client_signal, client_upgrade_tx, "192.0.2.1:19302", true, &None, CancellationToken::new(), None).await;
         });
 
         let pkt = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
@@ -1184,7 +1234,7 @@ mod tests {
             Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone()));
 
         let _server_upgrade = tokio::spawn(async move {
-            try_direct_upgrade(server_signal, server_upgrade_tx, "192.0.2.1:19302", false, &None, CancellationToken::new()).await;
+            try_direct_upgrade(server_signal, server_upgrade_tx, "192.0.2.1:19302", false, &None, CancellationToken::new(), None).await;
         });
 
         let cancel = CancellationToken::new();
@@ -1199,7 +1249,7 @@ mod tests {
         let mut client_transport = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
 
         let _client_upgrade = tokio::spawn(async move {
-            try_direct_upgrade(client_signal, client_upgrade_tx, "192.0.2.1:19302", true, &None, CancellationToken::new()).await;
+            try_direct_upgrade(client_signal, client_upgrade_tx, "192.0.2.1:19302", true, &None, CancellationToken::new(), None).await;
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
