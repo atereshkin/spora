@@ -24,6 +24,29 @@ use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
+/// Extract (relay_host, relay_port, key) from a `https://spora.to/s/<key>?r=<host>:<port>` URL.
+fn parse_spora_url(url: &Url) -> Result<(String, u16, String), String> {
+    let key = url
+        .path()
+        .strip_prefix("/s/")
+        .ok_or_else(|| format!("URL path must start with /s/, got {}", url.path()))?;
+    if key.is_empty() {
+        return Err("URL path is missing the key after /s/".into());
+    }
+    let relay = url
+        .query_pairs()
+        .find(|(k, _)| k == "r")
+        .map(|(_, v)| v.into_owned())
+        .ok_or("URL is missing required ?r= query parameter")?;
+    let (host, port_str) = relay
+        .rsplit_once(':')
+        .ok_or_else(|| format!("?r= value must be host:port, got {}", relay))?;
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| format!("invalid port in ?r= value: {}", port_str))?;
+    Ok((host.to_string(), port, key.to_string()))
+}
+
 pub type SocketProtector = Option<Arc<dyn Fn(i32) + Send + Sync>>;
 
 /// Call the protector callback with the socket's raw fd (unix only).
@@ -158,10 +181,12 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     let keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>> =
         Arc::new(std::sync::Mutex::new(None));
 
+    let (relay_host, relay_port, key) = parse_spora_url(&url)?;
+
     let relay_conn = PubSubService::publish(
-        url.host_str().unwrap(),
-        url.port().unwrap(),
-        url.path().strip_prefix("/").unwrap(),
+        &relay_host,
+        relay_port,
+        &key,
         &config.protector,
     )
     .await
@@ -169,22 +194,22 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
 
     let initial = build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel.clone(), keepalive_knob.clone(), keepalive_waker.clone());
 
-    let url_clone = url;
     let config_clone = config.clone();
     let dialer_cancel = cancel.clone();
     let dialer_knob = keepalive_knob.clone();
     let dialer_waker = keepalive_waker.clone();
     let dialer: Box<dyn FnMut() -> DialFuture + Send> = Box::new(move || {
-        let url = url_clone.clone();
+        let relay_host = relay_host.clone();
+        let key = key.clone();
         let config = config_clone.clone();
         let cancel = dialer_cancel.clone();
         let knob = dialer_knob.clone();
         let waker = dialer_waker.clone();
         Box::pin(async move {
             let relay_conn = PubSubService::publish(
-                url.host_str().unwrap(),
-                url.port().unwrap(),
-                url.path().strip_prefix("/").unwrap(),
+                &relay_host,
+                relay_port,
+                &key,
                 &config.protector,
             )
             .await?;

@@ -99,7 +99,7 @@ pub fn share(key: String, protector: Option<Box<dyn SocketProtectorCallback>>) -
         .block_on(spora_core::share(key, config))
         .map_err(|e| ShareError::Generic(e.to_string()))?;
 
-    let url = format!("spora://{}/{}", session.endpoint, session.key);
+    let url = format!("https://spora.to/s/{}?r={}", session.key, session.endpoint);
     let cancel = session.cancel.clone();
     let task = session.task;
 
@@ -164,7 +164,7 @@ pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCal
     info!("FFI connect() called with tun_fd={}", tun_fd);
 
     let url = Url::parse(&url).map_err(|_| InvalidUrl)?;
-    if url.scheme() != "spora" {
+    if url.scheme() != "https" {
         return Err(InvalidUrl);
     }
 

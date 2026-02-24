@@ -40,7 +40,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::Share{ key } => {
             let key = key.unwrap_or_else(make_secret_key);
             let session = share(key, Config::default()).await?;
-            println!("Expecting peer negotiation at spora://{}/{}", session.endpoint, session.key);
+            println!("Expecting peer negotiation at https://spora.to/s/{}?r={}", session.key, session.endpoint);
             println!("Press Ctrl+C to stop sharing.");
             tokio::signal::ctrl_c().await?;
             println!("Stopping share session...");
@@ -56,8 +56,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(not(windows))]
             {
                 let url = Url::parse(&url)?;
-                if url.scheme() != "spora" {
-                    panic!("Unsupported scheme {}. Expected a spora:// URL", url.scheme());
+                if url.scheme() != "https" {
+                    panic!("Unsupported scheme {}. Expected an https:// URL", url.scheme());
                 }
                 let result = connect(url, &Config::default()).await.unwrap();
                 let tun = Tun::builder().name("").up().try_build().unwrap();
