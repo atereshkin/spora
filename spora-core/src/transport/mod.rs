@@ -13,7 +13,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::task::Poll::Ready;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use tokio::net::UdpSocket;
 use tokio::time::{sleep, Sleep};
 
@@ -182,6 +182,7 @@ impl Stream for ReconnectTransport {
                 },
                 ReconnectState::Dialing(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(new_inner)) => {
+                        info!("Reconnected successfully");
                         this.state = ReconnectState::Connected(new_inner);
                         continue;
                     }

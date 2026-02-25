@@ -182,6 +182,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         Arc::new(std::sync::Mutex::new(None));
 
     let (relay_host, relay_port, key) = parse_spora_url(&url)?;
+    info!("Connecting to relay {}:{} with key {}", relay_host, relay_port, key);
 
     let relay_conn = PubSubService::publish(
         &relay_host,
@@ -191,6 +192,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     )
     .await
     .map_err(|e| format!("failed to publish to pubsub: {}", e))?;
+    info!("Relay connection established");
 
     let initial = build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel.clone(), keepalive_knob.clone(), keepalive_waker.clone());
 

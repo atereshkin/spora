@@ -3,7 +3,7 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use log::{debug, error};
+use log::{debug, error, info};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
@@ -47,7 +47,7 @@ async fn transport_router(
     loop {
         match route_one(current, &mut upgrade_rx, &in_tx, &mut out_rx).await {
             RouteResult::Upgraded(new_transport) => {
-                debug!("Transport upgraded");
+                info!("Transport upgraded to direct connection");
                 current = new_transport;
                 // continue loop — will re-split the new transport
             }

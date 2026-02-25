@@ -1,11 +1,15 @@
 use futures_util::SinkExt;
 use futures_util::stream::StreamExt;
-use log::{debug, error, info};
+use log::{debug, error, info, trace};
 use std::io;
+use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use crate::IpTransport;
 
-/// Summarise an IPv4 packet for debug logging.
+/// How often to emit aggregate tunnel stats at debug level.
+const STATS_INTERVAL_SECS: u64 = 30;
+
+/// Summarise an IPv4 packet for trace logging.
 fn describe_ip_packet(pkt: &[u8]) -> String {
     if pkt.len() < 20 {
         return format!("too short ({} bytes)", pkt.len());
@@ -54,15 +58,67 @@ fn describe_ip_packet(pkt: &[u8]) -> String {
     format!("{} {}→{} ({} bytes)", proto_str, src, dst, pkt.len())
 }
 
+/// Counters for periodic aggregate stats.
+struct TunnelStats {
+    rx_packets: u64,
+    rx_bytes: u64,
+    tx_packets: u64,
+    tx_bytes: u64,
+    last_report: Instant,
+}
+
+impl TunnelStats {
+    fn new() -> Self {
+        Self {
+            rx_packets: 0,
+            rx_bytes: 0,
+            tx_packets: 0,
+            tx_bytes: 0,
+            last_report: Instant::now(),
+        }
+    }
+
+    fn record_rx(&mut self, bytes: usize) {
+        self.rx_packets += 1;
+        self.rx_bytes += bytes as u64;
+    }
+
+    fn record_tx(&mut self, bytes: usize) {
+        self.tx_packets += 1;
+        self.tx_bytes += bytes as u64;
+    }
+
+    fn maybe_report(&mut self) {
+        let elapsed = self.last_report.elapsed();
+        if elapsed.as_secs() >= STATS_INTERVAL_SECS {
+            debug!(
+                "Tunnel stats ({}s): rx {} pkts/{} bytes, tx {} pkts/{} bytes",
+                elapsed.as_secs(),
+                self.rx_packets,
+                self.rx_bytes,
+                self.tx_packets,
+                self.tx_bytes,
+            );
+            self.rx_packets = 0;
+            self.rx_bytes = 0;
+            self.tx_packets = 0;
+            self.tx_bytes = 0;
+            self.last_report = Instant::now();
+        }
+    }
+}
+
 pub async fn start(mut transport: IpTransport, mut tun: impl AsyncReadExt+AsyncWriteExt+Unpin) -> io::Result<()> {
     let mut buffer = vec![0u8; 1500];
+    let mut stats = TunnelStats::new();
 
     loop {
         tokio::select! {
             res = transport.next() => {
                 match res {
                     Some(Ok(pkt)) => {
-                        debug!("tunnel ← peer: {}", describe_ip_packet(&pkt));
+                        trace!("tunnel ← peer: {}", describe_ip_packet(&pkt));
+                        stats.record_rx(pkt.len());
                         // Use write() not write_all(): TUN writes are
                         // packet-atomic — one write() = one IP packet.
                         // write_all() retries partial writes, which doesn't
@@ -83,7 +139,8 @@ pub async fn start(mut transport: IpTransport, mut tun: impl AsyncReadExt+AsyncW
             res = tun.read(&mut buffer) => {
                 match res {
                     Ok(n) if n > 0 => {
-                        debug!("tunnel → peer: {}", describe_ip_packet(&buffer[..n]));
+                        trace!("tunnel → peer: {}", describe_ip_packet(&buffer[..n]));
+                        stats.record_tx(n);
                         if let Err(e) = transport.send(buffer[..n].to_vec()).await {
                             error!("Error sending packet to remote peer: {}", e);
                         }
@@ -101,6 +158,7 @@ pub async fn start(mut transport: IpTransport, mut tun: impl AsyncReadExt+AsyncW
                 }
             }
         }
+        stats.maybe_report();
     }
     Ok(())
 }
@@ -200,12 +258,14 @@ pub async fn start_fd(mut transport: IpTransport, fd: std::os::fd::OwnedFd) -> i
         .map_err(|e| io::Error::other(format!("failed to spawn tun-write thread: {}", e)))?;
 
     // Bridge between transport and TUN channels.
+    let mut stats = TunnelStats::new();
     loop {
         tokio::select! {
             res = transport.next() => {
                 match res {
                     Some(Ok(pkt)) => {
-                        debug!("tunnel ← peer: {}", describe_ip_packet(&pkt));
+                        trace!("tunnel ← peer: {}", describe_ip_packet(&pkt));
+                        stats.record_rx(pkt.len());
                         if tun_write_tx.send(pkt).await.is_err() {
                             info!("TUN writer thread exited.");
                             break;
@@ -223,7 +283,8 @@ pub async fn start_fd(mut transport: IpTransport, fd: std::os::fd::OwnedFd) -> i
             pkt = tun_read_rx.recv() => {
                 match pkt {
                     Some(data) => {
-                        debug!("tunnel → peer: {}", describe_ip_packet(&data));
+                        trace!("tunnel → peer: {}", describe_ip_packet(&data));
+                        stats.record_tx(data.len());
                         if let Err(e) = transport.send(data).await {
                             error!("Error sending packet to remote peer: {}", e);
                         }
@@ -235,6 +296,7 @@ pub async fn start_fd(mut transport: IpTransport, fd: std::os::fd::OwnedFd) -> i
                 }
             }
         }
+        stats.maybe_report();
     }
 
     // Drop channels to signal threads to exit, then wait.

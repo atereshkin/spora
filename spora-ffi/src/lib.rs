@@ -15,6 +15,7 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 extern crate android_logger;
 use log::{info, LevelFilter};
+use android_logger::FilterBuilder;
 
 /// Callback interface that Kotlin implements to protect sockets from VPN routing.
 #[uniffi::export(callback_interface)]
@@ -56,10 +57,19 @@ pub struct ShareResult {
 
 #[uniffi::export]
 pub fn init_android_logging() {
-    let _ = android_logger::init_once(
+    let filter = FilterBuilder::new()
+        .filter_module("quinn", LevelFilter::Warn)
+        .filter_module("quinn_proto", LevelFilter::Warn)
+        .filter_module("quinn_udp", LevelFilter::Warn)
+        .filter_module("tracing", LevelFilter::Warn)
+        .filter_module("smoltcp", LevelFilter::Warn)
+        .filter_level(LevelFilter::Debug)
+        .build();
+    android_logger::init_once(
         android_logger::Config::default()
             .with_tag("spora")
-            .with_max_level(LevelFilter::Debug),
+            .with_max_level(LevelFilter::Trace)
+            .with_filter(filter),
     );
 }
 

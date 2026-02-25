@@ -8,7 +8,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use pubsub_client::{PubSubService, SubConnection};
 use tokio_util::sync::CancellationToken;
 use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
-use log::{debug, error, info, warn};
+use log::{debug, error, info, trace, warn};
 use futures_util::{Sink, Stream, SinkExt, StreamExt};
 use crate::transport::IpTransport;
 use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
@@ -290,7 +290,7 @@ async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket, protec
             _ = sweep_interval.tick() => {
                 entries.retain(|key, entry| {
                     if entry.last_activity.elapsed() > UDP_NAT_TIMEOUT {
-                        debug!("UDP NAT entry expired: {:?} => {:?}", key.0, key.1);
+                        trace!("UDP NAT entry expired: {:?} => {:?}", key.0, key.1);
                         entry.task.abort();
                         false
                     } else {
@@ -334,6 +334,7 @@ pub enum TunnelError {
 ///
 /// Blocks until the tunnel ends or `cancel` is triggered.
 pub(crate) async fn start_tunnel(transport: IpTransport, protector: SocketProtector, cancel: CancellationToken) -> io::Result<()> {
+    info!("Starting tunnel (virtual IP stack)");
     let builder = StackBuilder::default()
         .stack_buffer_size(4096)
         .enable_tcp(true)
