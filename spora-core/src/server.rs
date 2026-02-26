@@ -471,7 +471,7 @@ impl PeerPort {
 
             // Demux the relay connection into IP transport and signal channel
             let (relay_transport, signal_channel, demux_handle) =
-                relay_connection(sub_conn.connection);
+                relay_connection(sub_conn.connection, self.config.mtu_callback.clone());
 
             // Wrap in upgradable transport
             let (upgradable, upgrade_sender, router_handle) =
@@ -491,8 +491,9 @@ impl PeerPort {
             let upgrade_cancel = child_cancel.clone();
             let protector = self.config.protector.clone();
             let protector2 = self.config.protector.clone();
+            let mtu_cb = self.config.mtu_callback.clone();
             let upgrade_task = tokio::spawn(async move {
-                crate::try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, false, &protector, upgrade_cancel, None).await;
+                crate::try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, false, &protector, upgrade_cancel, None, mtu_cb).await;
             });
 
             tokio::spawn(async move {

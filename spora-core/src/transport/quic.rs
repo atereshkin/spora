@@ -114,6 +114,10 @@ pub struct QuicPeerTransport {
 }
 
 impl QuicPeerTransport {
+    pub fn max_datagram_size(&self) -> Option<usize> {
+        self.conn.max_datagram_size()
+    }
+
     fn new(conn: Connection) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let read_conn = conn.clone();
@@ -212,9 +216,8 @@ fn build_transport_config() -> quinn::TransportConfig {
     transport.keep_alive_interval(Some(QUIC_KEEP_ALIVE));
     transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     transport.datagram_send_buffer_size(8 * 1024 * 1024);
-    transport.initial_mtu(1452);
-    transport.min_mtu(1452);
-    transport.mtu_discovery_config(None);
+    transport.initial_mtu(1200);
+    transport.min_mtu(1200);
     transport.congestion_controller_factory(Arc::new(NoopCcFactory));
     transport
 }

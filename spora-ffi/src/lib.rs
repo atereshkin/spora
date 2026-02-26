@@ -23,6 +23,16 @@ pub trait SocketProtectorCallback: Send + Sync {
     fn protect(&self, fd: i32);
 }
 
+/// Callback interface for MTU notifications.
+///
+/// Called when the effective tunnel MTU is discovered (via PMTUD).
+/// May be called multiple times: once after relay connection, and again after
+/// direct P2P upgrade. The Android app can use the value to configure the TUN device MTU.
+#[uniffi::export(callback_interface)]
+pub trait MtuCallback: Send + Sync {
+    fn on_mtu(&self, mtu: i32);
+}
+
 static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()
@@ -170,7 +180,7 @@ impl std::fmt::Display for TunnelError {
 /// Android can call `VpnService.protect()` to bypass VPN routing.
 /// Use `disconnect` to tear down the tunnel.
 #[uniffi::export]
-pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCallback>) -> Result<i32, ConnectError> {
+pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCallback>, mtu_callback: Option<Box<dyn MtuCallback>>) -> Result<i32, ConnectError> {
     info!("FFI connect() called with tun_fd={}", tun_fd);
 
     let url = Url::parse(&url).map_err(|_| InvalidUrl)?;
@@ -178,8 +188,16 @@ pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCal
         return Err(InvalidUrl);
     }
 
+    let mtu_cb: spora_core::transport::relay::MtuCallback = mtu_callback.map(|cb| {
+        let cb = Arc::new(cb);
+        Arc::new(move |mtu: u16| {
+            cb.on_mtu(mtu as i32);
+        }) as Arc<dyn Fn(u16) + Send + Sync>
+    });
+
     let config = spora_core::Config {
         protector: wrap_protector(protector),
+        mtu_callback: mtu_cb,
         ..spora_core::Config::default()
     };
 

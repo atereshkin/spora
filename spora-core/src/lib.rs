@@ -7,7 +7,7 @@ use crate::neg::{NegChannel, SignalNegChannel};
 use crate::transport::keepalive::{KeepAliveConfig, KeepAliveMode, KeepAliveTransport};
 use crate::transport::DialFuture;
 pub use crate::transport::IpTransport;
-use crate::transport::relay::{relay_connection, SignalChannel};
+use crate::transport::relay::{relay_connection, MtuCallback, SignalChannel};
 use crate::transport::upgradable::{upgradable_transport, UpgradeSender};
 use crate::transport::ReconnectTransport;
 use crate::transport::quic::{establish_quic_client, establish_quic_server, generate_self_signed_cert};
@@ -71,6 +71,7 @@ pub struct Config {
     pub pubsub_host: String,
     pub pubsub_port: u16,
     pub protector: SocketProtector,
+    pub mtu_callback: MtuCallback,
 }
 
 impl Default for Config {
@@ -80,6 +81,7 @@ impl Default for Config {
             pubsub_host: "188.166.74.116".into(),
             pubsub_port: 2334,
             protector: None,
+            mtu_callback: None,
         }
     }
 }
@@ -141,8 +143,9 @@ fn build_client_transport(
     cancel: CancellationToken,
     keepalive_knob: Arc<AtomicU64>,
     keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+    mtu_callback: MtuCallback,
 ) -> IpTransport {
-    let (relay_transport, signal_channel, demux_handle) = relay_connection(relay_conn);
+    let (relay_transport, signal_channel, demux_handle) = relay_connection(relay_conn, mtu_callback.clone());
 
     let (upgradable, upgrade_sender, router_handle) =
         upgradable_transport(Box::new(relay_transport));
@@ -160,7 +163,7 @@ fn build_client_transport(
     let stun_server = stun_server.to_string();
     let protector = protector.clone();
     tokio::spawn(async move {
-        try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, true, &protector, cancel, Some(upgrade_knob)).await;
+        try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, true, &protector, cancel, Some(upgrade_knob), mtu_callback).await;
         drop(demux_handle);
         drop(router_handle);
     });
@@ -194,7 +197,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     .map_err(|e| format!("failed to publish to pubsub: {}", e))?;
     info!("Relay connection established");
 
-    let initial = build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel.clone(), keepalive_knob.clone(), keepalive_waker.clone());
+    let initial = build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel.clone(), keepalive_knob.clone(), keepalive_waker.clone(), config.mtu_callback.clone());
 
     let config_clone = config.clone();
     let dialer_cancel = cancel.clone();
@@ -215,7 +218,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
                 &config.protector,
             )
             .await?;
-            Ok(build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel, knob, waker))
+            Ok(build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel, knob, waker, config.mtu_callback.clone()))
         })
     });
 
@@ -235,6 +238,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
 /// `initiator` controls the protocol order:
 /// - `true` (client): STUN first, send endpoint, wait for peer. Retry with delay.
 /// - `false` (server): Wait for peer endpoint first, then STUN and respond. No delay between retries.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_direct_upgrade(
     mut signal: SignalChannel,
     upgrade_sender: UpgradeSender,
@@ -243,6 +247,7 @@ pub(crate) async fn try_direct_upgrade(
     protector: &SocketProtector,
     cancel: CancellationToken,
     keepalive_knob: Option<Arc<AtomicU64>>,
+    mtu_callback: MtuCallback,
 ) {
     const MAX_DORMANT_ATTEMPTS: u32 = 3;
     let mut dormant_attempts: u32 = 0;
@@ -301,8 +306,14 @@ pub(crate) async fn try_direct_upgrade(
             try_direct_as_responder(&mut signal, stun_server, protector).await
         };
         match result {
-            Ok(transport) => {
+            Ok((transport, max_datagram_size)) => {
                 info!("Direct connection established, upgrading transport");
+                if let Some(mds) = max_datagram_size {
+                    info!("P2P max datagram size: {}", mds);
+                    if let Some(ref cb) = mtu_callback {
+                        cb(mds as u16);
+                    }
+                }
                 if upgrade_sender.send(transport).is_err() {
                     warn!("Failed to send upgrade — tunnel already closed");
                 }
@@ -338,7 +349,7 @@ async fn try_direct_as_initiator(
     signal: &mut SignalChannel,
     stun_server: &str,
     protector: &SocketProtector,
-) -> Result<IpTransport, String> {
+) -> Result<(IpTransport, Option<usize>), String> {
     let (socket, external_addr) = pierce_keep_socket(stun_server, protector).await?;
 
     let (peer_addr, fingerprint) = {
@@ -368,7 +379,8 @@ async fn try_direct_as_initiator(
 
     let socket = punch_and_verify(socket, peer_addr).await?;
     let transport = establish_quic_client(socket, peer_addr, &fingerprint).await?;
-    Ok(Box::new(transport))
+    let mds = transport.max_datagram_size();
+    Ok((Box::new(transport), mds))
 }
 
 /// Server-side (QUIC server): wait for client's endpoint first, then STUN, respond
@@ -377,7 +389,7 @@ async fn try_direct_as_responder(
     signal: &mut SignalChannel,
     stun_server: &str,
     protector: &SocketProtector,
-) -> Result<IpTransport, String> {
+) -> Result<(IpTransport, Option<usize>), String> {
     let (cert, key, fingerprint) = generate_self_signed_cert();
 
     let (peer_addr, socket) = {
@@ -404,7 +416,8 @@ async fn try_direct_as_responder(
 
     let socket = punch_and_verify(socket, peer_addr).await?;
     let transport = establish_quic_server(socket, cert, key).await?;
-    Ok(Box::new(transport))
+    let mds = transport.max_datagram_size();
+    Ok((Box::new(transport), mds))
 }
 
 /// Marker for bidirectional verification packets.
@@ -753,8 +766,8 @@ mod tests {
         let (port, crypto) = start_fake_relay();
         let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
 
-        let (mut server_transport, _server_signal, _sh) = relay_connection(server_conn);
-        let (mut client_transport, _client_signal, _ch) = relay_connection(client_conn);
+        let (mut server_transport, _server_signal, _sh) = relay_connection(server_conn, None);
+        let (mut client_transport, _client_signal, _ch) = relay_connection(client_conn, None);
 
         let ip_pkt = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
         Pin::new(&mut client_transport)
@@ -775,8 +788,8 @@ mod tests {
         let (port, crypto) = start_fake_relay();
         let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
 
-        let (mut server_transport, _server_signal, _sh) = relay_connection(server_conn);
-        let (mut client_transport, _client_signal, _ch) = relay_connection(client_conn);
+        let (mut server_transport, _server_signal, _sh) = relay_connection(server_conn, None);
+        let (mut client_transport, _client_signal, _ch) = relay_connection(client_conn, None);
 
         let ip_pkt = vec![0x45, 0x00, 0x00, 0x14, 9, 8, 7, 6];
         Pin::new(&mut server_transport)
@@ -797,8 +810,8 @@ mod tests {
         let (port, crypto) = start_fake_relay();
         let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
 
-        let (_server_transport, mut server_signal, _sh) = relay_connection(server_conn);
-        let (_client_transport, mut client_signal, _ch) = relay_connection(client_conn);
+        let (_server_transport, mut server_signal, _sh) = relay_connection(server_conn, None);
+        let (_client_transport, mut client_signal, _ch) = relay_connection(client_conn, None);
 
         // Client → Server signal
         client_signal.send_signal(b"10.0.0.1:5000").await.unwrap();
@@ -822,8 +835,8 @@ mod tests {
         let (port, crypto) = start_fake_relay();
         let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
 
-        let (mut server_transport, mut server_signal, _sh) = relay_connection(server_conn);
-        let (mut client_transport, client_signal, _ch) = relay_connection(client_conn);
+        let (mut server_transport, mut server_signal, _sh) = relay_connection(server_conn, None);
+        let (mut client_transport, client_signal, _ch) = relay_connection(client_conn, None);
 
         let ip_pkt = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
         Pin::new(&mut client_transport)
@@ -853,7 +866,7 @@ mod tests {
         let (port, crypto) = start_fake_relay();
         let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
 
-        let (server_relay, _server_sig, _sh) = relay_connection(server_conn);
+        let (server_relay, _server_sig, _sh) = relay_connection(server_conn, None);
         let (server_upgradable, _server_upgrade_tx, _sr) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
@@ -865,7 +878,7 @@ mod tests {
         };
         let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
 
-        let (client_relay, _client_sig, _crh) = relay_connection(client_conn);
+        let (client_relay, _client_sig, _crh) = relay_connection(client_conn, None);
         let (client_upgradable, _client_upgrade_tx, _cr) =
             upgradable_transport(Box::new(client_relay));
         let mut client_stack = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
@@ -888,7 +901,7 @@ mod tests {
         let (port, crypto) = start_fake_relay();
         let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
 
-        let (server_relay, _server_sig, _sh) = relay_connection(server_conn);
+        let (server_relay, _server_sig, _sh) = relay_connection(server_conn, None);
         let (server_upgradable, _server_upgrade_tx, _sr) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
@@ -900,7 +913,7 @@ mod tests {
         };
         let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
 
-        let (client_relay, _client_sig, _ch) = relay_connection(client_conn);
+        let (client_relay, _client_sig, _ch) = relay_connection(client_conn, None);
         let (client_upgradable, client_upgrade_tx, _cr) =
             upgradable_transport(Box::new(client_relay));
         let mut client_stack = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
@@ -934,7 +947,7 @@ mod tests {
         let (port, crypto) = start_fake_relay();
         let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
 
-        let (server_relay, _server_sig, _sh) = relay_connection(server_conn);
+        let (server_relay, _server_sig, _sh) = relay_connection(server_conn, None);
         let (server_upgradable, server_upgrade_tx, _sr) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
@@ -946,7 +959,7 @@ mod tests {
         };
         let mut server_transport = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
 
-        let (client_relay, _client_sig, _ch) = relay_connection(client_conn);
+        let (client_relay, _client_sig, _ch) = relay_connection(client_conn, None);
         let (client_upgradable, _client_upgrade_tx, _cr) =
             upgradable_transport(Box::new(client_relay));
         let mut client_transport = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
@@ -993,7 +1006,7 @@ mod tests {
         sub_conn.wait_for_match().await.unwrap();
         let server_conn = sub_conn.connection;
 
-        let (server_relay, _server_sig, _sh) = relay_connection(server_conn);
+        let (server_relay, _server_sig, _sh) = relay_connection(server_conn, None);
         let (server_upgradable, _server_up_tx, _sr) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
@@ -1006,7 +1019,7 @@ mod tests {
         let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
 
         let client_conn = pub_handle.await.unwrap();
-        let (client_relay, _client_sig, _ch) = relay_connection(client_conn);
+        let (client_relay, _client_sig, _ch) = relay_connection(client_conn, None);
         let (client_upgradable, _client_up_tx, _cr) =
             upgradable_transport(Box::new(client_relay));
         let mut client_stack = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
@@ -1023,7 +1036,7 @@ mod tests {
         let (port, crypto) = start_fake_relay();
         let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
 
-        let (server_relay, server_signal, _sh) = relay_connection(server_conn);
+        let (server_relay, server_signal, _sh) = relay_connection(server_conn, None);
         let (server_upgradable, server_upgrade_tx, _sr) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
@@ -1036,16 +1049,16 @@ mod tests {
         let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
 
         let _server_upgrade = tokio::spawn(async move {
-            try_direct_upgrade(server_signal, server_upgrade_tx, "192.0.2.1:19302", false, &None, CancellationToken::new(), None).await;
+            try_direct_upgrade(server_signal, server_upgrade_tx, "192.0.2.1:19302", false, &None, CancellationToken::new(), None, None).await;
         });
 
-        let (client_relay, client_signal, _ch) = relay_connection(client_conn);
+        let (client_relay, client_signal, _ch) = relay_connection(client_conn, None);
         let (client_upgradable, client_upgrade_tx, _cr) =
             upgradable_transport(Box::new(client_relay));
         let mut client_stack = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
 
         let _client_upgrade = tokio::spawn(async move {
-            try_direct_upgrade(client_signal, client_upgrade_tx, "192.0.2.1:19302", true, &None, CancellationToken::new(), None).await;
+            try_direct_upgrade(client_signal, client_upgrade_tx, "192.0.2.1:19302", true, &None, CancellationToken::new(), None, None).await;
         });
 
         let pkt = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
@@ -1079,11 +1092,11 @@ mod tests {
         // --- Round 1 ---
         let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
 
-        let (server_relay, _, _sh) = relay_connection(server_conn);
+        let (server_relay, _, _sh) = relay_connection(server_conn, None);
         let (server_up, _, _sr) = upgradable_transport(Box::new(server_relay));
         let mut server1 = KeepAliveTransport::new(Box::new(server_up), ka_cfg.clone());
 
-        let (client_relay, _, client_demux) = relay_connection(client_conn);
+        let (client_relay, _, client_demux) = relay_connection(client_conn, None);
         let (client_up, _, _cr) = upgradable_transport(Box::new(client_relay));
         let client_inner: IpTransport = Box::new(KeepAliveTransport::new(Box::new(client_up), ka_cfg.clone()));
 
@@ -1093,7 +1106,7 @@ mod tests {
             Box::pin(async move {
                 let ep = build_endpoint_with_crypto(crypto, &None)?;
                 let conn = PubSubService::publish_with_endpoint("127.0.0.1", port, "testkey", &ep).await?;
-                let (relay, _, _) = relay_connection(conn);
+                let (relay, _, _) = relay_connection(conn, None);
                 let (up, _, _) = upgradable_transport(Box::new(relay));
                 let ka = KeepAliveConfig {
                     mode: KeepAliveMode::Periodic {
@@ -1131,7 +1144,7 @@ mod tests {
 
         // Wait for match on server side
         tokio::time::timeout(TIMEOUT, sub_conn.wait_for_match()).await.ok();
-        let (server_relay2, _, _sh2) = relay_connection(sub_conn.connection);
+        let (server_relay2, _, _sh2) = relay_connection(sub_conn.connection, None);
         let (server_up2, _, _sr2) = upgradable_transport(Box::new(server_relay2));
         let mut server2 = KeepAliveTransport::new(Box::new(server_up2), ka_cfg);
 
@@ -1199,7 +1212,7 @@ mod tests {
         let (port, crypto) = start_fake_relay();
         let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
 
-        let (server_relay, server_signal, _server_demux) = relay_connection(server_conn);
+        let (server_relay, server_signal, _server_demux) = relay_connection(server_conn, None);
         let (server_upgradable, _server_upgrade_tx, _server_router) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
@@ -1220,7 +1233,7 @@ mod tests {
         drop(server_signal);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let (client_relay, _client_signal, _client_demux) = relay_connection(client_conn);
+        let (client_relay, _client_signal, _client_demux) = relay_connection(client_conn, None);
         let (client_upgradable, _client_upgrade_tx, _client_router) =
             upgradable_transport(Box::new(client_relay));
         let mut client_transport = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
@@ -1253,7 +1266,7 @@ mod tests {
         let (port, crypto) = start_fake_relay();
         let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
 
-        let (server_relay, server_signal, _server_demux) = relay_connection(server_conn);
+        let (server_relay, server_signal, _server_demux) = relay_connection(server_conn, None);
         let (server_upgradable, server_upgrade_tx, _server_router) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig::default();
@@ -1261,7 +1274,7 @@ mod tests {
             Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone()));
 
         let _server_upgrade = tokio::spawn(async move {
-            try_direct_upgrade(server_signal, server_upgrade_tx, "192.0.2.1:19302", false, &None, CancellationToken::new(), None).await;
+            try_direct_upgrade(server_signal, server_upgrade_tx, "192.0.2.1:19302", false, &None, CancellationToken::new(), None, None).await;
         });
 
         let cancel = CancellationToken::new();
@@ -1270,13 +1283,13 @@ mod tests {
             server::start_tunnel(server_transport, None, cancel_clone).await.unwrap();
         });
 
-        let (client_relay, client_signal, _client_demux) = relay_connection(client_conn);
+        let (client_relay, client_signal, _client_demux) = relay_connection(client_conn, None);
         let (client_upgradable, client_upgrade_tx, _client_router) =
             upgradable_transport(Box::new(client_relay));
         let mut client_transport = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
 
         let _client_upgrade = tokio::spawn(async move {
-            try_direct_upgrade(client_signal, client_upgrade_tx, "192.0.2.1:19302", true, &None, CancellationToken::new(), None).await;
+            try_direct_upgrade(client_signal, client_upgrade_tx, "192.0.2.1:19302", true, &None, CancellationToken::new(), None, None).await;
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
@@ -1319,7 +1332,7 @@ mod tests {
         let (port, crypto) = start_fake_relay();
         let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
 
-        let (server_relay, _server_signal, _server_demux) = relay_connection(server_conn);
+        let (server_relay, _server_signal, _server_demux) = relay_connection(server_conn, None);
         let (server_upgradable, _server_upgrade_tx, _server_router) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
@@ -1339,7 +1352,7 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let (client_relay, _client_signal, _client_demux) = relay_connection(client_conn);
+        let (client_relay, _client_signal, _client_demux) = relay_connection(client_conn, None);
         let (client_upgradable, _client_upgrade_tx, _client_router) =
             upgradable_transport(Box::new(client_relay));
         let mut client_transport = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
@@ -1387,7 +1400,7 @@ mod tests {
         let (port, crypto) = start_fake_relay();
         let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
 
-        let (server_relay, _server_signal, server_demux) = relay_connection(server_conn);
+        let (server_relay, _server_signal, server_demux) = relay_connection(server_conn, None);
         let (server_upgradable, _server_upgrade_tx, server_router) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
@@ -1407,7 +1420,7 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let (client_relay, _client_signal, client_demux) = relay_connection(client_conn);
+        let (client_relay, _client_signal, client_demux) = relay_connection(client_conn, None);
         let (client_upgradable, _client_upgrade_tx, client_router) =
             upgradable_transport(Box::new(client_relay));
         let client_transport = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
@@ -1991,6 +2004,7 @@ mod tests {
             pubsub_host: "192.0.2.1".into(),
             pubsub_port: 1,
             protector: None,
+            mtu_callback: None,
         };
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(15),
@@ -2320,7 +2334,7 @@ mod tests {
         let (port, crypto, relay_stats) = start_constrained_relay(buffer_cap, drain_interval, latency);
         let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
 
-        let (server_relay, _server_signal, server_demux) = relay_connection(server_conn);
+        let (server_relay, _server_signal, server_demux) = relay_connection(server_conn, None);
         let (server_upgradable, _server_upgrade_tx, server_router) =
             upgradable_transport(Box::new(server_relay));
         let ka_cfg = KeepAliveConfig {
@@ -2342,7 +2356,7 @@ mod tests {
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-        let (client_relay, _client_signal, client_demux) = relay_connection(client_conn);
+        let (client_relay, _client_signal, client_demux) = relay_connection(client_conn, None);
         let (client_upgradable, _client_upgrade_tx, client_router) =
             upgradable_transport(Box::new(client_relay));
         let client_transport = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);

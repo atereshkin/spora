@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 use clap::Parser;
-use log::{info, warn};
+use log::{debug, info, warn};
 use quinn::Connection;
 use quinn::congestion;
 use tokio::sync::Mutex;
@@ -91,9 +91,8 @@ async fn main() {
     ));
     transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     transport.datagram_send_buffer_size(8 * 1024 * 1024);
-    transport.initial_mtu(1452);
-    transport.min_mtu(1452);
-    transport.mtu_discovery_config(None);
+    transport.initial_mtu(1200);
+    transport.min_mtu(1200);
     transport.congestion_controller_factory(Arc::new(NoopCcFactory));
     server_config.transport_config(Arc::new(transport));
 
@@ -203,7 +202,22 @@ async fn handle_connection(
                 // Forward datagrams bidirectionally
                 let pub_conn = conn;
                 let sub_conn = sub.connection;
-                spawn_datagram_forwarding(pub_conn, sub_conn);
+                spawn_datagram_forwarding(pub_conn.clone(), sub_conn.clone());
+
+                // After PMTUD converges (~1.5s), notify both peers of the
+                // effective tunnel MTU so they can configure TUN devices.
+                tokio::spawn(async move {
+                    tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                    let pub_mds = pub_conn.max_datagram_size();
+                    let sub_mds = sub_conn.max_datagram_size();
+                    if let (Some(p), Some(s)) = (pub_mds, sub_mds) {
+                        let mtu = std::cmp::min(p, s) as u16;
+                        let msg = [0xFD, (mtu >> 8) as u8, mtu as u8];
+                        debug!("Sending MTU notification: {} (pub={}, sub={})", mtu, p, s);
+                        let _ = pub_conn.send_datagram(msg.to_vec().into());
+                        let _ = sub_conn.send_datagram(msg.to_vec().into());
+                    }
+                });
 
                 Ok(())
             } else {

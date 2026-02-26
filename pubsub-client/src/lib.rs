@@ -80,9 +80,8 @@ pub fn default_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     transport.datagram_send_buffer_size(8 * 1024 * 1024);
-    transport.initial_mtu(1452);
-    transport.min_mtu(1452);
-    transport.mtu_discovery_config(None);
+    transport.initial_mtu(1200);
+    transport.min_mtu(1200);
     transport.congestion_controller_factory(Arc::new(NoopCcFactory));
     transport.max_idle_timeout(Some(
         std::time::Duration::from_secs(120).try_into().unwrap(),

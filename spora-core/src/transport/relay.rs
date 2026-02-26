@@ -1,9 +1,10 @@
 use std::io;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_util::{Sink, Stream};
-use log::{debug, warn};
+use log::{debug, info, warn};
 use quinn::Connection;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -12,17 +13,30 @@ use tokio::task::JoinHandle;
 /// IPv4 packets start with 0x45–0x4F so there's no ambiguity.
 pub const SIGNAL_PREFIX: u8 = 0xFE;
 
+/// Prefix byte for control messages (e.g. MTU notification) from the relay.
+/// Doesn't collide with IPv4 (0x4X), IPv6 (0x6X), or signal (0xFE).
+pub const CONTROL_PREFIX: u8 = 0xFD;
+
+pub type MtuCallback = Option<Arc<dyn Fn(u16) + Send + Sync>>;
+
 /// Split a relay `quinn::Connection` into a `RelayTransport` (IP traffic) and a
 /// `SignalChannel` (signaling messages). A background demux task reads datagrams
 /// from the connection and dispatches by first byte.
 pub fn relay_connection(
     conn: Connection,
+    mtu_callback: MtuCallback,
 ) -> (RelayTransport, SignalChannel, JoinHandle<()>) {
     let (ip_tx, ip_rx) = mpsc::unbounded_channel();
     let (signal_tx, signal_rx) = mpsc::unbounded_channel();
 
     let recv_conn = conn.clone();
     let handle = tokio::spawn(async move {
+        // Track the running minimum MTU across all 0xFD notifications
+        // (relay-reported MTU, peer-reported MDS, own MDS).  Only invoke
+        // the callback when a new lower value is discovered so the app
+        // never sees the MTU go *up* during the relay phase.
+        let mut best_mtu: u16 = u16::MAX;
+
         loop {
             match recv_conn.read_datagram().await {
                 Ok(data) if !data.is_empty() => {
@@ -31,6 +45,21 @@ pub fn relay_connection(
                         if signal_tx.send(data[1..].to_vec()).is_err() {
                             debug!("Signal channel closed, demux task exiting");
                             break;
+                        }
+                    } else if data[0] == CONTROL_PREFIX && data.len() >= 3 {
+                        let received_mtu = u16::from_be_bytes([data[1], data[2]]);
+                        let own_mds = recv_conn.max_datagram_size()
+                            .unwrap_or(received_mtu as usize) as u16;
+                        let candidate = std::cmp::min(received_mtu, own_mds);
+                        if candidate < best_mtu {
+                            best_mtu = candidate;
+                            info!(
+                                "MTU updated: received={}, own={}, effective={}",
+                                received_mtu, own_mds, candidate
+                            );
+                            if let Some(ref cb) = mtu_callback {
+                                cb(candidate);
+                            }
                         }
                     } else if ip_tx.send(data.to_vec()).is_err() {
                         debug!("IP channel closed, demux task exiting");
@@ -43,6 +72,20 @@ pub fn relay_connection(
                     break;
                 }
             }
+        }
+    });
+
+    // Report own MDS to the other peer after PMTUD converges.
+    // The relay's forwarding tasks will deliver this datagram to the
+    // other peer, whose demux will process it as a 0xFD control message.
+    let report_conn = conn.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        if let Some(mds) = report_conn.max_datagram_size() {
+            let mds = mds as u16;
+            let msg: Vec<u8> = vec![CONTROL_PREFIX, (mds >> 8) as u8, mds as u8];
+            debug!("Reporting own MDS to peer: {}", mds);
+            let _ = report_conn.send_datagram(msg.into());
         }
     });
 
@@ -229,7 +272,7 @@ mod tests {
     #[tokio::test]
     async fn relay_demux_routes_ip_and_signal() {
         let (client_conn, server_conn) = quic_loopback_pair().await;
-        let (mut transport, mut signal, _handle) = relay_connection(client_conn);
+        let (mut transport, mut signal, _handle) = relay_connection(client_conn, None);
 
         // Send an IPv4-like packet from peer
         let ip_pkt = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
@@ -268,7 +311,7 @@ mod tests {
     #[tokio::test]
     async fn relay_transport_sends_raw() {
         let (client_conn, server_conn) = quic_loopback_pair().await;
-        let (transport, _signal, _handle) = relay_connection(client_conn);
+        let (transport, _signal, _handle) = relay_connection(client_conn, None);
 
         use futures_util::SinkExt;
         let mut transport = transport;
@@ -288,7 +331,7 @@ mod tests {
     #[tokio::test]
     async fn signal_channel_roundtrip() {
         let (client_conn, server_conn) = quic_loopback_pair().await;
-        let (_transport, signal, _handle) = relay_connection(client_conn);
+        let (_transport, signal, _handle) = relay_connection(client_conn, None);
 
         // Send signal from our side
         signal.send_signal(b"hello").await.unwrap();
