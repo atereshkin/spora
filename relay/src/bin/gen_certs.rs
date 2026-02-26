@@ -36,7 +36,7 @@ fn main() {
     println!("Wrote {}/relay_cert.der", out_dir);
     println!("Wrote {}/relay_key.der", out_dir);
 
-    // Also copy ca.der to pubsub-client for embedding
-    fs::copy(format!("{}/ca.der", out_dir), "pubsub-client/ca.der").expect("failed to copy ca.der to pubsub-client");
-    println!("Copied ca.der to pubsub-client/ca.der");
+    // Also copy ca.der to relay-client for embedding
+    fs::copy(format!("{}/ca.der", out_dir), "relay-client/ca.der").expect("failed to copy ca.der to relay-client");
+    println!("Copied ca.der to relay-client/ca.der");
 }

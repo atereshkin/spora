@@ -53,7 +53,7 @@ pub fn build_client_crypto() -> rustls::ClientConfig {
 }
 
 /// Build a `TransportConfig` with the shared MTU, buffer, and CC settings used
-/// by all pubsub QUIC endpoints.
+/// by all relay QUIC endpoints.
 pub fn default_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
@@ -154,14 +154,14 @@ async fn quic_connect(
     }
 }
 
-pub struct PubSubService<'a> {
+pub struct RelayService<'a> {
     host: &'a str,
     port: u16,
 }
 
-impl<'a> PubSubService<'a> {
+impl<'a> RelayService<'a> {
     pub fn new(host: &'a str, port: u16) -> Self {
-        PubSubService { host, port }
+        RelayService { host, port }
     }
 
     /// Subscribe to a key. Returns a SubConnection with the QUIC connection
@@ -361,7 +361,7 @@ mod tests {
         send_stream: quinn::SendStream,
     }
 
-    /// Fake relay for testing - mimics the real pubsub relay.
+    /// Fake relay for testing.
     async fn fake_relay(endpoint: quinn::Endpoint) {
         let subscribers: Arc<TokioMutex<HashMap<Vec<u8>, FakeSubscriber>>> =
             Arc::new(TokioMutex::new(HashMap::new()));
@@ -469,7 +469,7 @@ mod tests {
         let (port, client_crypto) = start_test_relay();
         let client_ep = build_endpoint_with_crypto(client_crypto, &None).unwrap();
 
-        let svc = PubSubService::new("127.0.0.1", port);
+        let svc = RelayService::new("127.0.0.1", port);
         let sub_conn = svc.sub_with_endpoint("testkey", &client_ep).await.unwrap();
         assert!(!sub_conn.endpoint.is_empty());
     }
@@ -480,13 +480,13 @@ mod tests {
 
         // First subscribe
         let sub_ep = build_endpoint_with_crypto(client_crypto.clone(), &None).unwrap();
-        let svc = PubSubService::new("127.0.0.1", port);
+        let svc = RelayService::new("127.0.0.1", port);
         let _sub_conn = svc.sub_with_endpoint("testkey", &sub_ep).await.unwrap();
 
         // Then publish
         let pub_ep = build_endpoint_with_crypto(client_crypto, &None).unwrap();
         let pub_conn =
-            PubSubService::publish_with_endpoint("127.0.0.1", port, "testkey", &pub_ep)
+            RelayService::publish_with_endpoint("127.0.0.1", port, "testkey", &pub_ep)
                 .await
                 .unwrap();
         assert!(pub_conn.remote_address().port() > 0);
@@ -497,13 +497,13 @@ mod tests {
         let (port, client_crypto) = start_test_relay();
 
         let sub_ep = build_endpoint_with_crypto(client_crypto.clone(), &None).unwrap();
-        let svc = PubSubService::new("127.0.0.1", port);
+        let svc = RelayService::new("127.0.0.1", port);
         let mut sub_conn = svc.sub_with_endpoint("testkey", &sub_ep).await.unwrap();
 
         // Publish in background
         let pub_ep = build_endpoint_with_crypto(client_crypto, &None).unwrap();
         tokio::spawn(async move {
-            PubSubService::publish_with_endpoint("127.0.0.1", port, "testkey", &pub_ep)
+            RelayService::publish_with_endpoint("127.0.0.1", port, "testkey", &pub_ep)
                 .await
                 .unwrap();
         });
@@ -519,12 +519,12 @@ mod tests {
         let (port, client_crypto) = start_test_relay();
 
         let sub_ep = build_endpoint_with_crypto(client_crypto.clone(), &None).unwrap();
-        let svc = PubSubService::new("127.0.0.1", port);
+        let svc = RelayService::new("127.0.0.1", port);
         let mut sub_conn = svc.sub_with_endpoint("testkey", &sub_ep).await.unwrap();
 
         let pub_ep = build_endpoint_with_crypto(client_crypto, &None).unwrap();
         let pub_conn =
-            PubSubService::publish_with_endpoint("127.0.0.1", port, "testkey", &pub_ep)
+            RelayService::publish_with_endpoint("127.0.0.1", port, "testkey", &pub_ep)
                 .await
                 .unwrap();
 

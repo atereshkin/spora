@@ -146,7 +146,7 @@ pub fn relay_connection(
             // UpgradableTransport router couples send and receive in a single
             // select loop.  Blocking here would prevent ACKs from flowing
             // back, stalling the QUIC connection and triggering PMTUD failures.
-            // Back-pressure is applied at the relay (pubsub) side instead,
+            // Back-pressure is applied at the relay side instead,
             // where each direction runs in its own task.
             let pkt_len = pkt.len();
             match c.send_datagram(pkt.into()) {

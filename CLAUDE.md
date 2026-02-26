@@ -25,15 +25,15 @@ Five crates in the workspace (resolver v3):
 - **spora-core** — Core library. Exposes `share()` (server mode) and `connect(url)` (client mode). Contains all networking logic.
 - **spora-cli** — CLI binary with `spora share` and `spora use <URL>` subcommands. Uses `tokio-tun` for TUN device on Unix.
 - **spora-ffi** — Uniffi-based FFI for Android/JNI. Wraps core functions for Kotlin. Builds as `cdylib`.
-- **pubsub** — Simple TCP relay server for bootstrapping peer connections. Subscribers register with a key, publishers connect with the same key.
-- **pubsub-client** — Client library for the pubsub relay (`PubSubService::sub`/`publish`).
+- **relay** — QUIC relay server for bootstrapping peer connections. Subscribers register with a key, publishers connect with the same key.
+- **relay-client** — Client library for the relay server (`RelayService::sub`/`publish`).
 
 ## Architecture
 
 ### Connection Flow
 
 **Share (server) side:**
-1. Subscribe to pubsub relay with a key → wait for peer
+1. Subscribe to relay with a key → wait for peer
 2. Receive peer's external address via TCP negotiation (`neg.rs`)
 3. STUN hole punch → create UDP socket → send initial packet
 4. Build virtual IP stack (`netstack-smoltcp`) on top of UDP transport
@@ -41,7 +41,7 @@ Five crates in the workspace (resolver v3):
 
 **Connect (client) side:**
 1. STUN hole punch to discover external address
-2. Publish to pubsub relay → exchange endpoints via TCP negotiation
+2. Publish to relay → exchange endpoints via TCP negotiation
 3. Create UDP socket → wrap in `ReconnectTransport` → wrap in `KeepAliveTransport`
 4. Pipe transport to/from TUN device (`tun_util.rs`)
 
@@ -58,7 +58,7 @@ Transports compose: `UdpTransport` → `ReconnectTransport` → `KeepAliveTransp
 ### Key Constants
 
 - STUN server: `stun.l.google.com:19302`
-- PubSub relay: `188.166.74.116:2334`
+- Relay server: `188.166.74.116:2334`
 - Base UDP port: `54321` (tries up to +10)
 - Reconnect delay: 5s, UDP timeout: 30s, Keepalive: 10s
 

@@ -1165,31 +1165,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "pubsub"
-version = "0.1.0"
-dependencies = [
- "clap",
- "env_logger",
- "log",
- "quinn",
- "rcgen",
- "rustls",
- "tokio",
-]
-
-[[package]]
-name = "pubsub-client"
-version = "0.1.0"
-dependencies = [
- "bytes",
- "log",
- "quinn",
- "rcgen",
- "rustls",
- "tokio",
-]
-
-[[package]]
 name = "quinn"
 version = "0.11.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1370,6 +1345,31 @@ name = "regex-syntax"
 version = "0.8.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7a2d987857b319362043e95f5353c0535c1f58eec5336fdfcf626430af7def58"
+
+[[package]]
+name = "relay"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "env_logger",
+ "log",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "tokio",
+]
+
+[[package]]
+name = "relay-client"
+version = "0.1.0"
+dependencies = [
+ "bytes",
+ "log",
+ "quinn",
+ "rcgen",
+ "rustls",
+ "tokio",
+]
 
 [[package]]
 name = "ring"
@@ -1742,10 +1742,10 @@ dependencies = [
  "libc",
  "log",
  "netstack-smoltcp",
- "pubsub-client",
  "quinn",
  "rand 0.8.5",
  "rcgen",
+ "relay-client",
  "ring",
  "rustls",
  "socket2 0.5.10",

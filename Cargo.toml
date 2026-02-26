@@ -1,7 +1,7 @@
 [workspace]
 members = [
     "spora-core", "spora-cli",
-    "pubsub", "pubsub-client", "spora-ffi",
+    "relay", "relay-client", "spora-ffi",
 ]
 resolver = "3"
 

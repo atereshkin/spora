@@ -12,7 +12,7 @@ use crate::transport::upgradable::{upgradable_transport, UpgradeSender};
 use crate::transport::ReconnectTransport;
 use crate::transport::quic::{establish_quic_client, establish_quic_server, generate_self_signed_cert};
 use log::{debug, info, warn};
-use pubsub_client::PubSubService;
+use relay_client::RelayService;
 use quinn::Connection;
 use server::PeerPort;
 use std::net::{SocketAddr, ToSocketAddrs};
@@ -68,8 +68,8 @@ pub struct ConnectResult {
 #[derive(Clone)]
 pub struct Config {
     pub stun_server: String,
-    pub pubsub_host: String,
-    pub pubsub_port: u16,
+    pub relay_host: String,
+    pub relay_port: u16,
     pub protector: SocketProtector,
     pub mtu_callback: MtuCallback,
 }
@@ -78,8 +78,8 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             stun_server: "stun.l.google.com:19302".into(),
-            pubsub_host: "188.166.74.116".into(),
-            pubsub_port: 2334,
+            relay_host: "188.166.74.116".into(),
+            relay_port: 2334,
             protector: None,
             mtu_callback: None,
         }
@@ -187,14 +187,14 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     let (relay_host, relay_port, key) = parse_spora_url(&url)?;
     info!("Connecting to relay {}:{} with key {}", relay_host, relay_port, key);
 
-    let relay_conn = PubSubService::publish(
+    let relay_conn = RelayService::publish(
         &relay_host,
         relay_port,
         &key,
         &config.protector,
     )
     .await
-    .map_err(|e| format!("failed to publish to pubsub: {}", e))?;
+    .map_err(|e| format!("failed to publish to relay: {}", e))?;
     info!("Relay connection established");
 
     let initial = build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel.clone(), keepalive_knob.clone(), keepalive_waker.clone(), config.mtu_callback.clone());
@@ -211,7 +211,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         let knob = dialer_knob.clone();
         let waker = dialer_waker.clone();
         Box::pin(async move {
-            let relay_conn = PubSubService::publish(
+            let relay_conn = RelayService::publish(
                 &relay_host,
                 relay_port,
                 &key,
@@ -579,7 +579,7 @@ mod tests {
     use crate::transport::relay::relay_connection;
     use crate::transport::upgradable::upgradable_transport;
     use futures_util::{SinkExt, StreamExt};
-    use pubsub_client::build_endpoint_with_crypto;
+    use relay_client::build_endpoint_with_crypto;
     use std::collections::HashMap;
     use std::pin::Pin;
     use tokio::sync::Mutex as TokioMutex;
@@ -640,7 +640,7 @@ mod tests {
         send_stream: quinn::SendStream,
     }
 
-    /// Minimal fake pubsub relay for integration tests (QUIC-based).
+    /// Minimal fake relay for integration tests (QUIC-based).
     async fn fake_relay(endpoint: quinn::Endpoint) {
         let subscribers: Arc<TokioMutex<HashMap<Vec<u8>, FakeSubscriber>>> =
             Arc::new(TokioMutex::new(HashMap::new()));
@@ -750,12 +750,12 @@ mod tests {
         client_crypto: &rustls::ClientConfig,
     ) -> (Connection, Connection) {
         let sub_ep = build_endpoint_with_crypto(client_crypto.clone(), &None).unwrap();
-        let svc = PubSubService::new("127.0.0.1", port);
+        let svc = RelayService::new("127.0.0.1", port);
         let mut sub_conn = svc.sub_with_endpoint("testkey", &sub_ep).await.unwrap();
 
         let pub_ep = build_endpoint_with_crypto(client_crypto.clone(), &None).unwrap();
         let pub_conn =
-            PubSubService::publish_with_endpoint("127.0.0.1", port, "testkey", &pub_ep)
+            RelayService::publish_with_endpoint("127.0.0.1", port, "testkey", &pub_ep)
                 .await
                 .unwrap();
 
@@ -997,14 +997,14 @@ mod tests {
 
         // Server subscribes and waits for match
         let sub_ep = build_endpoint_with_crypto(crypto.clone(), &None).unwrap();
-        let svc = PubSubService::new("127.0.0.1", port);
+        let svc = RelayService::new("127.0.0.1", port);
         let mut sub_conn = svc.sub_with_endpoint("testkey", &sub_ep).await.unwrap();
 
         // Publish in background (will trigger match)
         let pub_ep = build_endpoint_with_crypto(crypto.clone(), &None).unwrap();
         let pub_handle = tokio::spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            PubSubService::publish_with_endpoint("127.0.0.1", port, "testkey", &pub_ep)
+            RelayService::publish_with_endpoint("127.0.0.1", port, "testkey", &pub_ep)
                 .await
                 .unwrap()
         });
@@ -1111,7 +1111,7 @@ mod tests {
             let crypto = crypto_clone.clone();
             Box::pin(async move {
                 let ep = build_endpoint_with_crypto(crypto, &None)?;
-                let conn = PubSubService::publish_with_endpoint("127.0.0.1", port, "testkey", &ep).await?;
+                let conn = RelayService::publish_with_endpoint("127.0.0.1", port, "testkey", &ep).await?;
                 let (relay, _, _) = relay_connection(conn, None);
                 let (up, _, _) = upgradable_transport(Box::new(relay));
                 let ka = KeepAliveConfig {
@@ -1137,7 +1137,7 @@ mod tests {
         drop(server1);
         // Server re-subscribes
         let sub_ep = build_endpoint_with_crypto(crypto.clone(), &None).unwrap();
-        let svc = PubSubService::new("127.0.0.1", port);
+        let svc = RelayService::new("127.0.0.1", port);
         let mut sub_conn = svc.sub_with_endpoint("testkey", &sub_ep).await.unwrap();
 
         // Break client's connection
@@ -1893,7 +1893,7 @@ mod tests {
         port
     }
 
-    /// Try a raw QUIC connection to a relay, bypassing pubsub-client's retry loop.
+    /// Try a raw QUIC connection to a relay, bypassing relay-client's retry loop.
     /// Returns Ok(Connection) on success, Err on TLS/handshake failure.
     async fn try_quic_connect(
         client_crypto: rustls::ClientConfig,
@@ -1969,7 +1969,7 @@ mod tests {
         let port = start_fake_relay_with_config(server_config);
 
         let ep = build_endpoint_with_crypto(client_crypto, &None).unwrap();
-        let svc = PubSubService::new("127.0.0.1", port);
+        let svc = RelayService::new("127.0.0.1", port);
         let result = svc.sub_with_endpoint("testkey", &ep).await;
 
         assert!(result.is_ok(), "connection should succeed with correct pinned CA: {:?}", result.err());
@@ -2003,12 +2003,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn connect_fails_on_bad_pubsub() {
+    async fn connect_fails_on_bad_relay() {
         let url = Url::parse("http://192.0.2.1:1/testkey").unwrap();
         let config = Config {
             stun_server: "192.0.2.1:19302".into(),
-            pubsub_host: "192.0.2.1".into(),
-            pubsub_port: 1,
+            relay_host: "192.0.2.1".into(),
+            relay_port: 1,
             protector: None,
             mtu_callback: None,
         };

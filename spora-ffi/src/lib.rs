@@ -174,7 +174,7 @@ impl std::fmt::Display for TunnelError {
 
 /// Establishes a tunnel connection and returns a handle for managing it.
 ///
-/// Blocks until the connection is established (relay + pubsub negotiation),
+/// Blocks until the connection is established (relay negotiation),
 /// then spawns the tunnel loop in the background and returns immediately.
 /// The `protector` callback is invoked on every new socket fd so that
 /// Android can call `VpnService.protect()` to bypass VPN routing.

@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::task::{AbortHandle, JoinHandle};
-use pubsub_client::{PubSubService, SubConnection};
+use relay_client::{RelayService, SubConnection};
 use tokio_util::sync::CancellationToken;
 use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
 use log::{error, info, trace, warn};
@@ -383,19 +383,19 @@ pub struct PeerPort {
 }
 
 impl PeerPort {
-    async fn connect_pubsub(key: &str, config: &Config) -> io::Result<SubConnection> {
-        let crypto = pubsub_client::build_client_crypto();
-        let mut transport = pubsub_client::default_transport_config();
+    async fn connect_relay(key: &str, config: &Config) -> io::Result<SubConnection> {
+        let crypto = relay_client::build_client_crypto();
+        let mut transport = relay_client::default_transport_config();
         transport.keep_alive_interval(Some(Duration::from_secs(20)));
-        let endpoint = pubsub_client::build_endpoint_with_transport_config(
+        let endpoint = relay_client::build_endpoint_with_transport_config(
             crypto, transport, &config.protector,
         )?;
-        let pubsub = PubSubService::new(&config.pubsub_host, config.pubsub_port);
-        pubsub.sub_with_endpoint(key, &endpoint).await
+        let relay = RelayService::new(&config.relay_host, config.relay_port);
+        relay.sub_with_endpoint(key, &endpoint).await
     }
 
     pub async fn new(key: String, config: Config) -> io::Result<Self> {
-        let sub_conn = Self::connect_pubsub(&key, &config).await?;
+        let sub_conn = Self::connect_relay(&key, &config).await?;
         let endpoint = sub_conn.endpoint.clone();
         Ok(PeerPort {
             key,
@@ -419,13 +419,13 @@ impl PeerPort {
                 info!("[share loop #{}] Using initial connection", iteration);
                 conn
             } else {
-                info!("[share loop #{}] Re-subscribing to pubsub...", iteration);
+                info!("[share loop #{}] Re-subscribing to relay...", iteration);
                 let result = tokio::select! {
                     _ = cancel.cancelled() => {
                         info!("Share session cancelled");
                         break;
                     }
-                    result = Self::connect_pubsub(&self.key, &self.config) => result,
+                    result = Self::connect_relay(&self.key, &self.config) => result,
                 };
                 match result {
                     Ok(conn) => {
@@ -433,7 +433,7 @@ impl PeerPort {
                         conn
                     }
                     Err(e) => {
-                        warn!("[share loop #{}] Failed to subscribe to pubsub: {}. Retrying in 5s...", iteration, e);
+                        warn!("[share loop #{}] Failed to subscribe to relay: {}. Retrying in 5s...", iteration, e);
                         tokio::select! {
                             _ = cancel.cancelled() => {
                                 info!("Share session cancelled during retry delay");
