@@ -16,7 +16,7 @@ use crate::transport::relay::relay_connection;
 use crate::transport::upgradable::upgradable_transport;
 use crate::{Config, SocketProtector};
 
-const EGRESS_CHANNEL_CAPACITY: usize = 512;
+const EGRESS_CHANNEL_CAPACITY: usize = 4096;
 
 /// Guard that aborts a set of tasks when dropped.
 struct AbortOnDrop(Vec<AbortHandle>);
