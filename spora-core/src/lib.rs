@@ -306,16 +306,22 @@ pub(crate) async fn try_direct_upgrade(
             try_direct_as_responder(&mut signal, stun_server, protector).await
         };
         match result {
-            Ok((transport, max_datagram_size)) => {
+            Ok((transport, conn)) => {
                 info!("Direct connection established, upgrading transport");
-                if let Some(mds) = max_datagram_size {
-                    info!("P2P max datagram size: {}", mds);
-                    if let Some(ref cb) = mtu_callback {
-                        cb(mds as u16);
-                    }
-                }
                 if upgrade_sender.send(transport).is_err() {
                     warn!("Failed to send upgrade — tunnel already closed");
+                    return;
+                }
+                // Read MDS after PMTUD converges (~1.5s) instead of
+                // immediately after handshake when it's still at initial_mtu.
+                if let Some(cb) = mtu_callback.clone() {
+                    tokio::spawn(async move {
+                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        if let Some(mds) = conn.max_datagram_size() {
+                            info!("P2P max datagram size (post-PMTUD): {}", mds);
+                            cb(mds as u16);
+                        }
+                    });
                 }
                 return;
             }
@@ -349,7 +355,7 @@ async fn try_direct_as_initiator(
     signal: &mut SignalChannel,
     stun_server: &str,
     protector: &SocketProtector,
-) -> Result<(IpTransport, Option<usize>), String> {
+) -> Result<(IpTransport, Connection), String> {
     let (socket, external_addr) = pierce_keep_socket(stun_server, protector).await?;
 
     let (peer_addr, fingerprint) = {
@@ -379,8 +385,8 @@ async fn try_direct_as_initiator(
 
     let socket = punch_and_verify(socket, peer_addr).await?;
     let transport = establish_quic_client(socket, peer_addr, &fingerprint).await?;
-    let mds = transport.max_datagram_size();
-    Ok((Box::new(transport), mds))
+    let conn = transport.connection();
+    Ok((Box::new(transport), conn))
 }
 
 /// Server-side (QUIC server): wait for client's endpoint first, then STUN, respond
@@ -389,7 +395,7 @@ async fn try_direct_as_responder(
     signal: &mut SignalChannel,
     stun_server: &str,
     protector: &SocketProtector,
-) -> Result<(IpTransport, Option<usize>), String> {
+) -> Result<(IpTransport, Connection), String> {
     let (cert, key, fingerprint) = generate_self_signed_cert();
 
     let (peer_addr, socket) = {
@@ -416,8 +422,8 @@ async fn try_direct_as_responder(
 
     let socket = punch_and_verify(socket, peer_addr).await?;
     let transport = establish_quic_server(socket, cert, key).await?;
-    let mds = transport.max_datagram_size();
-    Ok((Box::new(transport), mds))
+    let conn = transport.connection();
+    Ok((Box::new(transport), conn))
 }
 
 /// Marker for bidirectional verification packets.

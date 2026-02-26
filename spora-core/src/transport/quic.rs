@@ -118,6 +118,12 @@ impl QuicPeerTransport {
         self.conn.max_datagram_size()
     }
 
+    /// Returns a clone of the underlying QUIC connection handle.
+    /// Useful for reading stats after PMTUD converges.
+    pub fn connection(&self) -> Connection {
+        self.conn.clone()
+    }
+
     fn new(conn: Connection) -> Self {
         let (tx, rx) = mpsc::unbounded_channel();
         let read_conn = conn.clone();
@@ -257,10 +263,9 @@ fn build_transport_config() -> quinn::TransportConfig {
     transport.datagram_send_buffer_size(8 * 1024 * 1024);
     transport.initial_mtu(1200);
     transport.min_mtu(1200);
-
-
-
-
+    let mut mtud = quinn::MtuDiscoveryConfig::default();
+    mtud.black_hole_cooldown(std::time::Duration::from_secs(0));
+    transport.mtu_discovery_config(Some(mtud));
     transport.congestion_controller_factory(Arc::new(NoopCcFactory));
     transport
 }
