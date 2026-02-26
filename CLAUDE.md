@@ -58,7 +58,7 @@ Transports compose: `UdpTransport` → `ReconnectTransport` → `KeepAliveTransp
 ### Key Constants
 
 - STUN server: `stun.l.google.com:19302`
-- Relay server: `188.166.74.116:2334`
+- Relay server: `188.166.74.116:443`
 - Base UDP port: `54321` (tries up to +10)
 - Reconnect delay: 5s, UDP timeout: 30s, Keepalive: 10s
 

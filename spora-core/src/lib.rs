@@ -79,7 +79,7 @@ impl Default for Config {
         Self {
             stun_server: "stun.l.google.com:19302".into(),
             relay_host: "188.166.74.116".into(),
-            relay_port: 2334,
+            relay_port: 443,
             protector: None,
             mtu_callback: None,
         }

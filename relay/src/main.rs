@@ -19,7 +19,7 @@ struct Args {
     #[arg(required = true)]
     host: String,
     /// Port to listen on
-    #[arg(short, long, default_value_t = 2334)]
+    #[arg(short, long, default_value_t = 443)]
     port: u16,
     /// Path to relay certificate (DER)
     #[arg(long, required = true)]
