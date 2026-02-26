@@ -5,7 +5,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use futures_util::{Sink, Stream};
-use log::debug;
+use log::{debug, error, info, warn};
 use quinn::Connection;
 use quinn::congestion;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
@@ -126,10 +126,31 @@ impl QuicPeerTransport {
                 match read_conn.read_datagram().await {
                     Ok(data) => {
                         if tx.send(Ok(data.to_vec())).is_err() {
+                            info!("P2P QUIC reader: channel closed, exiting");
                             break;
                         }
                     }
                     Err(e) => {
+                        let stats = read_conn.stats();
+                        error!(
+                            "P2P QUIC connection died: {}. \
+                             Stats: mtu={}, mds={:?}, rtt={:?}, \
+                             sent_pkts={}, lost_pkts={}, lost_bytes={}, \
+                             pmtud_sent={}, pmtud_lost={}, black_holes={}, \
+                             datagrams_tx={}, datagrams_rx={}",
+                            e,
+                            stats.path.current_mtu,
+                            read_conn.max_datagram_size(),
+                            stats.path.rtt,
+                            stats.path.sent_packets,
+                            stats.path.lost_packets,
+                            stats.path.lost_bytes,
+                            stats.path.sent_plpmtud_probes,
+                            stats.path.lost_plpmtud_probes,
+                            stats.path.black_holes_detected,
+                            stats.frame_tx.datagram,
+                            stats.frame_rx.datagram,
+                        );
                         let _ = tx.send(Err(io::Error::other(format!(
                             "QUIC read_datagram error: {}",
                             e
@@ -163,13 +184,31 @@ impl Sink<Vec<u8>> for QuicPeerTransport {
     }
 
     fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
+        let pkt_len = item.len();
         match self.conn.send_datagram(item.into()) {
             Ok(()) => Ok(()),
             Err(quinn::SendDatagramError::TooLarge) => {
-                debug!("QUIC datagram too large, dropping");
+                warn!(
+                    "P2P QUIC datagram too large: pkt={} bytes, max_datagram_size={:?}",
+                    pkt_len,
+                    self.conn.max_datagram_size(),
+                );
                 Ok(())
             }
-            Err(e) => Err(io::Error::other(format!("QUIC send_datagram error: {}", e))),
+            Err(e) => {
+                let stats = self.conn.stats();
+                error!(
+                    "P2P QUIC send_datagram failed: {}. \
+                     Stats: mtu={}, mds={:?}, lost_pkts={}, pmtud_sent={}, pmtud_lost={}",
+                    e,
+                    stats.path.current_mtu,
+                    self.conn.max_datagram_size(),
+                    stats.path.lost_packets,
+                    stats.path.sent_plpmtud_probes,
+                    stats.path.lost_plpmtud_probes,
+                );
+                Err(io::Error::other(format!("QUIC send_datagram error: {}", e)))
+            }
         }
     }
 
@@ -218,6 +257,10 @@ fn build_transport_config() -> quinn::TransportConfig {
     transport.datagram_send_buffer_size(8 * 1024 * 1024);
     transport.initial_mtu(1200);
     transport.min_mtu(1200);
+
+
+
+
     transport.congestion_controller_factory(Arc::new(NoopCcFactory));
     transport
 }

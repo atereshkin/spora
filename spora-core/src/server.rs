@@ -8,7 +8,7 @@ use tokio::task::{AbortHandle, JoinHandle};
 use pubsub_client::{PubSubService, SubConnection};
 use tokio_util::sync::CancellationToken;
 use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
-use log::{debug, error, info, trace, warn};
+use log::{error, info, trace, warn};
 use futures_util::{Sink, Stream, SinkExt, StreamExt};
 use crate::transport::IpTransport;
 use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
@@ -70,7 +70,7 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
                 match Pin::new(&mut stack).poll_next(cx) {
                     Poll::Ready(Some(Ok(pkt))) => {
                         if egress_tx.try_send(pkt.to_vec()).is_err() {
-                            debug!("Egress channel full, dropping packet");
+                            warn!("Egress channel full, dropping packet ({} bytes)", pkt.len());
                         }
                     }
                     Poll::Ready(Some(Err(e))) => {

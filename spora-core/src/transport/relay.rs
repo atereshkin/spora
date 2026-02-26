@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_util::{Sink, Stream};
-use log::{debug, info, warn};
+use log::{debug, info, warn, error};
 use quinn::Connection;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -68,7 +68,26 @@ pub fn relay_connection(
                 }
                 Ok(_) => {} // empty datagram, ignore
                 Err(e) => {
-                    warn!("Relay connection read_datagram error: {}", e);
+                    let stats = recv_conn.stats();
+                    error!(
+                        "Relay QUIC connection died: {}. \
+                         Stats: mtu={}, mds={:?}, rtt={:?}, \
+                         sent_pkts={}, lost_pkts={}, lost_bytes={}, \
+                         pmtud_sent={}, pmtud_lost={}, black_holes={}, \
+                         datagrams_tx={}, datagrams_rx={}",
+                        e,
+                        stats.path.current_mtu,
+                        recv_conn.max_datagram_size(),
+                        stats.path.rtt,
+                        stats.path.sent_packets,
+                        stats.path.lost_packets,
+                        stats.path.lost_bytes,
+                        stats.path.sent_plpmtud_probes,
+                        stats.path.lost_plpmtud_probes,
+                        stats.path.black_holes_detected,
+                        stats.frame_tx.datagram,
+                        stats.frame_rx.datagram,
+                    );
                     break;
                 }
             }
@@ -89,6 +108,37 @@ pub fn relay_connection(
         }
     });
 
+    // Periodic connection health logging.
+    let stats_conn = conn.clone();
+    tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            let Some(mds) = stats_conn.max_datagram_size() else {
+                info!("Relay QUIC stats: connection closed");
+                break;
+            };
+            let stats = stats_conn.stats();
+            info!(
+                "Relay QUIC stats: mtu={}, mds={}, rtt={:?}, \
+                 sent_pkts={}, lost_pkts={}, lost_bytes={}, \
+                 pmtud_sent={}, pmtud_lost={}, black_holes={}, \
+                 cwnd={}, datagrams_tx={}, datagrams_rx={}",
+                stats.path.current_mtu,
+                mds,
+                stats.path.rtt,
+                stats.path.sent_packets,
+                stats.path.lost_packets,
+                stats.path.lost_bytes,
+                stats.path.sent_plpmtud_probes,
+                stats.path.lost_plpmtud_probes,
+                stats.path.black_holes_detected,
+                stats.path.cwnd,
+                stats.frame_tx.datagram,
+                stats.frame_rx.datagram,
+            );
+        }
+    });
+
     let send_conn = conn.clone();
     let transport_sink =
         futures_util::sink::unfold(send_conn, move |c, pkt: Vec<u8>| async move {
@@ -98,12 +148,28 @@ pub fn relay_connection(
             // back, stalling the QUIC connection and triggering PMTUD failures.
             // Back-pressure is applied at the relay (pubsub) side instead,
             // where each direction runs in its own task.
+            let pkt_len = pkt.len();
             match c.send_datagram(pkt.into()) {
                 Ok(()) => {}
                 Err(quinn::SendDatagramError::TooLarge) => {
-                    debug!("Relay datagram too large, dropping");
+                    warn!(
+                        "Relay datagram too large: pkt={} bytes, max_datagram_size={:?}",
+                        pkt_len,
+                        c.max_datagram_size(),
+                    );
                 }
                 Err(e) => {
+                    let stats = c.stats();
+                    error!(
+                        "Relay send_datagram failed: {}. \
+                         Stats: mtu={}, mds={:?}, lost_pkts={}, pmtud_sent={}, pmtud_lost={}",
+                        e,
+                        stats.path.current_mtu,
+                        c.max_datagram_size(),
+                        stats.path.lost_packets,
+                        stats.path.sent_plpmtud_probes,
+                        stats.path.lost_plpmtud_probes,
+                    );
                     return Err(io::Error::other(format!("send_datagram failed: {}", e)));
                 }
             }

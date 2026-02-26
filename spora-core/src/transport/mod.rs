@@ -160,13 +160,13 @@ impl Stream for ReconnectTransport {
                     let mut pinned = Pin::new(inner);
                     match pinned.as_mut().poll_next(cx) {
                         Poll::Ready(Some(Ok(pkt))) => return Poll::Ready(Some(Ok(pkt))),
-                        Poll::Ready(Some(Err(_e))) => {
-                            // Underlying transport errored => reconnect.
+                        Poll::Ready(Some(Err(e))) => {
+                            warn!("Inner transport error, reconnecting: {}", e);
                             this.begin_dial();
                             continue;
                         }
                         Poll::Ready(None) => {
-                            // Underlying transport ended => reconnect.
+                            info!("Inner transport stream ended, reconnecting");
                             this.begin_dial();
                             continue;
                         }

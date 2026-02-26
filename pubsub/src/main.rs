@@ -1,36 +1,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Instant;
 use clap::Parser;
-use log::{debug, info, warn};
+use log::{debug, error, info, warn};
 use quinn::Connection;
-use quinn::congestion;
 use tokio::sync::Mutex;
 
 const MSG_SUB: u8 = 0x01;
 const MSG_PUB: u8 = 0x02;
 const MSG_MATCH: u8 = 0x03;
 const RESP_ERROR: u8 = 0xFF;
-
-#[derive(Debug, Clone)]
-struct NoopCc { mtu: u16 }
-
-impl congestion::Controller for NoopCc {
-    fn on_congestion_event(&mut self, _now: Instant, _sent: Instant, _is_persistent: bool, _lost_bytes: u64) {}
-    fn on_mtu_update(&mut self, new_mtu: u16) { self.mtu = new_mtu; }
-    fn window(&self) -> u64 { u64::MAX / 2 }
-    fn clone_box(&self) -> Box<dyn congestion::Controller> { Box::new(self.clone()) }
-    fn initial_window(&self) -> u64 { u64::MAX / 2 }
-    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> { self }
-}
-
-struct NoopCcFactory;
-
-impl congestion::ControllerFactory for NoopCcFactory {
-    fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn congestion::Controller> {
-        Box::new(NoopCc { mtu: 1200 })
-    }
-}
 
 const ALPN: &[u8] = b"spora-relay/1";
 
@@ -93,7 +71,9 @@ async fn main() {
     transport.datagram_send_buffer_size(8 * 1024 * 1024);
     transport.initial_mtu(1200);
     transport.min_mtu(1200);
-    transport.congestion_controller_factory(Arc::new(NoopCcFactory));
+    let mut mtud = quinn::MtuDiscoveryConfig::default();
+    mtud.black_hole_cooldown(std::time::Duration::from_secs(1));
+    transport.mtu_discovery_config(Some(mtud));
     server_config.transport_config(Arc::new(transport));
 
     let endpoint = quinn::Endpoint::server(server_config, ([0, 0, 0, 0], args.port).into())
@@ -243,6 +223,29 @@ async fn handle_connection(
     }
 }
 
+fn log_conn_stats(label: &str, conn: &Connection) {
+    let stats = conn.stats();
+    error!(
+        "{}: mtu={}, mds={:?}, rtt={:?}, \
+         sent_pkts={}, lost_pkts={}, lost_bytes={}, \
+         pmtud_sent={}, pmtud_lost={}, black_holes={}, \
+         cwnd={}, datagrams_tx={}, datagrams_rx={}",
+        label,
+        stats.path.current_mtu,
+        conn.max_datagram_size(),
+        stats.path.rtt,
+        stats.path.sent_packets,
+        stats.path.lost_packets,
+        stats.path.lost_bytes,
+        stats.path.sent_plpmtud_probes,
+        stats.path.lost_plpmtud_probes,
+        stats.path.black_holes_detected,
+        stats.path.cwnd,
+        stats.frame_tx.datagram,
+        stats.frame_rx.datagram,
+    );
+}
+
 fn spawn_datagram_forwarding(a: Connection, b: Connection) {
     let a2 = a.clone();
     let b2 = b.clone();
@@ -260,17 +263,28 @@ fn spawn_datagram_forwarding(a: Connection, b: Connection) {
                     // buffer (FIFO).  Drop-newest is critical for TCP: the
                     // oldest segments are needed for the receiver's contiguous
                     // window to advance.
-                    if let Err(e) = b.send_datagram_wait(data).await {
-                        warn!("Failed to forward datagram a→b: {}", e);
-                        break;
+                    match b.send_datagram_wait(data).await {
+                        Ok(()) => {}
+                        Err(quinn::SendDatagramError::TooLarge) => {
+                            // Black hole detection may have temporarily reduced
+                            // the MTU.  Skip this datagram; inner TCP will
+                            // retransmit.  PMTUD will re-probe shortly.
+                            warn!("Forwarding a→b: datagram too large (mds={:?}), skipping", b.max_datagram_size());
+                        }
+                        Err(e) => {
+                            warn!("Failed to forward datagram a→b: {}", e);
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
-                    info!("Datagram forwarding a→b ended: {}", e);
+                    error!("Datagram forwarding a→b ended: {}", e);
                     break;
                 }
             }
         }
+        log_conn_stats("pub conn stats at forwarding end", &a);
+        log_conn_stats("sub conn stats at forwarding end (send side)", &b);
     });
 
     // b → a
@@ -278,16 +292,24 @@ fn spawn_datagram_forwarding(a: Connection, b: Connection) {
         loop {
             match b2.read_datagram().await {
                 Ok(data) => {
-                    if let Err(e) = a2.send_datagram_wait(data).await {
-                        warn!("Failed to forward datagram b→a: {}", e);
-                        break;
+                    match a2.send_datagram_wait(data).await {
+                        Ok(()) => {}
+                        Err(quinn::SendDatagramError::TooLarge) => {
+                            warn!("Forwarding b→a: datagram too large (mds={:?}), skipping", a2.max_datagram_size());
+                        }
+                        Err(e) => {
+                            warn!("Failed to forward datagram b→a: {}", e);
+                            break;
+                        }
                     }
                 }
                 Err(e) => {
-                    info!("Datagram forwarding b→a ended: {}", e);
+                    error!("Datagram forwarding b→a ended: {}", e);
                     break;
                 }
             }
         }
+        log_conn_stats("sub conn stats at forwarding end", &b2);
+        log_conn_stats("pub conn stats at forwarding end (send side)", &a2);
     });
 }
