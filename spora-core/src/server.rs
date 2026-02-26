@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io;
-use std::net::SocketAddr;
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
@@ -172,8 +172,37 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
     }
 }
 
-async fn handle_tcp_streams(mut tcp_listener: TcpListener, protector: SocketProtector) {
+/// Returns `true` if the address belongs to a private, loopback, link-local,
+/// or otherwise non-public IP range that should not be reachable through the tunnel.
+fn is_local_address(addr: IpAddr) -> bool {
+    match addr {
+        IpAddr::V4(ip) => {
+            let o = ip.octets();
+            o[0] == 0                                           // 0.0.0.0/8
+                || o[0] == 10                                   // 10.0.0.0/8
+                || (o[0] == 100 && (o[1] & 0xC0) == 64)        // 100.64.0.0/10
+                || ip == Ipv4Addr::LOCALHOST                    // fast path
+                || o[0] == 127                                  // 127.0.0.0/8
+                || (o[0] == 169 && o[1] == 254)                 // 169.254.0.0/16
+                || (o[0] == 172 && (o[1] & 0xF0) == 16)        // 172.16.0.0/12
+                || (o[0] == 192 && o[1] == 168)                 // 192.168.0.0/16
+                || (o[0] & 0xF0) == 224                         // 224.0.0.0/4 multicast
+                || (o[0] & 0xF0) == 240                         // 240.0.0.0/4 reserved + broadcast
+        }
+        IpAddr::V6(ip) => {
+            ip == Ipv6Addr::LOCALHOST                            // ::1
+                || (ip.segments()[0] & 0xFE00) == 0xFC00        // fc00::/7  (ULA)
+                || (ip.segments()[0] & 0xFFC0) == 0xFE80        // fe80::/10 (link-local)
+        }
+    }
+}
+
+async fn handle_tcp_streams(mut tcp_listener: TcpListener, protector: SocketProtector, block_local: bool) {
     while let Some((mut stream, local, remote)) = tcp_listener.next().await {
+        if block_local && is_local_address(remote.ip()) {
+            warn!("blocked TCP connection to local address: {:?} => {:?}", local, remote);
+            continue;
+        }
         let protector = protector.clone();
         tokio::spawn(async move {
             info!("new tcp connection: {:?} => {:?}", local, remote);
@@ -230,7 +259,7 @@ struct NATEntry {
     last_activity: Instant,
 }
 
-async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket, protector: SocketProtector) {
+async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket, protector: SocketProtector, block_local: bool) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let (mut read_half, mut write_half) = udp_socket.split();
     tokio::spawn(async move {
@@ -246,6 +275,10 @@ async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket, protec
         tokio::select! {
             packet = read_half.next() => {
                 let Some((data, local, remote)) = packet else { break };
+                if block_local && is_local_address(remote.ip()) {
+                    warn!("blocked UDP datagram to local address: {:?} => {:?}", local, remote);
+                    continue;
+                }
                 let key = NATKey(local, remote);
 
                 if let Some(entry) = entries.get_mut(&key) {
@@ -333,7 +366,7 @@ pub enum TunnelError {
 /// Start the virtual IP stack and tunnel with the given transport.
 ///
 /// Blocks until the tunnel ends or `cancel` is triggered.
-pub(crate) async fn start_tunnel(transport: IpTransport, protector: SocketProtector, cancel: CancellationToken) -> io::Result<()> {
+pub(crate) async fn start_tunnel(transport: IpTransport, protector: SocketProtector, cancel: CancellationToken, block_local: bool) -> io::Result<()> {
     info!("Starting tunnel (virtual IP stack)");
     let builder = StackBuilder::default()
         .stack_buffer_size(4096)
@@ -348,8 +381,8 @@ pub(crate) async fn start_tunnel(transport: IpTransport, protector: SocketProtec
     let runner_handle = runner.map(|r| tokio::spawn(r));
 
     let w_tunnel = tokio::spawn(run_tunnel(transport, stack));
-    let w_tcp = tokio::spawn(handle_tcp_streams(tcp_listener, protector.clone()));
-    let w_udp = tokio::spawn(handle_inbound_datagram(udp_socket, protector));
+    let w_tcp = tokio::spawn(handle_tcp_streams(tcp_listener, protector.clone(), block_local));
+    let w_udp = tokio::spawn(handle_inbound_datagram(udp_socket, protector, block_local));
 
     let abort_handles = [
         w_tunnel.abort_handle(),
@@ -497,7 +530,7 @@ impl PeerPort {
             });
 
             tokio::spawn(async move {
-                let _ = start_tunnel(transport, protector2, child_cancel).await;
+                let _ = start_tunnel(transport, protector2, child_cancel, true).await;
                 // Clean up background tasks
                 upgrade_task.abort();
                 demux_handle.abort();

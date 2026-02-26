@@ -1186,7 +1186,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         tokio::spawn(async move {
-            server::start_tunnel(transport, None, cancel_clone).await.unwrap();
+            server::start_tunnel(transport, None, cancel_clone, false).await.unwrap();
         });
 
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -1234,7 +1234,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         tokio::spawn(async move {
-            server::start_tunnel(server_transport, None, cancel_clone).await.unwrap();
+            server::start_tunnel(server_transport, None, cancel_clone, false).await.unwrap();
         });
         drop(server_signal);
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -1286,7 +1286,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         tokio::spawn(async move {
-            server::start_tunnel(server_transport, None, cancel_clone).await.unwrap();
+            server::start_tunnel(server_transport, None, cancel_clone, false).await.unwrap();
         });
 
         let (client_relay, client_signal, _client_demux) = relay_connection(client_conn, None);
@@ -1354,7 +1354,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         tokio::spawn(async move {
-            server::start_tunnel(server_transport, None, cancel_clone).await.unwrap();
+            server::start_tunnel(server_transport, None, cancel_clone, false).await.unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -1422,7 +1422,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let tunnel_handle = tokio::spawn(async move {
-            server::start_tunnel(server_transport, None, cancel_clone).await.unwrap();
+            server::start_tunnel(server_transport, None, cancel_clone, false).await.unwrap();
         });
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
@@ -2356,7 +2356,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
         let tunnel_handle = tokio::spawn(async move {
-            server::start_tunnel(server_transport, None, cancel_clone)
+            server::start_tunnel(server_transport, None, cancel_clone, false)
                 .await
                 .unwrap();
         });
