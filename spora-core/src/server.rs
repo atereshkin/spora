@@ -37,9 +37,11 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
 
     // Task 1 — Transport reader: transport → unbounded ingress channel.
     let ingress = tokio::spawn(async move {
+        let mut count: u64 = 0;
         while let Some(res) = peer_stream.next().await {
             match res {
                 Ok(pkt) => {
+                    count += 1;
                     if ingress_tx.send(pkt).is_err() {
                         break;
                     }
@@ -50,7 +52,7 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
                 }
             }
         }
-        info!("Transport stream closed.");
+        info!("Transport stream closed. Ingress packets received: {}", count);
     });
 
     // Task 2 — Stack driver: polls both Stream (egress) and Sink (ingress) on
@@ -59,17 +61,43 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
     // (poll_ready / poll_flush return Pending without registering a waker when
     // the internal tcp_tx channel is full, which permanently parks the caller).
     let stack_driver = tokio::spawn(async move {
+        use std::future::Future;
         use std::pin::Pin;
         use std::task::Poll;
 
         let mut pending_ingress: Option<Vec<u8>> = None;
 
+        // --- Diagnostic counters ---
+        let mut ingress_delivered: u64 = 0; // packets pushed into stack
+        let mut ingress_flush_pending: u64 = 0; // times poll_flush returned Pending
+        let mut ingress_ready_pending: u64 = 0; // times poll_ready returned Pending
+        let mut egress_produced: u64 = 0; // packets emitted by stack
+        let mut egress_dropped: u64 = 0; // egress_tx.try_send failures
+
+        let stats_timer = tokio::time::sleep(std::time::Duration::from_secs(10));
+        tokio::pin!(stats_timer);
+
         futures_util::future::poll_fn(|cx| {
+            // --- Periodic stats ---
+            if stats_timer.as_mut().poll(cx).is_ready() {
+                info!(
+                    "Stack driver: ingress_delivered={}, egress_produced={}, egress_dropped={}, \
+                     flush_pending={}, ready_pending={}, pending_ingress={}",
+                    ingress_delivered, egress_produced, egress_dropped,
+                    ingress_flush_pending, ingress_ready_pending, pending_ingress.is_some(),
+                );
+                stats_timer.as_mut().reset(
+                    tokio::time::Instant::now() + std::time::Duration::from_secs(10),
+                );
+            }
+
             // --- Egress: drain stack output → bounded egress channel ---
             loop {
                 match Pin::new(&mut stack).poll_next(cx) {
                     Poll::Ready(Some(Ok(pkt))) => {
+                        egress_produced += 1;
                         if egress_tx.try_send(pkt.to_vec()).is_err() {
+                            egress_dropped += 1;
                             warn!("Egress channel full, dropping packet ({} bytes)", pkt.len());
                         }
                     }
@@ -94,6 +122,7 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
 
                         match Pin::new(&mut stack).poll_ready(cx) {
                             Poll::Ready(Ok(())) => {
+                                ingress_delivered += 1;
                                 if let Err(e) = Pin::new(&mut stack).start_send(pkt) {
                                     error!("Stack send error: {}", e);
                                 }
@@ -105,7 +134,10 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
                                         error!("Stack flush error: {}", e);
                                         return Poll::Ready(());
                                     }
-                                    Poll::Pending => break, // sink busy
+                                    Poll::Pending => {
+                                        ingress_flush_pending += 1;
+                                        break; // sink busy
+                                    }
                                 }
                             }
                             Poll::Ready(Err(e)) => {
@@ -113,6 +145,7 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
                                 return Poll::Ready(());
                             }
                             Poll::Pending => {
+                                ingress_ready_pending += 1;
                                 pending_ingress = Some(pkt);
                                 break;
                             }
@@ -124,6 +157,7 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
                     return Poll::Ready(());
                 }
                 Poll::Pending => {
+                    ingress_flush_pending += 1;
                     // Sink busy — can't accept data yet.  We'll retry when
                     // woken by poll_next (stack output) or ingress_rx below.
                 }
@@ -145,17 +179,25 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
             Poll::Pending
         })
         .await;
-        info!("Stack driver ended.");
+        info!(
+            "Stack driver ended. Final stats: ingress_delivered={}, egress_produced={}, \
+             egress_dropped={}, flush_pending={}, ready_pending={}",
+            ingress_delivered, egress_produced, egress_dropped,
+            ingress_flush_pending, ingress_ready_pending,
+        );
     });
 
     // Task 3 — Egress writer: bounded channel → transport.
     let egress = tokio::spawn(async move {
+        let mut count: u64 = 0;
         while let Some(pkt) = egress_rx.recv().await {
+            count += 1;
             if let Err(e) = peer_sink.send(pkt).await {
-                error!("Transport write error: {}", e);
+                error!("Transport write error after {} packets: {}", count, e);
                 break;
             }
         }
+        info!("Egress writer ended. Packets sent to transport: {}", count);
     });
 
     let _guard = AbortOnDrop(vec![
