@@ -2,3 +2,5 @@ target
 .idea
 
 .aider*
+
+deploy/deploy_key
