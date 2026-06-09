@@ -14,3 +14,4 @@ url = "2.5.7"
 
 [target.'cfg(not(windows))'.dependencies]
 tokio-tun = "0.12.1"
+tikv-jemallocator = "0.6"

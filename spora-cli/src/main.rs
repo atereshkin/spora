@@ -5,6 +5,13 @@ use std::path::PathBuf;
 use tokio_tun::Tun;
 use url::Url;
 
+/// Use jemalloc on non-Windows. The default glibc allocator holds onto pages
+/// under heavy alloc/free churn (every IP packet on the share side allocates
+/// a `Vec<u8>`); jemalloc returns memory to the OS far more aggressively.
+#[cfg(not(windows))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
 #[derive(Parser, Debug)]
 #[command(name = "spora")]
 #[command(author, version, about)]
