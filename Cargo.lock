@@ -4552,9 +4552,7 @@ dependencies = [
  "clap",
  "env_logger",
  "log",
- "quinn",
- "rcgen",
- "rustls",
+ "relay-client",
  "tokio",
 ]
 
@@ -4562,11 +4560,7 @@ dependencies = [
 name = "relay-client"
 version = "0.1.0"
 dependencies = [
- "bytes",
  "log",
- "quinn",
- "rcgen",
- "rustls",
  "tokio",
 ]
 
@@ -5337,6 +5331,8 @@ dependencies = [
 name = "spora-core"
 version = "0.1.0"
 dependencies = [
+ "base64",
+ "env_logger",
  "etherparse",
  "futures-util",
  "libc",
@@ -5345,6 +5341,7 @@ dependencies = [
  "quinn",
  "rand 0.8.5",
  "rcgen",
+ "relay",
  "relay-client",
  "ring",
  "rustls",
@@ -5374,6 +5371,7 @@ dependencies = [
 name = "spora-wincore"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "env_logger",
  "futures-util",
  "log",

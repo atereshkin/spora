@@ -1,7 +1,7 @@
 [package]
 name = "spora-core"
 version = "0.1.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 netstack-smoltcp = "0.2.0"
@@ -20,6 +20,9 @@ quinn = { workspace = true }
 rustls = { workspace = true }
 rcgen = "0.13"
 ring = "0.17"
+base64 = "0.22"
 
 [dev-dependencies]
 tokio = { version = "1.40.0", features = ["full", "test-util"] }
+relay = { path = "../relay" }
+env_logger = "0.11"

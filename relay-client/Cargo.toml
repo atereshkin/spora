@@ -6,9 +6,3 @@ edition = "2024"
 [dependencies]
 tokio = { version = "1", features = ["full"]}
 log = "0.4"
-quinn = { workspace = true }
-rustls = { workspace = true }
-
-[dev-dependencies]
-rcgen = "0.13"
-bytes = "1"

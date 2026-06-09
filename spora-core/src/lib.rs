@@ -1,58 +1,53 @@
 mod neg;
+pub mod e2e;
+pub mod identity;
 pub mod server;
+pub mod signal;
 pub mod transport;
 pub mod tun_util;
 
-use crate::neg::{NegChannel, SignalNegChannel};
-use crate::transport::keepalive::{KeepAliveConfig, KeepAliveMode, KeepAliveTransport};
-use crate::transport::DialFuture;
-pub use crate::transport::IpTransport;
-use crate::transport::relay::{relay_connection, MtuCallback, SignalChannel};
-use crate::transport::upgradable::{upgradable_transport, UpgradeSender};
-use crate::transport::ReconnectTransport;
-use crate::transport::quic::{establish_quic_client, establish_quic_server, generate_self_signed_cert};
-use log::{debug, info, warn};
-use relay_client::RelayService;
-use quinn::Connection;
-use server::PeerPort;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
+use std::time::Duration;
+
+use log::{debug, info, warn};
+use quinn::Connection;
 use stunclient::StunClient;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
 
-/// Extract (relay_host, relay_port, key) from a `https://spora.to/s/<key>?r=<host>:<port>` URL.
-fn parse_spora_url(url: &Url) -> Result<(String, u16, String), String> {
-    let key = url
-        .path()
-        .strip_prefix("/s/")
-        .ok_or_else(|| format!("URL path must start with /s/, got {}", url.path()))?;
-    if key.is_empty() {
-        return Err("URL path is missing the key after /s/".into());
-    }
-    let relay = url
-        .query_pairs()
-        .find(|(k, _)| k == "r")
-        .map(|(_, v)| v.into_owned())
-        .ok_or("URL is missing required ?r= query parameter")?;
-    let (host, port_str) = relay
-        .rsplit_once(':')
-        .ok_or_else(|| format!("?r= value must be host:port, got {}", relay))?;
-    let port: u16 = port_str
-        .parse()
-        .map_err(|_| format!("invalid port in ?r= value: {}", port_str))?;
-    Ok((host.to_string(), port, key.to_string()))
-}
+use crate::e2e::{accept_one, client_connect, client_endpoint, server_endpoint, E2eSession};
+use crate::identity::{Identity, Token, ROUTING_KEY_LEN, SECRET_LEN};
+use crate::neg::{NegChannel, SignalNegChannel};
+use crate::signal::SignalChannel;
+use crate::transport::keepalive::{KeepAliveConfig, KeepAliveMode, KeepAliveTransport};
+use crate::transport::quic::QuicPeerTransport;
+use crate::transport::upgradable::{upgradable_transport, UpgradeSender};
+use crate::transport::DialFuture;
+use crate::transport::ReconnectTransport;
+pub use crate::transport::IpTransport;
+
+/// Callback invoked once after the end-to-end QUIC connection's PMTUD has
+/// converged. The application can use this to configure its TUN device.
+pub type MtuCallback = Option<Arc<dyn Fn(u16) + Send + Sync>>;
 
 pub type SocketProtector = Option<Arc<dyn Fn(i32) + Send + Sync>>;
 
 /// Call the protector callback with the socket's raw fd (unix only).
 pub fn protect_socket(protector: &SocketProtector, _socket: &UdpSocket) {
     #[cfg(unix)]
-    if let Some(ref f) = protector {
+    if let Some(f) = protector {
+        use std::os::unix::io::AsRawFd;
+        f(_socket.as_raw_fd());
+    }
+}
+
+fn apply_protector_to_std(protector: &SocketProtector, _socket: &std::net::UdpSocket) {
+    #[cfg(unix)]
+    if let Some(f) = protector {
         use std::os::unix::io::AsRawFd;
         f(_socket.as_raw_fd());
     }
@@ -78,7 +73,7 @@ impl Default for Config {
     fn default() -> Self {
         Self {
             stun_server: "stun.l.google.com:19302".into(),
-            relay_host: "188.166.74.116".into(),
+            relay_host: "167.71.66.250".into(),
             relay_port: 443,
             protector: None,
             mtu_callback: None,
@@ -87,143 +82,214 @@ impl Default for Config {
 }
 
 pub struct ShareSession {
-    pub key: String,
-    pub endpoint: String,
+    pub url: Url,
     pub cancel: CancellationToken,
     pub task: JoinHandle<()>,
 }
 
 impl ShareSession {
-    /// Cancel the session and wait for the background task to finish.
     pub async fn stop(self) {
         self.cancel.cancel();
         let _ = self.task.await;
     }
 
-    /// Cancel the session and abort the background task immediately.
     pub fn abort(self) {
         self.cancel.cancel();
         self.task.abort();
     }
 }
 
-/// Generate a random secret key for use with `share()`.
-pub fn make_secret_key() -> String {
-    use rand::Rng;
-    const CHARSET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let mut rng = rand::thread_rng();
-    (0..12).map(|_| CHARSET[rng.gen_range(0..CHARSET.len())] as char).collect()
-}
-
-pub async fn share(key: String, config: Config) -> Result<ShareSession, String> {
-    let pp = match PeerPort::new(key, config).await {
-        Ok(pp) => pp,
-        Err(e) => return Err(format!("failed to start message subscription: {}", e)),
-    };
-    let key = pp.key.clone();
-    let endpoint = pp.endpoint.clone();
-    let cancel = CancellationToken::new();
-    let child = cancel.clone();
-    let task = tokio::spawn(async move {
-        info!("PeerPort::run task started");
-        pp.run(child).await;
-        info!("PeerPort::run task exited");
-    });
-    Ok(ShareSession { key, endpoint, cancel, task })
-}
-
-/// Build a relay-based client transport stack and spawn a background upgrade task.
+/// Start sharing under the given `Identity` (cert + key + secret).
 ///
-/// Returns `(transport, keepalive_knob)` where `keepalive_knob` is the adaptive
-/// keepalive control (0 = on-demand, >0 = always-probe at that interval in seconds).
-fn build_client_transport(
-    relay_conn: Connection,
-    stun_server: &str,
-    protector: &SocketProtector,
+/// Identity persistence is the caller's responsibility. Use
+/// `Identity::generate()` once and persist `identity.to_bytes()` somewhere
+/// platform-appropriate (a file under XDG_CONFIG_HOME on the CLI,
+/// SharedPreferences on Android, the registry on Windows, etc.), then load
+/// it back with `Identity::from_bytes()` on subsequent launches so the share
+/// URL stays the same.
+pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, String> {
+    let identity = Arc::new(identity);
+    let routing_key = identity.routing_key;
+
+    let relay_addr = resolve_relay(&config.relay_host, config.relay_port)?;
+    let url = identity
+        .token(config.relay_host.clone(), config.relay_port)
+        .to_url();
+
+    let std_socket = bind_local_udp(&config.protector)?;
+    let std_clone = std_socket
+        .try_clone()
+        .map_err(|e| format!("socket try_clone: {}", e))?;
+    std_clone
+        .set_nonblocking(true)
+        .map_err(|e| format!("set_nonblocking on cloned socket: {}", e))?;
+    let registrar = Arc::new(
+        tokio::net::UdpSocket::from_std(std_clone)
+            .map_err(|e| format!("tokio::from_std: {}", e))?,
+    );
+
+    let endpoint = server_endpoint(std_socket, &identity)?;
+    info!(
+        "share: e2e endpoint up, rk {:x?}, relay {}",
+        &routing_key[..4],
+        relay_addr
+    );
+
+    let cancel = CancellationToken::new();
+    let cancel_child = cancel.clone();
+    let config_for_loop = config.clone();
+    let identity_for_loop = identity.clone();
+    let task = tokio::spawn(async move {
+        let register_task = tokio::spawn(relay_client::register_loop(
+            registrar,
+            relay_addr,
+            routing_key,
+            relay_client::DEFAULT_REGISTER_INTERVAL,
+        ));
+        run_share_loop(endpoint, identity_for_loop, cancel_child, config_for_loop).await;
+        register_task.abort();
+    });
+
+    Ok(ShareSession { url, cancel, task })
+}
+
+async fn run_share_loop(
+    endpoint: quinn::Endpoint,
+    identity: Arc<Identity>,
     cancel: CancellationToken,
-    keepalive_knob: Arc<AtomicU64>,
-    keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
-    mtu_callback: MtuCallback,
-) -> IpTransport {
-    let (relay_transport, signal_channel, demux_handle) = relay_connection(relay_conn, mtu_callback.clone());
+    config: Config,
+) {
+    let secret = identity.secret;
+    let mut tunnel_cancel: Option<CancellationToken> = None;
+    let mut iteration: u32 = 0;
 
-    let (upgradable, upgrade_sender, router_handle) =
-        upgradable_transport(Box::new(relay_transport));
+    loop {
+        iteration += 1;
+        info!("[share #{}] waiting for peer", iteration);
+        let session = tokio::select! {
+            _ = cancel.cancelled() => {
+                info!("share cancelled");
+                if let Some(tc) = tunnel_cancel.take() { tc.cancel(); }
+                endpoint.close(0u32.into(), b"share-cancelled");
+                break;
+            }
+            result = accept_one(&endpoint, &secret) => match result {
+                None => { info!("share endpoint closed"); break; }
+                Some(Ok(s)) => s,
+                Some(Err(e)) => { warn!("[share #{}] accept failed: {}", iteration, e); continue; }
+            },
+        };
 
-    let upgrade_knob = keepalive_knob.clone();
-    let keepalive_cfg = KeepAliveConfig {
-        mode: KeepAliveMode::Adaptive { knob: keepalive_knob, waker: keepalive_waker },
-        ..Default::default()
-    };
-    let transport: IpTransport =
-        Box::new(KeepAliveTransport::new(Box::new(upgradable), keepalive_cfg));
+        if let Some(tc) = tunnel_cancel.take() {
+            info!("[share #{}] new peer, cancelling previous tunnel", iteration);
+            tc.cancel();
+        }
 
-    // Spawn background direct upgrade task (client = initiator).
-    // Move demux_handle and router_handle into the task to keep them alive.
-    let stun_server = stun_server.to_string();
-    let protector = protector.clone();
+        let child_cancel = cancel.child_token();
+        tunnel_cancel = Some(child_cancel.clone());
+        spawn_responder_tunnel(session, identity.clone(), &config, child_cancel);
+    }
+}
+
+fn spawn_responder_tunnel(
+    session: E2eSession,
+    identity: Arc<Identity>,
+    config: &Config,
+    tunnel_cancel: CancellationToken,
+) {
+    let E2eSession {
+        conn,
+        transport,
+        signal,
+    } = session;
+
+    let (upgradable, upgrade_sender, router_handle) = upgradable_transport(Box::new(transport));
+    let transport: IpTransport = Box::new(KeepAliveTransport::new(
+        Box::new(upgradable),
+        KeepAliveConfig::default(),
+    ));
+
+    let stun_server = config.stun_server.clone();
+    let protector = config.protector.clone();
+    let protector_for_tunnel = config.protector.clone();
+    let mtu_cb = config.mtu_callback.clone();
+    let conn_for_mtu = conn.clone();
+    let upgrade_cancel = tunnel_cancel.clone();
+    let role = DirectRole::Responder { identity };
+
+    let upgrade_task = tokio::spawn(async move {
+        try_direct_upgrade(
+            signal,
+            upgrade_sender,
+            &stun_server,
+            role,
+            &protector,
+            upgrade_cancel,
+            None,
+            mtu_cb,
+        )
+        .await;
+    });
+
+    if let Some(cb) = config.mtu_callback.clone() {
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            if let Some(mds) = conn_for_mtu.max_datagram_size() {
+                info!("e2e max datagram size (post-PMTUD): {}", mds);
+                cb(mds as u16);
+            }
+        });
+    }
+
     tokio::spawn(async move {
-        try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, true, &protector, cancel, Some(upgrade_knob), mtu_callback).await;
-        drop(demux_handle);
+        let _ = server::start_tunnel(transport, protector_for_tunnel, tunnel_cancel, true).await;
+        upgrade_task.abort();
         drop(router_handle);
     });
-
-    transport
 }
 
-/// Connect to a peer via relay-first tunneling with background direct upgrade.
-///
-/// 1. Publishes to the relay to get a relay socket
-/// 2. Creates a RelayTransport for immediate IP tunneling
-/// 3. Wraps in UpgradableTransport + KeepAlive
-/// 4. Spawns a background task that tries to establish a direct UDP connection
-/// 5. Wraps in ReconnectTransport to auto-reconnect if the relay connection drops
+/// Connect to a sharer via the URL. Returns the IP-level transport plus the
+/// keepalive controls so the caller (CLI/FFI) can toggle dormant mode.
 pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String> {
+    let token = Arc::new(Token::from_url(&url)?);
+    let relay_addr = resolve_relay(&token.relay_host, token.relay_port)?;
+    info!(
+        "connect: relay {} for rk {:x?}",
+        relay_addr,
+        &token.routing_key[..4]
+    );
+
     let cancel = CancellationToken::new();
     let keepalive_knob = Arc::new(AtomicU64::new(0));
     let keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>> =
         Arc::new(std::sync::Mutex::new(None));
 
-    let (relay_host, relay_port, key) = parse_spora_url(&url)?;
-    info!("Connecting to relay {}:{} with key {}", relay_host, relay_port, key);
-
-    let relay_conn = RelayService::publish(
-        &relay_host,
-        relay_port,
-        &key,
-        &config.protector,
+    let initial = dial_initiator(
+        relay_addr,
+        &token,
+        config,
+        cancel.clone(),
+        keepalive_knob.clone(),
+        keepalive_waker.clone(),
     )
     .await
-    .map_err(|e| format!("failed to publish to relay: {}", e))?;
-    info!("Relay connection established");
+    .map_err(|e| format!("initial dial: {}", e))?;
 
-    let initial = build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel.clone(), keepalive_knob.clone(), keepalive_waker.clone(), config.mtu_callback.clone());
-
-    let config_clone = config.clone();
+    let dialer_token = token.clone();
+    let dialer_config = config.clone();
     let dialer_cancel = cancel.clone();
     let dialer_knob = keepalive_knob.clone();
     let dialer_waker = keepalive_waker.clone();
     let dialer: Box<dyn FnMut() -> DialFuture + Send> = Box::new(move || {
-        let relay_host = relay_host.clone();
-        let key = key.clone();
-        let config = config_clone.clone();
+        let token = dialer_token.clone();
+        let config = dialer_config.clone();
         let cancel = dialer_cancel.clone();
         let knob = dialer_knob.clone();
         let waker = dialer_waker.clone();
-        Box::pin(async move {
-            let relay_conn = RelayService::publish(
-                &relay_host,
-                relay_port,
-                &key,
-                &config.protector,
-            )
-            .await?;
-            Ok(build_client_transport(relay_conn, &config.stun_server, &config.protector, cancel, knob, waker, config.mtu_callback.clone()))
-        })
+        Box::pin(async move { dial_initiator(relay_addr, &token, &config, cancel, knob, waker).await })
     });
 
     let transport = Box::new(ReconnectTransport::new(initial, dialer));
-
     Ok(ConnectResult {
         transport,
         cancel,
@@ -232,18 +298,94 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     })
 }
 
+async fn dial_initiator(
+    relay_addr: SocketAddr,
+    token: &Token,
+    config: &Config,
+    cancel: CancellationToken,
+    keepalive_knob: Arc<AtomicU64>,
+    keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+) -> std::io::Result<IpTransport> {
+    let std_socket = bind_local_udp(&config.protector).map_err(std::io::Error::other)?;
+    let endpoint = client_endpoint(std_socket, token.routing_key).map_err(std::io::Error::other)?;
+    let session = client_connect(&endpoint, relay_addr, &token.secret)
+        .await
+        .map_err(std::io::Error::other)?;
+    let E2eSession {
+        conn,
+        transport,
+        signal,
+    } = session;
+
+    let (upgradable, upgrade_sender, router_handle) = upgradable_transport(Box::new(transport));
+    let upgrade_knob = keepalive_knob.clone();
+    let keepalive_cfg = KeepAliveConfig {
+        mode: KeepAliveMode::Adaptive {
+            knob: keepalive_knob,
+            waker: keepalive_waker,
+        },
+        ..Default::default()
+    };
+    let transport: IpTransport =
+        Box::new(KeepAliveTransport::new(Box::new(upgradable), keepalive_cfg));
+
+    let role = DirectRole::Initiator {
+        routing_key: token.routing_key,
+        secret: token.secret,
+    };
+    let stun_server = config.stun_server.clone();
+    let protector = config.protector.clone();
+    let mtu_cb = config.mtu_callback.clone();
+    let upgrade_cancel = cancel.clone();
+    tokio::spawn(async move {
+        try_direct_upgrade(
+            signal,
+            upgrade_sender,
+            &stun_server,
+            role,
+            &protector,
+            upgrade_cancel,
+            Some(upgrade_knob),
+            mtu_cb,
+        )
+        .await;
+        drop(router_handle);
+    });
+
+    if let Some(cb) = config.mtu_callback.clone() {
+        let conn = conn.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            if let Some(mds) = conn.max_datagram_size() {
+                info!("e2e max datagram size (post-PMTUD): {}", mds);
+                cb(mds as u16);
+            }
+        });
+    }
+
+    Ok(transport)
+}
+
+// ---------- Direct upgrade ----------
+
+pub(crate) enum DirectRole {
+    Initiator {
+        routing_key: [u8; ROUTING_KEY_LEN],
+        secret: [u8; SECRET_LEN],
+    },
+    Responder {
+        identity: Arc<Identity>,
+    },
+}
+
 /// Background task: repeatedly try to establish a direct UDP connection.
 /// On success, send the new transport via `upgrade_sender`.
-///
-/// `initiator` controls the protocol order:
-/// - `true` (client): STUN first, send endpoint, wait for peer. Retry with delay.
-/// - `false` (server): Wait for peer endpoint first, then STUN and respond. No delay between retries.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_direct_upgrade(
     mut signal: SignalChannel,
     upgrade_sender: UpgradeSender,
     stun_server: &str,
-    initiator: bool,
+    role: DirectRole,
     protector: &SocketProtector,
     cancel: CancellationToken,
     keepalive_knob: Option<Arc<AtomicU64>>,
@@ -252,6 +394,7 @@ pub(crate) async fn try_direct_upgrade(
     const MAX_DORMANT_ATTEMPTS: u32 = 3;
     let mut dormant_attempts: u32 = 0;
     let mut was_active = false;
+    let initiator = matches!(role, DirectRole::Initiator { .. });
 
     loop {
         if cancel.is_cancelled() {
@@ -263,47 +406,44 @@ pub(crate) async fn try_direct_upgrade(
             return;
         }
 
-        // Check keepalive knob for dormant retry limiting (initiator only).
-        if initiator {
-            if let Some(ref knob) = keepalive_knob {
-                let knob_val = knob.load(std::sync::atomic::Ordering::Relaxed);
-                let active = knob_val > 0;
-
-                // Knob transitioned 0→N: reset attempt counter
-                if active && !was_active {
-                    dormant_attempts = 0;
-                }
-                was_active = active;
-
-                // Dormant and attempts exhausted: park until knob changes
-                if !active && dormant_attempts >= MAX_DORMANT_ATTEMPTS {
-                    info!("Direct upgrade: dormant attempts exhausted, waiting for screen-on");
-                    loop {
-                        tokio::select! {
-                            _ = cancel.cancelled() => {
-                                info!("Direct upgrade cancelled while parked");
-                                return;
-                            }
-                            _ = tokio::time::sleep(std::time::Duration::from_secs(5)) => {}
-                        }
-                        if upgrade_sender.is_closed() {
-                            info!("Upgrade channel closed while parked");
-                            return;
-                        }
-                        if knob.load(std::sync::atomic::Ordering::Relaxed) > 0 {
-                            dormant_attempts = 0;
-                            was_active = true;
-                            break;
-                        }
+        if initiator
+            && let Some(ref knob) = keepalive_knob
+        {
+            let knob_val = knob.load(std::sync::atomic::Ordering::Relaxed);
+            let active = knob_val > 0;
+            if active && !was_active {
+                dormant_attempts = 0;
+            }
+            was_active = active;
+            if !active && dormant_attempts >= MAX_DORMANT_ATTEMPTS {
+                info!("Direct upgrade: dormant attempts exhausted, waiting for screen-on");
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => { info!("Direct upgrade cancelled while parked"); return; }
+                        _ = tokio::time::sleep(Duration::from_secs(5)) => {}
+                    }
+                    if upgrade_sender.is_closed() {
+                        info!("Upgrade channel closed while parked");
+                        return;
+                    }
+                    if knob.load(std::sync::atomic::Ordering::Relaxed) > 0 {
+                        dormant_attempts = 0;
+                        was_active = true;
+                        break;
                     }
                 }
             }
         }
 
-        let result = if initiator {
-            try_direct_as_initiator(&mut signal, stun_server, protector).await
-        } else {
-            try_direct_as_responder(&mut signal, stun_server, protector).await
+        let result = match &role {
+            DirectRole::Initiator {
+                routing_key,
+                secret,
+            } => try_direct_as_initiator(&mut signal, stun_server, protector, *routing_key, *secret)
+                .await,
+            DirectRole::Responder { identity } => {
+                try_direct_as_responder(&mut signal, stun_server, protector, identity).await
+            }
         };
         match result {
             Ok((transport, conn)) => {
@@ -312,11 +452,9 @@ pub(crate) async fn try_direct_upgrade(
                     warn!("Failed to send upgrade — tunnel already closed");
                     return;
                 }
-                // Read MDS after PMTUD converges (~1.5s) instead of
-                // immediately after handshake when it's still at initial_mtu.
                 if let Some(cb) = mtu_callback.clone() {
                     tokio::spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(1500)).await;
+                        tokio::time::sleep(Duration::from_millis(1500)).await;
                         if let Some(mds) = conn.max_datagram_size() {
                             info!("P2P max datagram size (post-PMTUD): {}", mds);
                             cb(mds as u16);
@@ -326,130 +464,124 @@ pub(crate) async fn try_direct_upgrade(
                 return;
             }
             Err(e) => {
-                warn!("Direct connection attempt failed: {}.", e);
+                warn!("Direct connection attempt failed: {}", e);
                 if initiator {
-                    // Track dormant attempts
-                    if let Some(ref knob) = keepalive_knob {
-                        if knob.load(std::sync::atomic::Ordering::Relaxed) == 0 {
-                            dormant_attempts += 1;
-                        }
+                    if let Some(ref knob) = keepalive_knob
+                        && knob.load(std::sync::atomic::Ordering::Relaxed) == 0
+                    {
+                        dormant_attempts += 1;
                     }
                     warn!("Retrying in 15s...");
                     tokio::select! {
-                        _ = cancel.cancelled() => {
-                            info!("Direct upgrade cancelled during retry wait");
-                            return;
-                        }
-                        _ = tokio::time::sleep(std::time::Duration::from_secs(15)) => {}
+                        _ = cancel.cancelled() => { info!("Direct upgrade cancelled during retry wait"); return; }
+                        _ = tokio::time::sleep(Duration::from_secs(15)) => {}
                     }
                 }
-                // Responder loops back immediately to wait for the next signal.
             }
         }
     }
 }
 
-/// Client-initiated (QUIC client): STUN first, send our endpoint, wait for peer's
-/// endpoint and cert fingerprint, then establish QUIC connection.
+/// Initiator (B): STUN, exchange endpoint, punch, build direct QUIC client
+/// (cert-pinned to `routing_key`, sends `secret` on auth stream).
 async fn try_direct_as_initiator(
     signal: &mut SignalChannel,
     stun_server: &str,
     protector: &SocketProtector,
+    routing_key: [u8; ROUTING_KEY_LEN],
+    secret: [u8; SECRET_LEN],
 ) -> Result<(IpTransport, Connection), String> {
     let (socket, external_addr) = pierce_keep_socket(stun_server, protector).await?;
-
-    let (peer_addr, fingerprint) = {
+    let peer_addr = {
         let mut neg = SignalNegChannel::new(signal);
         neg.send_endpoint(external_addr)
             .await
             .map_err(|_| "failed to send endpoint via signal".to_string())?;
-
-        let peer_addr = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            neg.recv_endpoint(),
-        )
-        .await
-        .map_err(|_| "timed out waiting for peer endpoint".to_string())?
-        .map_err(|e| format!("failed to receive peer endpoint: {:?}", e))?;
-
-        let fingerprint = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            neg.recv_fingerprint(),
-        )
-        .await
-        .map_err(|_| "timed out waiting for peer fingerprint".to_string())?
-        .map_err(|e| format!("failed to receive peer fingerprint: {:?}", e))?;
-
-        (peer_addr, fingerprint)
+        tokio::time::timeout(Duration::from_secs(10), neg.recv_endpoint())
+            .await
+            .map_err(|_| "timed out waiting for peer endpoint".to_string())?
+            .map_err(|e| format!("failed to receive peer endpoint: {:?}", e))?
     };
 
     let socket = punch_and_verify(socket, peer_addr).await?;
-    let transport = establish_quic_client(socket, peer_addr, &fingerprint).await?;
-    let conn = transport.connection();
-    Ok((Box::new(transport), conn))
+    let std_sock = socket.into_std().map_err(|e| format!("into_std: {}", e))?;
+    let endpoint = client_endpoint(std_sock, routing_key)?;
+    let session = client_connect(&endpoint, peer_addr, &secret).await?;
+    let conn = session.conn.clone();
+    let transport: IpTransport = Box::new(QuicPeerTransport::new(conn.clone()));
+    Ok((transport, conn))
 }
 
-/// Server-side (QUIC server): wait for client's endpoint first, then STUN, respond
-/// with our endpoint and cert fingerprint, then establish QUIC connection.
+/// Responder (A): wait for peer endpoint, STUN, send own endpoint, punch,
+/// build direct QUIC server using identity, verify peer's secret.
 async fn try_direct_as_responder(
     signal: &mut SignalChannel,
     stun_server: &str,
     protector: &SocketProtector,
+    identity: &Identity,
 ) -> Result<(IpTransport, Connection), String> {
-    let (cert, key, fingerprint) = generate_self_signed_cert();
-
     let (peer_addr, socket) = {
         let mut neg = SignalNegChannel::new(signal);
-
-        // Block until the client sends its endpoint — this is the trigger.
         let peer_addr = neg
             .recv_endpoint()
             .await
             .map_err(|e| format!("failed to receive peer endpoint: {:?}", e))?;
-
         let (socket, external_addr) = pierce_keep_socket(stun_server, protector).await?;
-
         neg.send_endpoint(external_addr)
             .await
             .map_err(|_| "failed to send endpoint via signal".to_string())?;
-
-        neg.send_fingerprint(&fingerprint)
-            .await
-            .map_err(|_| "failed to send fingerprint via signal".to_string())?;
-
         (peer_addr, socket)
     };
 
     let socket = punch_and_verify(socket, peer_addr).await?;
-    let transport = establish_quic_server(socket, cert, key).await?;
-    let conn = transport.connection();
-    Ok((Box::new(transport), conn))
+    let std_sock = socket.into_std().map_err(|e| format!("into_std: {}", e))?;
+    let endpoint = server_endpoint(std_sock, identity)?;
+    let Some(session_result) = accept_one(&endpoint, &identity.secret).await else {
+        return Err("direct endpoint closed before accept".into());
+    };
+    let session = session_result?;
+    let conn = session.conn.clone();
+    let transport: IpTransport = Box::new(QuicPeerTransport::new(conn));
+    let conn = session.conn;
+    Ok((transport, conn))
 }
 
-/// Marker for bidirectional verification packets.
+// ---------- Helpers ----------
+
+fn resolve_relay(host: &str, port: u16) -> Result<SocketAddr, String> {
+    format!("{}:{}", host, port)
+        .to_socket_addrs()
+        .map_err(|e| format!("resolve relay {}:{} failed: {}", host, port, e))?
+        .find(|a| a.is_ipv4())
+        .ok_or_else(|| format!("no IPv4 for relay {}:{}", host, port))
+}
+
+/// Bind an ephemeral UDP socket on 0.0.0.0, apply the FD protector, and
+/// return it as a `std::net::UdpSocket` ready for handoff to quinn.
+fn bind_local_udp(protector: &SocketProtector) -> Result<std::net::UdpSocket, String> {
+    let std = std::net::UdpSocket::bind(("0.0.0.0", 0))
+        .map_err(|e| format!("bind UDP: {}", e))?;
+    std.set_nonblocking(true)
+        .map_err(|e| format!("set_nonblocking: {}", e))?;
+    apply_protector_to_std(protector, &std);
+    Ok(std)
+}
+
 const VERIFY_MARKER: &[u8; 7] = b"SPORA_V";
 
 /// Punch through NAT and verify *bidirectional* connectivity.
 ///
-/// Phase 1 — punch exchange: send punch packets repeatedly while waiting for the
-/// peer's punch. Repeated sends handle the timing window where one peer's NAT
-/// mapping hasn't been created yet when the other's punch arrives.
+/// Phase 1 — punch exchange: send punch packets repeatedly while waiting for
+/// the peer's punch.
 ///
-/// Phase 2 — bidirectional verify: both sides send VERIFY packets. Receiving the
-/// peer's VERIFY proves they also completed phase 1 (i.e. they received our
-/// punch). Only if both phases succeed is the connection truly bidirectional.
-///
-/// Returns the raw UDP socket for QUIC wrapping.
-async fn punch_and_verify(
-    socket: UdpSocket,
-    peer_addr: SocketAddr,
-) -> Result<UdpSocket, String> {
+/// Phase 2 — bidirectional verify: both sides send VERIFY packets. Receiving
+/// the peer's VERIFY proves they also completed phase 1.
+async fn punch_and_verify(socket: UdpSocket, peer_addr: SocketAddr) -> Result<UdpSocket, String> {
     debug!("Direct connection: punching {}", peer_addr);
 
-    // Phase 1: Exchange punch packets.
-    let phase1 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let phase1 = tokio::time::timeout(Duration::from_secs(5), async {
         let mut buf = [0u8; 1500];
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
+        let mut interval = tokio::time::interval(Duration::from_millis(300));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -466,25 +598,17 @@ async fn punch_and_verify(
         }
     })
     .await;
-
     match phase1 {
         Ok(Ok(())) => {}
         Ok(Err(e)) => return Err(e),
-        Err(_) => return Err("timed out during punch exchange".to_string()),
+        Err(_) => return Err("timed out during punch exchange".into()),
     }
 
-    debug!(
-        "Punch received from {}, verifying bidirectional...",
-        peer_addr
-    );
+    debug!("Punch received from {}, verifying bidirectional...", peer_addr);
 
-    // Phase 2: Verify both directions. Send VERIFY repeatedly while waiting for
-    // the peer's VERIFY. If the peer never completed phase 1 (because our punch
-    // didn't reach them), they never enter phase 2 and we time out here — preventing
-    // a one-sided upgrade that would break the relay tunnel.
-    let phase2 = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+    let phase2 = tokio::time::timeout(Duration::from_secs(5), async {
         let mut buf = [0u8; 1500];
-        let mut interval = tokio::time::interval(std::time::Duration::from_millis(300));
+        let mut interval = tokio::time::interval(Duration::from_millis(300));
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -497,12 +621,10 @@ async fn punch_and_verify(
                                 && len == VERIFY_MARKER.len()
                                 && &buf[..len] == VERIFY_MARKER =>
                         {
-                            // Peer completed phase 1 too — both directions work.
-                            // Send one more VERIFY so the peer also sees ours.
                             let _ = socket.send_to(VERIFY_MARKER, peer_addr).await;
                             return Ok::<_, String>(());
                         }
-                        Ok(_) => continue, // stale punch or unrelated packet
+                        Ok(_) => continue,
                         Err(e) => return Err(format!("recv error: {}", e)),
                     }
                 }
@@ -516,11 +638,8 @@ async fn punch_and_verify(
             debug!("Bidirectional direct connection confirmed with {}", peer_addr);
         }
         Ok(Err(e)) => return Err(e),
-        Err(_) => {
-            return Err("direct connection is not bidirectional — not upgrading".to_string())
-        }
+        Err(_) => return Err("direct connection is not bidirectional — not upgrading".into()),
     }
-
     Ok(socket)
 }
 
@@ -570,2124 +689,4 @@ pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), Strin
         .local_addr()
         .map_err(|e| format!("failed to get local addr: {}", e))?;
     Ok((local_addr, external_addr))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::transport::keepalive::{KeepAliveConfig, KeepAliveMode, KeepAliveTransport};
-    use crate::transport::relay::relay_connection;
-    use crate::transport::upgradable::upgradable_transport;
-    use futures_util::{SinkExt, StreamExt};
-    use relay_client::build_endpoint_with_crypto;
-    use std::collections::HashMap;
-    use std::pin::Pin;
-    use tokio::sync::Mutex as TokioMutex;
-
-    const ALPN: &[u8] = b"spora-relay/1";
-
-    /// Generate ephemeral certs for testing and return (server_config, client_crypto).
-    fn test_certs() -> (quinn::ServerConfig, rustls::ClientConfig) {
-        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let mut ca_params = rcgen::CertificateParams::default();
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_params.distinguished_name = rcgen::DistinguishedName::new();
-        ca_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "Test CA");
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-        let relay_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let mut relay_params = rcgen::CertificateParams::default();
-        relay_params.distinguished_name = rcgen::DistinguishedName::new();
-        relay_params
-            .subject_alt_names
-            .push(rcgen::SanType::DnsName("relay.spora.dev".try_into().unwrap()));
-        let relay_cert = relay_params
-            .signed_by(&relay_key, &ca_cert, &ca_key)
-            .unwrap();
-
-        let cert = rustls::pki_types::CertificateDer::from(relay_cert.der().to_vec());
-        let key = rustls::pki_types::PrivateKeyDer::try_from(relay_key.serialize_der()).unwrap();
-
-        let mut server_crypto = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert], key)
-            .unwrap();
-        server_crypto.alpn_protocols = vec![ALPN.to_vec()];
-
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
-        ));
-
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store
-            .add(rustls::pki_types::CertificateDer::from(
-                ca_cert.der().to_vec(),
-            ))
-            .unwrap();
-
-        let mut client_crypto = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        client_crypto.alpn_protocols = vec![ALPN.to_vec()];
-
-        (server_config, client_crypto)
-    }
-
-    struct FakeSubscriber {
-        connection: Connection,
-        send_stream: quinn::SendStream,
-    }
-
-    /// Minimal fake relay for integration tests (QUIC-based).
-    async fn fake_relay(endpoint: quinn::Endpoint) {
-        let subscribers: Arc<TokioMutex<HashMap<Vec<u8>, FakeSubscriber>>> =
-            Arc::new(TokioMutex::new(HashMap::new()));
-
-        while let Some(incoming) = endpoint.accept().await {
-            let subscribers = subscribers.clone();
-            let endpoint_str = endpoint.local_addr().unwrap().to_string();
-            tokio::spawn(async move {
-                let conn = match incoming.await {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
-                let (mut send, mut recv) = match conn.accept_bi().await {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                let handshake = match recv.read_to_end(65535).await {
-                    Ok(h) => h,
-                    Err(_) => return,
-                };
-                if handshake.is_empty() {
-                    return;
-                }
-
-                let msg_type = handshake[0];
-                let key = handshake[1..].to_vec();
-
-                match msg_type {
-                    0x01 => {
-                        // SUB
-                        let mut resp = vec![0x01];
-                        resp.extend_from_slice(endpoint_str.as_bytes());
-                        let _ = send.write_all(&resp).await;
-                        // Don't finish - keep open for MATCH notification
-                        subscribers.lock().await.insert(
-                            key,
-                            FakeSubscriber {
-                                connection: conn,
-                                send_stream: send,
-                            },
-                        );
-                    }
-                    0x02 => {
-                        // PUB
-                        let mut subs = subscribers.lock().await;
-                        if let Some(mut sub) = subs.remove(&key) {
-                            let _ = send.write_all(&[0x02]).await;
-                            let _ = send.finish();
-                            // Notify subscriber
-                            let _ = sub.send_stream.write_all(&[0x03]).await;
-                            let _ = sub.send_stream.finish();
-                            // Forward datagrams bidirectionally
-                            let a = conn;
-                            let b = sub.connection;
-                            let a2 = a.clone();
-                            let b2 = b.clone();
-                            tokio::spawn(async move {
-                                loop {
-                                    match a.read_datagram().await {
-                                        Ok(d) => {
-                                            if b.send_datagram(d).is_err() {
-                                                break;
-                                            }
-                                        }
-                                        Err(_) => break,
-                                    }
-                                }
-                            });
-                            tokio::spawn(async move {
-                                loop {
-                                    match b2.read_datagram().await {
-                                        Ok(d) => {
-                                            if a2.send_datagram(d).is_err() {
-                                                break;
-                                            }
-                                        }
-                                        Err(_) => break,
-                                    }
-                                }
-                            });
-                        } else {
-                            let mut resp = vec![0xFF];
-                            resp.extend_from_slice(b"unknown subscriber");
-                            let _ = send.write_all(&resp).await;
-                            let _ = send.finish();
-                        }
-                    }
-                    _ => {}
-                }
-            });
-        }
-    }
-
-    /// Helper: start a fake QUIC relay and return (port, client_crypto).
-    fn start_fake_relay() -> (u16, rustls::ClientConfig) {
-        let (server_config, client_crypto) = test_certs();
-        let endpoint =
-            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let port = endpoint.local_addr().unwrap().port();
-        tokio::spawn(fake_relay(endpoint));
-        (port, client_crypto)
-    }
-
-    /// Helper: subscribe + publish through a fake relay, return matched connection pair.
-    async fn matched_relay_pair(
-        port: u16,
-        client_crypto: &rustls::ClientConfig,
-    ) -> (Connection, Connection) {
-        let sub_ep = build_endpoint_with_crypto(client_crypto.clone(), &None).unwrap();
-        let svc = RelayService::new("127.0.0.1", port);
-        let mut sub_conn = svc.sub_with_endpoint("testkey", &sub_ep).await.unwrap();
-
-        let pub_ep = build_endpoint_with_crypto(client_crypto.clone(), &None).unwrap();
-        let pub_conn =
-            RelayService::publish_with_endpoint("127.0.0.1", port, "testkey", &pub_ep)
-                .await
-                .unwrap();
-
-        sub_conn.wait_for_match().await.unwrap();
-        (sub_conn.connection, pub_conn)
-    }
-
-    const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-
-    // --- Relay transport through fake relay ---
-
-    #[tokio::test]
-    async fn relay_pair_ip_data_flows_client_to_server() {
-        let (port, crypto) = start_fake_relay();
-        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
-
-        let (mut server_transport, _server_signal, _sh) = relay_connection(server_conn, None);
-        let (mut client_transport, _client_signal, _ch) = relay_connection(client_conn, None);
-
-        let ip_pkt = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
-        Pin::new(&mut client_transport)
-            .send(ip_pkt.clone())
-            .await
-            .unwrap();
-
-        let received = tokio::time::timeout(TIMEOUT, server_transport.next())
-            .await
-            .expect("server should receive IP packet from client")
-            .unwrap()
-            .unwrap();
-        assert_eq!(received, ip_pkt);
-    }
-
-    #[tokio::test]
-    async fn relay_pair_ip_data_flows_server_to_client() {
-        let (port, crypto) = start_fake_relay();
-        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
-
-        let (mut server_transport, _server_signal, _sh) = relay_connection(server_conn, None);
-        let (mut client_transport, _client_signal, _ch) = relay_connection(client_conn, None);
-
-        let ip_pkt = vec![0x45, 0x00, 0x00, 0x14, 9, 8, 7, 6];
-        Pin::new(&mut server_transport)
-            .send(ip_pkt.clone())
-            .await
-            .unwrap();
-
-        let received = tokio::time::timeout(TIMEOUT, client_transport.next())
-            .await
-            .expect("client should receive IP packet from server")
-            .unwrap()
-            .unwrap();
-        assert_eq!(received, ip_pkt);
-    }
-
-    #[tokio::test]
-    async fn relay_pair_signal_flows_bidirectional() {
-        let (port, crypto) = start_fake_relay();
-        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
-
-        let (_server_transport, mut server_signal, _sh) = relay_connection(server_conn, None);
-        let (_client_transport, mut client_signal, _ch) = relay_connection(client_conn, None);
-
-        // Client → Server signal
-        client_signal.send_signal(b"10.0.0.1:5000").await.unwrap();
-        let sig = tokio::time::timeout(TIMEOUT, server_signal.recv_signal())
-            .await
-            .expect("server should receive signal from client")
-            .unwrap();
-        assert_eq!(sig, b"10.0.0.1:5000");
-
-        // Server → Client signal
-        server_signal.send_signal(b"10.0.0.2:6000").await.unwrap();
-        let sig = tokio::time::timeout(TIMEOUT, client_signal.recv_signal())
-            .await
-            .expect("client should receive signal from server")
-            .unwrap();
-        assert_eq!(sig, b"10.0.0.2:6000");
-    }
-
-    #[tokio::test]
-    async fn relay_pair_ip_and_signal_dont_cross() {
-        let (port, crypto) = start_fake_relay();
-        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
-
-        let (mut server_transport, mut server_signal, _sh) = relay_connection(server_conn, None);
-        let (mut client_transport, client_signal, _ch) = relay_connection(client_conn, None);
-
-        let ip_pkt = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
-        Pin::new(&mut client_transport)
-            .send(ip_pkt.clone())
-            .await
-            .unwrap();
-        client_signal.send_signal(b"endpoint-info").await.unwrap();
-
-        let received = tokio::time::timeout(TIMEOUT, server_transport.next())
-            .await
-            .expect("timeout")
-            .unwrap()
-            .unwrap();
-        assert_eq!(received, ip_pkt, "IP channel got wrong data");
-
-        let sig = tokio::time::timeout(TIMEOUT, server_signal.recv_signal())
-            .await
-            .expect("timeout")
-            .unwrap();
-        assert_eq!(sig, b"endpoint-info", "signal channel got wrong data");
-    }
-
-    // --- Full transport stack through fake relay ---
-
-    #[tokio::test]
-    async fn full_stack_relay_data_flows_bidirectional() {
-        let (port, crypto) = start_fake_relay();
-        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
-
-        let (server_relay, _server_sig, _sh) = relay_connection(server_conn, None);
-        let (server_upgradable, _server_upgrade_tx, _sr) =
-            upgradable_transport(Box::new(server_relay));
-        let ka_cfg = KeepAliveConfig {
-            mode: KeepAliveMode::Periodic {
-                interval: std::time::Duration::from_secs(60),
-                recv_timeout: Some(std::time::Duration::from_secs(30)),
-            },
-            ..Default::default()
-        };
-        let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
-
-        let (client_relay, _client_sig, _crh) = relay_connection(client_conn, None);
-        let (client_upgradable, _client_upgrade_tx, _cr) =
-            upgradable_transport(Box::new(client_relay));
-        let mut client_stack = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
-
-        let pkt1 = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
-        Pin::new(&mut client_stack).send(pkt1.clone()).await.unwrap();
-        let received = tokio::time::timeout(TIMEOUT, server_stack.next())
-            .await.expect("server should receive").unwrap().unwrap();
-        assert_eq!(received, pkt1);
-
-        let pkt2 = vec![0x45, 0x00, 0x00, 0x14, 5, 6, 7, 8];
-        Pin::new(&mut server_stack).send(pkt2.clone()).await.unwrap();
-        let received = tokio::time::timeout(TIMEOUT, client_stack.next())
-            .await.expect("client should receive").unwrap().unwrap();
-        assert_eq!(received, pkt2);
-    }
-
-    #[tokio::test]
-    async fn full_stack_relay_upgrade_switches_transport() {
-        let (port, crypto) = start_fake_relay();
-        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
-
-        let (server_relay, _server_sig, _sh) = relay_connection(server_conn, None);
-        let (server_upgradable, _server_upgrade_tx, _sr) =
-            upgradable_transport(Box::new(server_relay));
-        let ka_cfg = KeepAliveConfig {
-            mode: KeepAliveMode::Periodic {
-                interval: std::time::Duration::from_secs(60),
-                recv_timeout: Some(std::time::Duration::from_secs(30)),
-            },
-            ..Default::default()
-        };
-        let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
-
-        let (client_relay, _client_sig, _ch) = relay_connection(client_conn, None);
-        let (client_upgradable, client_upgrade_tx, _cr) =
-            upgradable_transport(Box::new(client_relay));
-        let mut client_stack = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
-
-        let pkt1 = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
-        Pin::new(&mut client_stack).send(pkt1.clone()).await.unwrap();
-        let received = tokio::time::timeout(TIMEOUT, server_stack.next())
-            .await.expect("relay mode should work").unwrap().unwrap();
-        assert_eq!(received, pkt1);
-
-        use crate::transport::mock::mock_transport;
-        let (mock_direct, mut mock_handle) = mock_transport();
-        client_upgrade_tx.send(Box::new(mock_direct)).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        mock_handle.send(vec![0x45, 0, 0, 20, 9, 9, 9, 9]).unwrap();
-        let received = tokio::time::timeout(TIMEOUT, client_stack.next())
-            .await.expect("upgraded transport").unwrap().unwrap();
-        assert_eq!(received, vec![0x45, 0, 0, 20, 9, 9, 9, 9]);
-
-        Pin::new(&mut client_stack).send(vec![0x45, 0, 0, 20, 7, 7, 7, 7]).await.unwrap();
-        let received = tokio::time::timeout(TIMEOUT, mock_handle.recv())
-            .await.expect("outbound should go through upgraded").unwrap();
-        assert_eq!(received, vec![0x45, 0, 0, 20, 7, 7, 7, 7]);
-    }
-
-    #[tokio::test]
-    async fn one_sided_upgrade_breaks_tunnel() {
-        use crate::transport::mock::mock_transport;
-
-        let (port, crypto) = start_fake_relay();
-        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
-
-        let (server_relay, _server_sig, _sh) = relay_connection(server_conn, None);
-        let (server_upgradable, server_upgrade_tx, _sr) =
-            upgradable_transport(Box::new(server_relay));
-        let ka_cfg = KeepAliveConfig {
-            mode: KeepAliveMode::Periodic {
-                interval: std::time::Duration::from_secs(300),
-                recv_timeout: Some(std::time::Duration::from_secs(30)),
-            },
-            ..Default::default()
-        };
-        let mut server_transport = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
-
-        let (client_relay, _client_sig, _ch) = relay_connection(client_conn, None);
-        let (client_upgradable, _client_upgrade_tx, _cr) =
-            upgradable_transport(Box::new(client_relay));
-        let mut client_transport = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
-
-        let pkt = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
-        Pin::new(&mut client_transport).send(pkt.clone()).await.unwrap();
-        let received = tokio::time::timeout(TIMEOUT, server_transport.next())
-            .await.expect("relay should work").unwrap().unwrap();
-        assert_eq!(received, pkt);
-
-        let (mock_direct, _mock_handle) = mock_transport();
-        server_upgrade_tx.send(Box::new(mock_direct)).unwrap();
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let pkt2 = vec![0x45, 0x00, 0x00, 0x14, 5, 6, 7, 8];
-        Pin::new(&mut client_transport).send(pkt2.clone()).await.unwrap();
-        let result = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            server_transport.next(),
-        ).await;
-        assert!(result.is_err(), "one-sided upgrade should break tunnel");
-    }
-
-    // --- Tests that replicate the actual share/connect flow ---
-
-    #[tokio::test]
-    async fn server_starts_before_client_connects() {
-        let (port, crypto) = start_fake_relay();
-
-        // Server subscribes and waits for match
-        let sub_ep = build_endpoint_with_crypto(crypto.clone(), &None).unwrap();
-        let svc = RelayService::new("127.0.0.1", port);
-        let mut sub_conn = svc.sub_with_endpoint("testkey", &sub_ep).await.unwrap();
-
-        // Publish in background (will trigger match)
-        let pub_ep = build_endpoint_with_crypto(crypto.clone(), &None).unwrap();
-        let pub_handle = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            RelayService::publish_with_endpoint("127.0.0.1", port, "testkey", &pub_ep)
-                .await
-                .unwrap()
-        });
-
-        sub_conn.wait_for_match().await.unwrap();
-        let server_conn = sub_conn.connection;
-
-        let (server_relay, _server_sig, _sh) = relay_connection(server_conn, None);
-        let (server_upgradable, _server_up_tx, _sr) =
-            upgradable_transport(Box::new(server_relay));
-        let ka_cfg = KeepAliveConfig {
-            mode: KeepAliveMode::Periodic {
-                interval: std::time::Duration::from_secs(60),
-                recv_timeout: Some(std::time::Duration::from_secs(30)),
-            },
-            ..Default::default()
-        };
-        let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
-
-        let client_conn = pub_handle.await.unwrap();
-        let (client_relay, _client_sig, _ch) = relay_connection(client_conn, None);
-        let (client_upgradable, _client_up_tx, _cr) =
-            upgradable_transport(Box::new(client_relay));
-        let mut client_stack = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
-
-        let pkt = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
-        Pin::new(&mut client_stack).send(pkt.clone()).await.unwrap();
-        let received = tokio::time::timeout(TIMEOUT, server_stack.next())
-            .await.expect("server should receive").unwrap().unwrap();
-        assert_eq!(received, pkt);
-    }
-
-    #[tokio::test]
-    async fn relay_works_while_direct_upgrade_fails() {
-        let (port, crypto) = start_fake_relay();
-        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
-
-        let (server_relay, server_signal, _sh) = relay_connection(server_conn, None);
-        let (server_upgradable, server_upgrade_tx, _sr) =
-            upgradable_transport(Box::new(server_relay));
-        let ka_cfg = KeepAliveConfig {
-            mode: KeepAliveMode::Periodic {
-                interval: std::time::Duration::from_secs(60),
-                recv_timeout: Some(std::time::Duration::from_secs(30)),
-            },
-            ..Default::default()
-        };
-        let mut server_stack = KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone());
-
-        let _server_upgrade = tokio::spawn(async move {
-            try_direct_upgrade(server_signal, server_upgrade_tx, "192.0.2.1:19302", false, &None, CancellationToken::new(), None, None).await;
-        });
-
-        let (client_relay, client_signal, _ch) = relay_connection(client_conn, None);
-        let (client_upgradable, client_upgrade_tx, _cr) =
-            upgradable_transport(Box::new(client_relay));
-        let mut client_stack = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
-
-        let _client_upgrade = tokio::spawn(async move {
-            try_direct_upgrade(client_signal, client_upgrade_tx, "192.0.2.1:19302", true, &None, CancellationToken::new(), None, None).await;
-        });
-
-        let pkt = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
-        Pin::new(&mut client_stack).send(pkt.clone()).await.unwrap();
-        let received = tokio::time::timeout(TIMEOUT, server_stack.next())
-            .await.expect("relay should work").unwrap().unwrap();
-        assert_eq!(received, pkt);
-
-        let pkt2 = vec![0x45, 0x00, 0x00, 0x14, 5, 6, 7, 8];
-        Pin::new(&mut server_stack).send(pkt2.clone()).await.unwrap();
-        let received = tokio::time::timeout(TIMEOUT, client_stack.next())
-            .await.expect("server→client should work").unwrap().unwrap();
-        assert_eq!(received, pkt2);
-    }
-
-    // --- Client reconnect tests ---
-
-    #[tokio::test]
-    async fn client_reconnects_through_relay_after_disconnect() {
-        use crate::transport::{DialFuture, ReconnectTransport};
-
-        let (port, crypto) = start_fake_relay();
-        let ka_cfg = KeepAliveConfig {
-            mode: KeepAliveMode::Periodic {
-                interval: std::time::Duration::from_secs(300),
-                recv_timeout: Some(std::time::Duration::from_secs(30)),
-            },
-            ..Default::default()
-        };
-
-        // --- Round 1 ---
-        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
-
-        let (server_relay, _, _sh) = relay_connection(server_conn, None);
-        let (server_up, _, _sr) = upgradable_transport(Box::new(server_relay));
-        let mut server1 = KeepAliveTransport::new(Box::new(server_up), ka_cfg.clone());
-
-        let (client_relay, _, client_demux) = relay_connection(client_conn, None);
-        let (client_up, _, _cr) = upgradable_transport(Box::new(client_relay));
-        let client_inner: IpTransport = Box::new(KeepAliveTransport::new(Box::new(client_up), ka_cfg.clone()));
-
-        let crypto_clone = crypto.clone();
-        let dialer: Box<dyn FnMut() -> DialFuture + Send> = Box::new(move || {
-            let crypto = crypto_clone.clone();
-            Box::pin(async move {
-                let ep = build_endpoint_with_crypto(crypto, &None)?;
-                let conn = RelayService::publish_with_endpoint("127.0.0.1", port, "testkey", &ep).await?;
-                let (relay, _, _) = relay_connection(conn, None);
-                let (up, _, _) = upgradable_transport(Box::new(relay));
-                let ka = KeepAliveConfig {
-                    mode: KeepAliveMode::Periodic {
-                        interval: std::time::Duration::from_secs(300),
-                        recv_timeout: Some(std::time::Duration::from_secs(30)),
-                    },
-                    ..Default::default()
-                };
-                Ok(Box::new(KeepAliveTransport::new(Box::new(up), ka)) as IpTransport)
-            })
-        });
-
-        let mut client = ReconnectTransport::new(client_inner, dialer);
-
-        let pkt1 = vec![0x45, 0, 0, 20, 1, 2, 3, 4];
-        Pin::new(&mut client).send(pkt1.clone()).await.unwrap();
-        let received = tokio::time::timeout(TIMEOUT, server1.next())
-            .await.expect("round 1").unwrap().unwrap();
-        assert_eq!(received, pkt1);
-
-        // --- Break + Round 2 ---
-        drop(server1);
-        // Server re-subscribes
-        let sub_ep = build_endpoint_with_crypto(crypto.clone(), &None).unwrap();
-        let svc = RelayService::new("127.0.0.1", port);
-        let mut sub_conn = svc.sub_with_endpoint("testkey", &sub_ep).await.unwrap();
-
-        // Break client's connection
-        client_demux.abort();
-
-        // Drive reconnect (client re-publishes, which triggers match)
-        for _ in 0..5 {
-            tokio::time::timeout(std::time::Duration::from_millis(200), client.next()).await.ok();
-        }
-
-        // Wait for match on server side
-        tokio::time::timeout(TIMEOUT, sub_conn.wait_for_match()).await.ok();
-        let (server_relay2, _, _sh2) = relay_connection(sub_conn.connection, None);
-        let (server_up2, _, _sr2) = upgradable_transport(Box::new(server_relay2));
-        let mut server2 = KeepAliveTransport::new(Box::new(server_up2), ka_cfg);
-
-        let pkt2 = vec![0x45, 0, 0, 20, 5, 6, 7, 8];
-        Pin::new(&mut client).send(pkt2.clone()).await.unwrap();
-        let received = tokio::time::timeout(TIMEOUT, server2.next())
-            .await.expect("round 2").unwrap().unwrap();
-        assert_eq!(received, pkt2);
-    }
-
-    // --- Netstack integration tests ---
-
-    fn build_icmp_echo_request(src: [u8; 4], dst: [u8; 4], id: u16, seq: u16) -> Vec<u8> {
-        let mut pkt = Vec::with_capacity(64);
-        etherparse::PacketBuilder::ipv4(src, dst, 64)
-            .icmpv4_echo_request(id, seq)
-            .write(&mut pkt, b"test")
-            .unwrap();
-        pkt
-    }
-
-    fn is_icmp_echo_reply(pkt: &[u8]) -> bool {
-        pkt.len() >= 24 && (pkt[0] >> 4) == 4 && pkt[9] == 1 && pkt[20] == 0
-    }
-
-    #[tokio::test]
-    async fn netstack_responds_to_icmp_via_mock_transport() {
-        use crate::transport::mock::mock_transport;
-
-        let (mock, mut handle) = mock_transport();
-        let transport: IpTransport = Box::new(mock);
-
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-        tokio::spawn(async move {
-            server::start_tunnel(transport, None, cancel_clone, false).await.unwrap();
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-
-        let icmp_request = build_icmp_echo_request([10, 0, 0, 2], [10, 0, 0, 1], 0x1234, 1);
-        handle.send(icmp_request).unwrap();
-
-        let reply = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                loop {
-                    match handle.recv().await {
-                        Some(pkt) if is_icmp_echo_reply(&pkt) => return pkt,
-                        Some(_) => continue,
-                        None => panic!("mock transport closed"),
-                    }
-                }
-            },
-        ).await.expect("should receive ICMP echo reply");
-
-        assert_eq!(reply[0] >> 4, 4);
-        assert_eq!(reply[9], 1);
-        assert_eq!(reply[20], 0);
-        cancel.cancel();
-    }
-
-    #[tokio::test]
-    async fn netstack_responds_to_icmp_through_relay() {
-        let (port, crypto) = start_fake_relay();
-        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
-
-        let (server_relay, server_signal, _server_demux) = relay_connection(server_conn, None);
-        let (server_upgradable, _server_upgrade_tx, _server_router) =
-            upgradable_transport(Box::new(server_relay));
-        let ka_cfg = KeepAliveConfig {
-            mode: KeepAliveMode::Periodic {
-                interval: std::time::Duration::from_secs(300),
-                recv_timeout: Some(std::time::Duration::from_secs(30)),
-            },
-            ..Default::default()
-        };
-        let server_transport: IpTransport =
-            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone()));
-
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-        tokio::spawn(async move {
-            server::start_tunnel(server_transport, None, cancel_clone, false).await.unwrap();
-        });
-        drop(server_signal);
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let (client_relay, _client_signal, _client_demux) = relay_connection(client_conn, None);
-        let (client_upgradable, _client_upgrade_tx, _client_router) =
-            upgradable_transport(Box::new(client_relay));
-        let mut client_transport = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
-
-        let icmp_request = build_icmp_echo_request([10, 0, 0, 2], [10, 0, 0, 1], 0x1234, 1);
-        Pin::new(&mut client_transport).send(icmp_request).await.unwrap();
-
-        let reply = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                loop {
-                    match client_transport.next().await {
-                        Some(Ok(pkt)) if is_icmp_echo_reply(&pkt) => return pkt,
-                        Some(Ok(_)) => continue,
-                        Some(Err(e)) => panic!("transport error: {}", e),
-                        None => panic!("transport closed"),
-                    }
-                }
-            },
-        ).await.expect("should receive ICMP echo reply through relay");
-
-        assert_eq!(reply[0] >> 4, 4);
-        assert_eq!(reply[9], 1);
-        assert_eq!(reply[20], 0);
-        cancel.cancel();
-    }
-
-    #[tokio::test]
-    async fn full_production_stack_icmp_with_failed_upgrades() {
-        let (port, crypto) = start_fake_relay();
-        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
-
-        let (server_relay, server_signal, _server_demux) = relay_connection(server_conn, None);
-        let (server_upgradable, server_upgrade_tx, _server_router) =
-            upgradable_transport(Box::new(server_relay));
-        let ka_cfg = KeepAliveConfig::default();
-        let server_transport: IpTransport =
-            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone()));
-
-        let _server_upgrade = tokio::spawn(async move {
-            try_direct_upgrade(server_signal, server_upgrade_tx, "192.0.2.1:19302", false, &None, CancellationToken::new(), None, None).await;
-        });
-
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-        tokio::spawn(async move {
-            server::start_tunnel(server_transport, None, cancel_clone, false).await.unwrap();
-        });
-
-        let (client_relay, client_signal, _client_demux) = relay_connection(client_conn, None);
-        let (client_upgradable, client_upgrade_tx, _client_router) =
-            upgradable_transport(Box::new(client_relay));
-        let mut client_transport = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
-
-        let _client_upgrade = tokio::spawn(async move {
-            try_direct_upgrade(client_signal, client_upgrade_tx, "192.0.2.1:19302", true, &None, CancellationToken::new(), None, None).await;
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        for seq in 0..5u16 {
-            let icmp = build_icmp_echo_request([10, 0, 0, 2], [10, 0, 0, 1], 0xABCD, seq);
-            Pin::new(&mut client_transport).send(icmp).await.unwrap();
-        }
-
-        let mut reply_count = 0;
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                loop {
-                    match client_transport.next().await {
-                        Some(Ok(pkt)) if is_icmp_echo_reply(&pkt) => {
-                            reply_count += 1;
-                            if reply_count >= 5 { return; }
-                        }
-                        Some(Ok(_)) => continue,
-                        Some(Err(e)) => panic!("transport error: {}", e),
-                        None => panic!("transport closed"),
-                    }
-                }
-            },
-        ).await;
-
-        assert!(result.is_ok(), "expected 5 ICMP echo replies, got {}", reply_count);
-        cancel.cancel();
-    }
-
-    #[tokio::test]
-    async fn netstack_processes_tcp_syn_through_relay() {
-        use tokio::net::TcpListener as TokioTcpListener;
-
-        let tcp_server = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-        let server_port = tcp_server.local_addr().unwrap().port();
-        tokio::spawn(async move { let _ = tcp_server.accept().await; });
-
-        let (port, crypto) = start_fake_relay();
-        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
-
-        let (server_relay, _server_signal, _server_demux) = relay_connection(server_conn, None);
-        let (server_upgradable, _server_upgrade_tx, _server_router) =
-            upgradable_transport(Box::new(server_relay));
-        let ka_cfg = KeepAliveConfig {
-            mode: KeepAliveMode::Periodic {
-                interval: std::time::Duration::from_secs(300),
-                recv_timeout: Some(std::time::Duration::from_secs(30)),
-            },
-            ..Default::default()
-        };
-        let server_transport: IpTransport =
-            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone()));
-
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-        tokio::spawn(async move {
-            server::start_tunnel(server_transport, None, cancel_clone, false).await.unwrap();
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let (client_relay, _client_signal, _client_demux) = relay_connection(client_conn, None);
-        let (client_upgradable, _client_upgrade_tx, _client_router) =
-            upgradable_transport(Box::new(client_relay));
-        let mut client_transport = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
-
-        let mut tcp_syn = Vec::new();
-        etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [127, 0, 0, 1], 64)
-            .tcp(12345, server_port, 1000, 65535)
-            .syn()
-            .write(&mut tcp_syn, &[])
-            .unwrap();
-
-        Pin::new(&mut client_transport).send(tcp_syn).await.unwrap();
-
-        let response = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            async {
-                loop {
-                    match client_transport.next().await {
-                        Some(Ok(pkt)) if pkt.len() >= 20 && (pkt[0] >> 4) == 4 && pkt[9] == 6 => return pkt,
-                        Some(Ok(_)) => continue,
-                        Some(Err(e)) => panic!("transport error: {}", e),
-                        None => panic!("transport closed"),
-                    }
-                }
-            },
-        ).await.expect("should receive TCP response from netstack");
-
-        assert_eq!(response[0] >> 4, 4);
-        assert_eq!(response[9], 6);
-        let ihl = (response[0] & 0x0F) as usize * 4;
-        let tcp_flags = response[ihl + 13];
-        assert!(tcp_flags & 0x12 == 0x12 || tcp_flags & 0x04 == 0x04);
-        cancel.cancel();
-    }
-
-    // --- Relay tunnel setup helper ---
-
-    struct TunnelPair {
-        client_transport: KeepAliveTransport,
-        server_cancel: CancellationToken,
-        _handles: Vec<JoinHandle<()>>,
-    }
-
-    async fn setup_relay_tunnel() -> TunnelPair {
-        let (port, crypto) = start_fake_relay();
-        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
-
-        let (server_relay, _server_signal, server_demux) = relay_connection(server_conn, None);
-        let (server_upgradable, _server_upgrade_tx, server_router) =
-            upgradable_transport(Box::new(server_relay));
-        let ka_cfg = KeepAliveConfig {
-            mode: KeepAliveMode::Periodic {
-                interval: std::time::Duration::from_secs(300),
-                recv_timeout: Some(std::time::Duration::from_secs(30)),
-            },
-            ..Default::default()
-        };
-        let server_transport: IpTransport =
-            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone()));
-
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-        let tunnel_handle = tokio::spawn(async move {
-            server::start_tunnel(server_transport, None, cancel_clone, false).await.unwrap();
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let (client_relay, _client_signal, client_demux) = relay_connection(client_conn, None);
-        let (client_upgradable, _client_upgrade_tx, client_router) =
-            upgradable_transport(Box::new(client_relay));
-        let client_transport = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
-
-        TunnelPair {
-            client_transport,
-            server_cancel: cancel,
-            _handles: vec![tunnel_handle, server_demux, server_router, client_demux, client_router],
-        }
-    }
-
-    // --- Raw TCP client for packet-level handshake + data ---
-
-    struct RawTcpClient {
-        src_ip: [u8; 4],
-        dst_ip: [u8; 4],
-        src_port: u16,
-        dst_port: u16,
-        seq: u32,
-        ack: u32,
-    }
-
-    impl RawTcpClient {
-        fn new(src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16) -> Self {
-            Self {
-                src_ip,
-                dst_ip,
-                src_port,
-                dst_port,
-                seq: 1000,
-                ack: 0,
-            }
-        }
-
-        fn build_syn(&mut self) -> Vec<u8> {
-            let mut pkt = Vec::new();
-            etherparse::PacketBuilder::ipv4(self.src_ip, self.dst_ip, 64)
-                .tcp(self.src_port, self.dst_port, self.seq, 65535)
-                .syn()
-                .write(&mut pkt, &[])
-                .unwrap();
-            self.seq += 1; // SYN consumes one sequence number
-            pkt
-        }
-
-        fn process_syn_ack(&mut self, pkt: &[u8]) {
-            let parsed = etherparse::SlicedPacket::from_ip(pkt).unwrap();
-            if let Some(etherparse::TransportSlice::Tcp(tcp)) = parsed.transport {
-                self.ack = tcp.sequence_number() + 1;
-            }
-        }
-
-        fn build_ack(&self) -> Vec<u8> {
-            let mut pkt = Vec::new();
-            etherparse::PacketBuilder::ipv4(self.src_ip, self.dst_ip, 64)
-                .tcp(self.src_port, self.dst_port, self.seq, 65535)
-                .ack(self.ack)
-                .write(&mut pkt, &[])
-                .unwrap();
-            pkt
-        }
-
-        fn build_data(&mut self, payload: &[u8]) -> Vec<u8> {
-            let mut pkt = Vec::new();
-            etherparse::PacketBuilder::ipv4(self.src_ip, self.dst_ip, 64)
-                .tcp(self.src_port, self.dst_port, self.seq, 65535)
-                .ack(self.ack)
-                .psh()
-                .write(&mut pkt, payload)
-                .unwrap();
-            self.seq += payload.len() as u32;
-            pkt
-        }
-
-        fn build_fin(&mut self) -> Vec<u8> {
-            let mut pkt = Vec::new();
-            etherparse::PacketBuilder::ipv4(self.src_ip, self.dst_ip, 64)
-                .tcp(self.src_port, self.dst_port, self.seq, 65535)
-                .ack(self.ack)
-                .fin()
-                .write(&mut pkt, &[])
-                .unwrap();
-            self.seq += 1; // FIN consumes one sequence number
-            pkt
-        }
-
-        /// Parse a TCP response, update ack number, return payload bytes (if any).
-        fn process_response(&mut self, pkt: &[u8]) -> Vec<u8> {
-            let parsed = etherparse::SlicedPacket::from_ip(pkt).unwrap();
-            if let Some(etherparse::TransportSlice::Tcp(tcp)) = parsed.transport {
-                let payload = tcp.payload().to_vec();
-                let seg_len = payload.len() as u32
-                    + if tcp.syn() { 1 } else { 0 }
-                    + if tcp.fin() { 1 } else { 0 };
-                if seg_len > 0 {
-                    self.ack = tcp.sequence_number() + seg_len;
-                }
-                payload
-            } else {
-                Vec::new()
-            }
-        }
-    }
-
-    // --- Packet filter helpers ---
-
-    async fn recv_tcp(transport: &mut KeepAliveTransport, timeout: std::time::Duration) -> Vec<u8> {
-        tokio::time::timeout(timeout, async {
-            loop {
-                match transport.next().await {
-                    Some(Ok(pkt)) if pkt.len() >= 20 && (pkt[0] >> 4) == 4 && pkt[9] == 6 => {
-                        return pkt;
-                    }
-                    Some(Ok(_)) => continue,
-                    Some(Err(e)) => panic!("transport error: {}", e),
-                    None => panic!("transport closed"),
-                }
-            }
-        })
-        .await
-        .expect("timed out waiting for TCP packet")
-    }
-
-    async fn recv_udp_pkt(transport: &mut KeepAliveTransport, timeout: std::time::Duration) -> Vec<u8> {
-        tokio::time::timeout(timeout, async {
-            loop {
-                match transport.next().await {
-                    Some(Ok(pkt)) if pkt.len() >= 20 && (pkt[0] >> 4) == 4 && pkt[9] == 17 => {
-                        return pkt;
-                    }
-                    Some(Ok(_)) => continue,
-                    Some(Err(e)) => panic!("transport error: {}", e),
-                    None => panic!("transport closed"),
-                }
-            }
-        })
-        .await
-        .expect("timed out waiting for UDP packet")
-    }
-
-    // --- End-to-end integration tests ---
-
-    #[tokio::test]
-    async fn tcp_echo_through_relay_tunnel() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener as TokioTcpListener;
-
-        // Start a real TCP echo server
-        let echo_server = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-        let echo_port = echo_server.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = echo_server.accept().await {
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match stream.read(&mut buf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => { let _ = stream.write_all(&buf[..n]).await; }
-                        }
-                    }
-                });
-            }
-        });
-
-        let mut tunnel = setup_relay_tunnel().await;
-        let timeout = std::time::Duration::from_secs(5);
-
-        // TCP 3-way handshake
-        let mut tcp = RawTcpClient::new([10, 0, 0, 2], [127, 0, 0, 1], 40001, echo_port);
-
-        // SYN
-        let syn = tcp.build_syn();
-        Pin::new(&mut tunnel.client_transport).send(syn).await.unwrap();
-
-        // Receive SYN-ACK
-        let syn_ack = recv_tcp(&mut tunnel.client_transport, timeout).await;
-        let parsed = etherparse::SlicedPacket::from_ip(&syn_ack).unwrap();
-        if let Some(etherparse::TransportSlice::Tcp(ref t)) = parsed.transport {
-            assert!(t.syn() && t.ack(), "expected SYN-ACK, got flags: syn={} ack={}", t.syn(), t.ack());
-        }
-        tcp.process_syn_ack(&syn_ack);
-
-        // ACK (completes handshake)
-        let ack = tcp.build_ack();
-        Pin::new(&mut tunnel.client_transport).send(ack).await.unwrap();
-
-        // Send data
-        let payload = b"Hello, tunnel!";
-        let data_pkt = tcp.build_data(payload);
-        Pin::new(&mut tunnel.client_transport).send(data_pkt).await.unwrap();
-
-        // Receive echoed data
-        let mut received_data = Vec::new();
-        let result = tokio::time::timeout(timeout, async {
-            while received_data.len() < payload.len() {
-                let response = recv_tcp(&mut tunnel.client_transport, timeout).await;
-                let data = tcp.process_response(&response);
-                received_data.extend_from_slice(&data);
-            }
-        }).await;
-        assert!(result.is_ok(), "timed out waiting for echo data");
-        assert_eq!(&received_data[..payload.len()], payload);
-
-        // ACK the received data
-        let ack = tcp.build_ack();
-        Pin::new(&mut tunnel.client_transport).send(ack).await.unwrap();
-
-        // FIN
-        let fin = tcp.build_fin();
-        Pin::new(&mut tunnel.client_transport).send(fin).await.unwrap();
-
-        // Wait for FIN-ACK from server (may be ACK or FIN+ACK)
-        let fin_response = recv_tcp(&mut tunnel.client_transport, timeout).await;
-        let parsed = etherparse::SlicedPacket::from_ip(&fin_response).unwrap();
-        if let Some(etherparse::TransportSlice::Tcp(ref t)) = parsed.transport {
-            assert!(t.ack(), "expected ACK in FIN response");
-        }
-
-        tunnel.server_cancel.cancel();
-    }
-
-    #[tokio::test]
-    async fn udp_echo_through_relay_tunnel() {
-        // Start a real UDP echo server
-        let echo_socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let echo_port = echo_socket.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            let mut buf = [0u8; 4096];
-            loop {
-                match echo_socket.recv_from(&mut buf).await {
-                    Ok((n, addr)) => { let _ = echo_socket.send_to(&buf[..n], addr).await; }
-                    Err(_) => break,
-                }
-            }
-        });
-
-        let mut tunnel = setup_relay_tunnel().await;
-        let timeout = std::time::Duration::from_secs(5);
-
-        // Craft and send a UDP packet
-        let payload = b"Hello, UDP tunnel!";
-        let mut udp_pkt = Vec::new();
-        etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [127, 0, 0, 1], 64)
-            .udp(50001, echo_port)
-            .write(&mut udp_pkt, payload)
-            .unwrap();
-
-        Pin::new(&mut tunnel.client_transport).send(udp_pkt).await.unwrap();
-
-        // Receive echoed UDP response
-        let response = recv_udp_pkt(&mut tunnel.client_transport, timeout).await;
-        let parsed = etherparse::SlicedPacket::from_ip(&response).unwrap();
-        if let Some(etherparse::TransportSlice::Udp(udp)) = parsed.transport {
-            assert_eq!(udp.payload(), payload);
-        } else {
-            panic!("expected UDP transport slice");
-        }
-
-        tunnel.server_cancel.cancel();
-    }
-
-    #[tokio::test]
-    async fn multiple_tcp_connections_through_tunnel() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener as TokioTcpListener;
-
-        let echo_server = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-        let echo_port = echo_server.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = echo_server.accept().await {
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match stream.read(&mut buf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => { let _ = stream.write_all(&buf[..n]).await; }
-                        }
-                    }
-                });
-            }
-        });
-
-        let mut tunnel = setup_relay_tunnel().await;
-        let timeout = std::time::Duration::from_secs(5);
-
-        // Connection #1
-        let mut tcp1 = RawTcpClient::new([10, 0, 0, 2], [127, 0, 0, 1], 40001, echo_port);
-        Pin::new(&mut tunnel.client_transport).send(tcp1.build_syn()).await.unwrap();
-        let syn_ack1 = recv_tcp(&mut tunnel.client_transport, timeout).await;
-        tcp1.process_syn_ack(&syn_ack1);
-        Pin::new(&mut tunnel.client_transport).send(tcp1.build_ack()).await.unwrap();
-
-        let data1 = b"conn1-data";
-        Pin::new(&mut tunnel.client_transport).send(tcp1.build_data(data1)).await.unwrap();
-
-        let mut received1 = Vec::new();
-        let result = tokio::time::timeout(timeout, async {
-            while received1.len() < data1.len() {
-                let resp = recv_tcp(&mut tunnel.client_transport, timeout).await;
-                received1.extend_from_slice(&tcp1.process_response(&resp));
-            }
-        }).await;
-        assert!(result.is_ok(), "conn1 echo timed out");
-        assert_eq!(&received1[..data1.len()], data1);
-
-        // Connection #2 (different src port)
-        let mut tcp2 = RawTcpClient::new([10, 0, 0, 2], [127, 0, 0, 1], 40002, echo_port);
-        Pin::new(&mut tunnel.client_transport).send(tcp2.build_syn()).await.unwrap();
-        let syn_ack2 = recv_tcp(&mut tunnel.client_transport, timeout).await;
-        tcp2.process_syn_ack(&syn_ack2);
-        Pin::new(&mut tunnel.client_transport).send(tcp2.build_ack()).await.unwrap();
-
-        let data2 = b"conn2-data";
-        Pin::new(&mut tunnel.client_transport).send(tcp2.build_data(data2)).await.unwrap();
-
-        let mut received2 = Vec::new();
-        let result = tokio::time::timeout(timeout, async {
-            while received2.len() < data2.len() {
-                let resp = recv_tcp(&mut tunnel.client_transport, timeout).await;
-                // Determine which connection this packet belongs to
-                let parsed = etherparse::SlicedPacket::from_ip(&resp).unwrap();
-                if let Some(etherparse::TransportSlice::Tcp(ref t)) = parsed.transport {
-                    if t.source_port() == echo_port {
-                        // Check destination port to route to correct client
-                        if t.destination_port() == 40002 {
-                            received2.extend_from_slice(&tcp2.process_response(&resp));
-                        } else {
-                            // Data for conn1, just process to keep ack updated
-                            tcp1.process_response(&resp);
-                        }
-                    }
-                }
-            }
-        }).await;
-        assert!(result.is_ok(), "conn2 echo timed out");
-        assert_eq!(&received2[..data2.len()], data2);
-
-        tunnel.server_cancel.cancel();
-    }
-
-    #[tokio::test]
-    async fn large_payload_tcp_through_tunnel() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener as TokioTcpListener;
-
-        let echo_server = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-        let echo_port = echo_server.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = echo_server.accept().await {
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match stream.read(&mut buf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => { let _ = stream.write_all(&buf[..n]).await; }
-                        }
-                    }
-                });
-            }
-        });
-
-        let mut tunnel = setup_relay_tunnel().await;
-        let timeout = std::time::Duration::from_secs(10);
-
-        let mut tcp = RawTcpClient::new([10, 0, 0, 2], [127, 0, 0, 1], 40001, echo_port);
-
-        // Handshake
-        Pin::new(&mut tunnel.client_transport).send(tcp.build_syn()).await.unwrap();
-        let syn_ack = recv_tcp(&mut tunnel.client_transport, timeout).await;
-        tcp.process_syn_ack(&syn_ack);
-        Pin::new(&mut tunnel.client_transport).send(tcp.build_ack()).await.unwrap();
-
-        // Build a 4KB payload, send in ~500-byte segments to stay under MTU
-        let total_size = 4096;
-        let segment_size = 500;
-        let full_payload: Vec<u8> = (0..total_size).map(|i| (i % 256) as u8).collect();
-
-        for chunk in full_payload.chunks(segment_size) {
-            let data_pkt = tcp.build_data(chunk);
-            Pin::new(&mut tunnel.client_transport).send(data_pkt).await.unwrap();
-            // Small delay to avoid overwhelming the netstack
-            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
-        }
-
-        // Collect echoed data
-        let mut received = Vec::new();
-        let result = tokio::time::timeout(timeout, async {
-            while received.len() < total_size {
-                let resp = recv_tcp(&mut tunnel.client_transport, timeout).await;
-                let data = tcp.process_response(&resp);
-                if !data.is_empty() {
-                    received.extend_from_slice(&data);
-                    // ACK the data
-                    let ack = tcp.build_ack();
-                    Pin::new(&mut tunnel.client_transport).send(ack).await.unwrap();
-                }
-            }
-        }).await;
-
-        assert!(result.is_ok(), "timed out, received {}/{} bytes", received.len(), total_size);
-        assert_eq!(received.len(), total_size);
-        assert_eq!(received, full_payload);
-
-        tunnel.server_cancel.cancel();
-    }
-
-    // --- Certificate pinning tests ---
-
-    /// Like `test_certs()` but allows specifying the SAN on the relay certificate.
-    fn test_certs_with_san(san: &str) -> (quinn::ServerConfig, rustls::ClientConfig) {
-        let ca_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let mut ca_params = rcgen::CertificateParams::default();
-        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
-        ca_params.distinguished_name = rcgen::DistinguishedName::new();
-        ca_params
-            .distinguished_name
-            .push(rcgen::DnType::CommonName, "Test CA");
-        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
-
-        let relay_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let mut relay_params = rcgen::CertificateParams::default();
-        relay_params.distinguished_name = rcgen::DistinguishedName::new();
-        relay_params
-            .subject_alt_names
-            .push(rcgen::SanType::DnsName(san.try_into().unwrap()));
-        let relay_cert = relay_params
-            .signed_by(&relay_key, &ca_cert, &ca_key)
-            .unwrap();
-
-        let cert = rustls::pki_types::CertificateDer::from(relay_cert.der().to_vec());
-        let key = rustls::pki_types::PrivateKeyDer::try_from(relay_key.serialize_der()).unwrap();
-
-        let mut server_crypto = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert], key)
-            .unwrap();
-        server_crypto.alpn_protocols = vec![ALPN.to_vec()];
-
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
-        ));
-
-        let mut root_store = rustls::RootCertStore::empty();
-        root_store
-            .add(rustls::pki_types::CertificateDer::from(
-                ca_cert.der().to_vec(),
-            ))
-            .unwrap();
-
-        let mut client_crypto = rustls::ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        client_crypto.alpn_protocols = vec![ALPN.to_vec()];
-
-        (server_config, client_crypto)
-    }
-
-    /// Start a fake relay with a specific server TLS config. Returns the port.
-    fn start_fake_relay_with_config(server_config: quinn::ServerConfig) -> u16 {
-        let endpoint =
-            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let port = endpoint.local_addr().unwrap().port();
-        tokio::spawn(fake_relay(endpoint));
-        port
-    }
-
-    /// Try a raw QUIC connection to a relay, bypassing relay-client's retry loop.
-    /// Returns Ok(Connection) on success, Err on TLS/handshake failure.
-    async fn try_quic_connect(
-        client_crypto: rustls::ClientConfig,
-        port: u16,
-    ) -> Result<quinn::Connection, quinn::ConnectionError> {
-        let ep = build_endpoint_with_crypto(client_crypto, &None).unwrap();
-        let addr: std::net::SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
-        let connecting = ep.connect(addr, "relay.spora.dev").unwrap();
-        connecting.await
-    }
-
-    #[tokio::test]
-    async fn relay_rejects_connection_with_wrong_ca() {
-        // Server has cert signed by CA_A
-        let (server_config, _correct_crypto) = test_certs();
-        // Client trusts a completely different CA_B
-        let (_, wrong_crypto) = test_certs();
-
-        let port = start_fake_relay_with_config(server_config);
-        let result = try_quic_connect(wrong_crypto, port).await;
-
-        assert!(result.is_err(), "connection should fail when client trusts a different CA");
-    }
-
-    #[tokio::test]
-    async fn relay_rejects_connection_with_wrong_san() {
-        // Server cert has SAN "wrong.example.com" instead of "relay.spora.dev"
-        // Client trusts the correct CA but connects with SNI "relay.spora.dev"
-        let (server_config, correct_crypto) = test_certs_with_san("wrong.example.com");
-
-        let port = start_fake_relay_with_config(server_config);
-        let result = try_quic_connect(correct_crypto, port).await;
-
-        assert!(result.is_err(), "connection should fail when server SAN doesn't match SNI");
-    }
-
-    #[tokio::test]
-    async fn relay_rejects_self_signed_server_cert() {
-        // Server uses a self-signed cert (acts as its own CA)
-        let relay_key = rcgen::KeyPair::generate_for(&rcgen::PKCS_ECDSA_P256_SHA256).unwrap();
-        let mut relay_params = rcgen::CertificateParams::default();
-        relay_params.distinguished_name = rcgen::DistinguishedName::new();
-        relay_params
-            .subject_alt_names
-            .push(rcgen::SanType::DnsName("relay.spora.dev".try_into().unwrap()));
-        let self_signed = relay_params.self_signed(&relay_key).unwrap();
-
-        let cert = rustls::pki_types::CertificateDer::from(self_signed.der().to_vec());
-        let key = rustls::pki_types::PrivateKeyDer::try_from(relay_key.serialize_der()).unwrap();
-
-        let mut server_crypto = rustls::ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![cert], key)
-            .unwrap();
-        server_crypto.alpn_protocols = vec![ALPN.to_vec()];
-        let server_config = quinn::ServerConfig::with_crypto(Arc::new(
-            quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto).unwrap(),
-        ));
-
-        // Client trusts a separate CA (not the self-signed cert)
-        let (_, client_crypto) = test_certs();
-
-        let port = start_fake_relay_with_config(server_config);
-        let result = try_quic_connect(client_crypto, port).await;
-
-        assert!(result.is_err(), "connection should fail with self-signed server cert");
-    }
-
-    #[tokio::test]
-    async fn relay_accepts_connection_with_correct_pinned_ca() {
-        // Positive control: matching CA, correct SAN → connection succeeds
-        let (server_config, client_crypto) = test_certs();
-        let port = start_fake_relay_with_config(server_config);
-
-        let ep = build_endpoint_with_crypto(client_crypto, &None).unwrap();
-        let svc = RelayService::new("127.0.0.1", port);
-        let result = svc.sub_with_endpoint("testkey", &ep).await;
-
-        assert!(result.is_ok(), "connection should succeed with correct pinned CA: {:?}", result.err());
-    }
-
-    // --- Existing tests ---
-
-    #[tokio::test]
-    async fn pierce_fails_on_unresolvable_stun() {
-        let result = pierce("this.host.does.not.exist.invalid:19302").await;
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert!(
-            err.contains("failed to resolve"),
-            "expected 'failed to resolve' in error, got: {err}"
-        );
-    }
-
-    #[tokio::test]
-    async fn pierce_fails_on_unreachable_stun() {
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(10),
-            pierce("192.0.2.1:19302"),
-        ).await;
-
-        match result {
-            Ok(Ok(_)) => panic!("should not succeed"),
-            Ok(Err(_)) => {}
-            Err(_) => {}
-        }
-    }
-
-    #[tokio::test]
-    async fn connect_fails_on_bad_relay() {
-        let url = Url::parse("http://192.0.2.1:1/testkey").unwrap();
-        let config = Config {
-            stun_server: "192.0.2.1:19302".into(),
-            relay_host: "192.0.2.1".into(),
-            relay_port: 1,
-            protector: None,
-            mtu_callback: None,
-        };
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(15),
-            connect(url, &config),
-        ).await;
-
-        match result {
-            Ok(Ok(_)) => panic!("should not succeed"),
-            Ok(Err(_)) => {}
-            Err(_) => {}
-        }
-    }
-
-    // --- QUIC P2P transport tests ---
-
-    use crate::transport::quic::{
-        cert_fingerprint, establish_quic_client, establish_quic_server, generate_self_signed_cert,
-    };
-
-    /// Helper: create a localhost UDP socket pair bound to ephemeral ports.
-    async fn quic_socket_pair() -> (tokio::net::UdpSocket, tokio::net::UdpSocket, std::net::SocketAddr, std::net::SocketAddr) {
-        let server_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let client_sock = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let server_addr = server_sock.local_addr().unwrap();
-        let client_addr = client_sock.local_addr().unwrap();
-        (server_sock, client_sock, server_addr, client_addr)
-    }
-
-    #[tokio::test]
-    async fn quic_peer_transport_roundtrip() {
-        let (server_sock, client_sock, server_addr, _client_addr) = quic_socket_pair().await;
-
-        let (cert, key, fingerprint) = generate_self_signed_cert();
-
-        let server_task = tokio::spawn(async move {
-            establish_quic_server(server_sock, cert, key).await.unwrap()
-        });
-
-        let client_task = tokio::spawn(async move {
-            establish_quic_client(client_sock, server_addr, &fingerprint).await.unwrap()
-        });
-
-        let (server_result, client_result) = tokio::join!(server_task, client_task);
-        let mut server_transport = server_result.unwrap();
-        let mut client_transport = client_result.unwrap();
-
-        // Client → Server
-        let pkt1 = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
-        Pin::new(&mut client_transport).send(pkt1.clone()).await.unwrap();
-        let received = tokio::time::timeout(TIMEOUT, server_transport.next())
-            .await
-            .expect("server should receive packet from client")
-            .unwrap()
-            .unwrap();
-        assert_eq!(received, pkt1);
-
-        // Server → Client
-        let pkt2 = vec![0x45, 0x00, 0x00, 0x14, 5, 6, 7, 8];
-        Pin::new(&mut server_transport).send(pkt2.clone()).await.unwrap();
-        let received = tokio::time::timeout(TIMEOUT, client_transport.next())
-            .await
-            .expect("client should receive packet from server")
-            .unwrap()
-            .unwrap();
-        assert_eq!(received, pkt2);
-    }
-
-    #[tokio::test]
-    async fn quic_peer_rejects_wrong_fingerprint() {
-        let (server_sock, client_sock, server_addr, _client_addr) = quic_socket_pair().await;
-
-        let (cert, key, _correct_fp) = generate_self_signed_cert();
-
-        // Generate a different cert to get a different fingerprint
-        let (other_cert, _, _) = generate_self_signed_cert();
-        let wrong_fingerprint = cert_fingerprint(other_cert.as_ref());
-
-        let server_task = tokio::spawn(async move {
-            establish_quic_server(server_sock, cert, key).await
-        });
-
-        let client_result = tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            establish_quic_client(client_sock, server_addr, &wrong_fingerprint),
-        ).await;
-
-        // Client should fail due to fingerprint mismatch
-        match client_result {
-            Ok(Ok(_)) => panic!("client should reject wrong fingerprint"),
-            Ok(Err(_)) => {} // expected: handshake failed
-            Err(_) => {}     // timeout is also acceptable
-        }
-
-        // Server may fail too (client resets connection)
-        let _ = server_task.await;
-    }
-
-    #[tokio::test]
-    async fn quic_peer_drops_oversized_datagram() {
-        let (server_sock, client_sock, server_addr, _client_addr) = quic_socket_pair().await;
-
-        let (cert, key, fingerprint) = generate_self_signed_cert();
-
-        let server_task = tokio::spawn(async move {
-            establish_quic_server(server_sock, cert, key).await.unwrap()
-        });
-
-        let client_task = tokio::spawn(async move {
-            establish_quic_client(client_sock, server_addr, &fingerprint).await.unwrap()
-        });
-
-        let (server_result, client_result) = tokio::join!(server_task, client_task);
-        let mut server_transport = server_result.unwrap();
-        let mut client_transport = client_result.unwrap();
-
-        // Send an oversized datagram (2000 bytes, exceeds QUIC datagram limit)
-        let oversized = vec![0u8; 2000];
-        let send_result = Pin::new(&mut client_transport).send(oversized).await;
-        assert!(send_result.is_ok(), "oversized datagram should be silently dropped, not error");
-
-        // Verify transport is still alive by sending a normal-sized packet
-        let normal_pkt = vec![0x45, 0x00, 0x00, 0x14, 1, 2, 3, 4];
-        Pin::new(&mut client_transport).send(normal_pkt.clone()).await.unwrap();
-        let received = tokio::time::timeout(TIMEOUT, server_transport.next())
-            .await
-            .expect("transport should still work after dropping oversized datagram")
-            .unwrap()
-            .unwrap();
-        assert_eq!(received, normal_pkt);
-    }
-
-    // --- Constrained relay: simulates a bandwidth-limited link with finite buffer ---
-
-    use std::collections::VecDeque;
-    use std::sync::atomic::{AtomicU64, Ordering};
-
-    #[derive(Default)]
-    struct RelayStats {
-        a_to_b: AtomicU64,       // client→server packets forwarded
-        b_to_a_fwd: AtomicU64,   // server→client packets forwarded
-        b_to_a_evict: AtomicU64, // server→client packets evicted
-        b_to_a_recv: AtomicU64,  // server→client packets received (before buffering)
-    }
-
-    /// Like `fake_relay` but constrains the b→a (server→client) forwarding direction.
-    ///
-    /// - `buffer_cap`: max datagrams buffered; when full the oldest is evicted (like
-    ///   `send_datagram`'s FIFO eviction). 0 means unlimited.
-    /// - `drain_interval`: minimum time between forwarding two datagrams. Simulates
-    ///   a bandwidth-limited link.
-    /// - `latency`: artificial one-way delay added to BOTH forwarding directions.
-    ///   Simulates real network RTT (total RTT = 2 × latency).
-    async fn fake_relay_constrained(
-        endpoint: quinn::Endpoint,
-        buffer_cap: usize,
-        drain_interval: std::time::Duration,
-        latency: std::time::Duration,
-        stats: Arc<RelayStats>,
-    ) {
-        let subscribers: Arc<TokioMutex<HashMap<Vec<u8>, FakeSubscriber>>> =
-            Arc::new(TokioMutex::new(HashMap::new()));
-
-        while let Some(incoming) = endpoint.accept().await {
-            let subscribers = subscribers.clone();
-            let endpoint_str = endpoint.local_addr().unwrap().to_string();
-            let stats = stats.clone();
-            tokio::spawn(async move {
-                let conn = match incoming.await {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
-                let (mut send, mut recv) = match conn.accept_bi().await {
-                    Ok(s) => s,
-                    Err(_) => return,
-                };
-                let handshake = match recv.read_to_end(65535).await {
-                    Ok(h) => h,
-                    Err(_) => return,
-                };
-                if handshake.is_empty() {
-                    return;
-                }
-
-                let msg_type = handshake[0];
-                let key = handshake[1..].to_vec();
-
-                match msg_type {
-                    0x01 => {
-                        let mut resp = vec![0x01];
-                        resp.extend_from_slice(endpoint_str.as_bytes());
-                        let _ = send.write_all(&resp).await;
-                        subscribers.lock().await.insert(
-                            key,
-                            FakeSubscriber {
-                                connection: conn,
-                                send_stream: send,
-                            },
-                        );
-                    }
-                    0x02 => {
-                        let mut subs = subscribers.lock().await;
-                        if let Some(mut sub) = subs.remove(&key) {
-                            let _ = send.write_all(&[0x02]).await;
-                            let _ = send.finish();
-                            let _ = sub.send_stream.write_all(&[0x03]).await;
-                            let _ = sub.send_stream.finish();
-
-                            let a = conn; // publisher (client)
-                            let b = sub.connection; // subscriber (server)
-                            let a2 = a.clone();
-                            let b2 = b.clone();
-
-                            // a → b: unconstrained throughput, latency via spawned delay
-                            let stats_ab = stats.clone();
-                            tokio::spawn(async move {
-                                loop {
-                                    match a.read_datagram().await {
-                                        Ok(d) => {
-                                            stats_ab.a_to_b.fetch_add(1, Ordering::Relaxed);
-                                            if latency > std::time::Duration::ZERO {
-                                                let b = b.clone();
-                                                tokio::spawn(async move {
-                                                    tokio::time::sleep(latency).await;
-                                                    let _ = b.send_datagram(d);
-                                                });
-                                            } else if b.send_datagram(d).is_err() {
-                                                break;
-                                            }
-                                        }
-                                        Err(_) => break,
-                                    }
-                                }
-                            });
-
-                            // b → a: constrained (server→client)
-                            // Latency is applied via spawned delay so the drain loop
-                            // isn't blocked — models production where send_datagram()
-                            // returns instantly and latency is on the wire.
-                            let stats_ba = stats.clone();
-                            tokio::spawn(async move {
-                                let mut buffer: VecDeque<Vec<u8>> = VecDeque::new();
-                                let mut drain_timer = tokio::time::interval(
-                                    if drain_interval > std::time::Duration::ZERO {
-                                        drain_interval
-                                    } else {
-                                        std::time::Duration::from_nanos(1)
-                                    },
-                                );
-                                drain_timer.set_missed_tick_behavior(
-                                    tokio::time::MissedTickBehavior::Skip,
-                                );
-
-                                loop {
-                                    tokio::select! {
-                                        biased;
-                                        dgram = b2.read_datagram() => {
-                                            match dgram {
-                                                Ok(d) => {
-                                                    stats_ba.b_to_a_recv.fetch_add(1, Ordering::Relaxed);
-                                                    if buffer_cap > 0 && buffer.len() >= buffer_cap {
-                                                        // Drop newest (incoming) — oldest in buffer survive.
-                                                        // This is critical for TCP: oldest segments are
-                                                        // needed for the client's contiguous window to
-                                                        // advance; dropping them causes a death spiral.
-                                                        stats_ba.b_to_a_evict.fetch_add(1, Ordering::Relaxed);
-                                                    } else {
-                                                        buffer.push_back(d.to_vec());
-                                                    }
-                                                }
-                                                Err(_) => break,
-                                            }
-                                        }
-                                        _ = drain_timer.tick() => {
-                                            if let Some(pkt) = buffer.pop_front() {
-                                                stats_ba.b_to_a_fwd.fetch_add(1, Ordering::Relaxed);
-                                                if latency > std::time::Duration::ZERO {
-                                                    let a2 = a2.clone();
-                                                    tokio::spawn(async move {
-                                                        tokio::time::sleep(latency).await;
-                                                        let _ = a2.send_datagram(pkt.into());
-                                                    });
-                                                } else if a2.send_datagram(pkt.into()).is_err() {
-                                                    break;
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            });
-                        } else {
-                            let mut resp = vec![0xFF];
-                            resp.extend_from_slice(b"unknown subscriber");
-                            let _ = send.write_all(&resp).await;
-                            let _ = send.finish();
-                        }
-                    }
-                    _ => {}
-                }
-            });
-        }
-    }
-
-    fn start_constrained_relay(
-        buffer_cap: usize,
-        drain_interval: std::time::Duration,
-        latency: std::time::Duration,
-    ) -> (u16, rustls::ClientConfig, Arc<RelayStats>) {
-        let (server_config, client_crypto) = test_certs();
-        let endpoint =
-            quinn::Endpoint::server(server_config, "127.0.0.1:0".parse().unwrap()).unwrap();
-        let port = endpoint.local_addr().unwrap().port();
-        let stats = Arc::new(RelayStats::default());
-        tokio::spawn(fake_relay_constrained(endpoint, buffer_cap, drain_interval, latency, stats.clone()));
-        (port, client_crypto, stats)
-    }
-
-    struct ConstrainedTunnel {
-        tunnel: TunnelPair,
-        relay_stats: Arc<RelayStats>,
-    }
-
-    async fn setup_constrained_tunnel(
-        buffer_cap: usize,
-        drain_interval: std::time::Duration,
-        latency: std::time::Duration,
-    ) -> ConstrainedTunnel {
-        let (port, crypto, relay_stats) = start_constrained_relay(buffer_cap, drain_interval, latency);
-        let (server_conn, client_conn) = matched_relay_pair(port, &crypto).await;
-
-        let (server_relay, _server_signal, server_demux) = relay_connection(server_conn, None);
-        let (server_upgradable, _server_upgrade_tx, server_router) =
-            upgradable_transport(Box::new(server_relay));
-        let ka_cfg = KeepAliveConfig {
-            mode: KeepAliveMode::Periodic {
-                interval: std::time::Duration::from_secs(300),
-                recv_timeout: Some(std::time::Duration::from_secs(30)),
-            },
-            ..Default::default()
-        };
-        let server_transport: IpTransport =
-            Box::new(KeepAliveTransport::new(Box::new(server_upgradable), ka_cfg.clone()));
-
-        let cancel = CancellationToken::new();
-        let cancel_clone = cancel.clone();
-        let tunnel_handle = tokio::spawn(async move {
-            server::start_tunnel(server_transport, None, cancel_clone, false)
-                .await
-                .unwrap();
-        });
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-
-        let (client_relay, _client_signal, client_demux) = relay_connection(client_conn, None);
-        let (client_upgradable, _client_upgrade_tx, client_router) =
-            upgradable_transport(Box::new(client_relay));
-        let client_transport = KeepAliveTransport::new(Box::new(client_upgradable), ka_cfg);
-
-        ConstrainedTunnel {
-            tunnel: TunnelPair {
-                client_transport,
-                server_cancel: cancel,
-                _handles: vec![
-                    tunnel_handle,
-                    server_demux,
-                    server_router,
-                    client_demux,
-                    client_router,
-                ],
-            },
-            relay_stats,
-        }
-    }
-
-    /// TCP receiver that handles out-of-order delivery for bulk downloads.
-    /// Tracks received bytes with a bitmap and sends correct cumulative ACKs.
-    struct BulkTcpReceiver {
-        src_ip: [u8; 4],
-        dst_ip: [u8; 4],
-        src_port: u16,
-        dst_port: u16,
-        local_seq: u32,
-        initial_remote_seq: u32,
-        received: Vec<bool>,
-        contiguous_end: usize,
-        fin_received: bool,
-    }
-
-    impl BulkTcpReceiver {
-        fn new(src_ip: [u8; 4], dst_ip: [u8; 4], src_port: u16, dst_port: u16) -> Self {
-            Self {
-                src_ip,
-                dst_ip,
-                src_port,
-                dst_port,
-                local_seq: 1000,
-                initial_remote_seq: 0,
-                received: vec![false; 256 * 1024],
-                contiguous_end: 0,
-                fin_received: false,
-            }
-        }
-
-        fn process_segment(&mut self, pkt: &[u8]) -> Vec<u8> {
-            let parsed = etherparse::SlicedPacket::from_ip(pkt).unwrap();
-            if let Some(etherparse::TransportSlice::Tcp(tcp)) = parsed.transport {
-                let seg_seq = tcp.sequence_number();
-                let payload = tcp.payload();
-
-                if !payload.is_empty() {
-                    let offset = seg_seq.wrapping_sub(self.initial_remote_seq) as usize;
-                    let end = offset + payload.len();
-                    if end > self.received.len() {
-                        self.received.resize(end, false);
-                    }
-                    for i in offset..end {
-                        self.received[i] = true;
-                    }
-                }
-
-                if tcp.fin() {
-                    self.fin_received = true;
-                }
-
-                while self.contiguous_end < self.received.len()
-                    && self.received[self.contiguous_end]
-                {
-                    self.contiguous_end += 1;
-                }
-            }
-            self.build_ack()
-        }
-
-        fn build_ack(&self) -> Vec<u8> {
-            let ack_num = self.initial_remote_seq + self.contiguous_end as u32;
-            let mut pkt = Vec::new();
-            etherparse::PacketBuilder::ipv4(self.src_ip, self.dst_ip, 64)
-                .tcp(self.src_port, self.dst_port, self.local_seq, 65535)
-                .ack(ack_num)
-                .write(&mut pkt, &[])
-                .unwrap();
-            pkt
-        }
-
-        fn contiguous_bytes(&self) -> usize {
-            self.contiguous_end
-        }
-    }
-
-    // --- Constrained relay tests ---
-
-    /// Baseline: 64KB echo through unconstrained relay. Verifies the test
-    /// infrastructure (BulkTcpReceiver + bulk_download) works.
-    #[tokio::test]
-    async fn tcp_bulk_download_baseline() {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener as TokioTcpListener;
-
-        const DOWNLOAD_SIZE: usize = 65536;
-
-        // Echo server (proven pattern from existing tests)
-        let echo_server = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-        let echo_port = echo_server.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = echo_server.accept().await {
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match stream.read(&mut buf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => { let _ = stream.write_all(&buf[..n]).await; }
-                        }
-                    }
-                });
-            }
-        });
-
-        let mut tunnel = setup_relay_tunnel().await;
-        let timeout = std::time::Duration::from_secs(10);
-
-        // Handshake using proven RawTcpClient
-        let mut tcp = RawTcpClient::new([10, 0, 0, 2], [127, 0, 0, 1], 40001, echo_port);
-        Pin::new(&mut tunnel.client_transport).send(tcp.build_syn()).await.unwrap();
-        let syn_ack = recv_tcp(&mut tunnel.client_transport, timeout).await;
-        tcp.process_syn_ack(&syn_ack);
-        Pin::new(&mut tunnel.client_transport).send(tcp.build_ack()).await.unwrap();
-
-        // Send data in segments (client→server, unconstrained)
-        let full_payload: Vec<u8> = (0..DOWNLOAD_SIZE).map(|i| (i % 256) as u8).collect();
-        for chunk in full_payload.chunks(500) {
-            Pin::new(&mut tunnel.client_transport)
-                .send(tcp.build_data(chunk))
-                .await
-                .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-
-        // Now receive echoed data using BulkTcpReceiver for out-of-order handling
-        let mut receiver = BulkTcpReceiver::new([10, 0, 0, 2], [127, 0, 0, 1], 40001, echo_port);
-        // Set initial_remote_seq from the handshake we already did
-        receiver.initial_remote_seq = tcp.ack;
-        receiver.local_seq = tcp.seq;
-
-        let result = tokio::time::timeout(timeout, async {
-            loop {
-                let pkt = recv_tcp(&mut tunnel.client_transport, timeout).await;
-                let ack = receiver.process_segment(&pkt);
-                Pin::new(&mut tunnel.client_transport)
-                    .send(ack)
-                    .await
-                    .unwrap();
-
-                if receiver.contiguous_bytes() >= DOWNLOAD_SIZE {
-                    break;
-                }
-            }
-        })
-        .await;
-
-        let received = receiver.contiguous_bytes();
-        tunnel.server_cancel.cancel();
-        assert!(
-            result.is_ok(),
-            "baseline: expected {} bytes, got {} ({:.1}%)",
-            DOWNLOAD_SIZE,
-            received,
-            received as f64 / DOWNLOAD_SIZE as f64 * 100.0,
-        );
-    }
-
-    struct EchoResult {
-        received_bytes: usize,
-        elapsed: std::time::Duration,
-        segments_from_server: u64,
-        dup_acks_sent: u64,
-        relay_a_to_b: u64,
-        relay_b_to_a_recv: u64,
-        relay_b_to_a_fwd: u64,
-        relay_b_to_a_evict: u64,
-    }
-
-    /// Helper to run a constrained relay echo test with full instrumentation.
-    async fn run_constrained_echo(
-        buffer_cap: usize,
-        drain_interval: std::time::Duration,
-        latency: std::time::Duration,
-        download_size: usize,
-        timeout_secs: u64,
-    ) -> EchoResult {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        use tokio::net::TcpListener as TokioTcpListener;
-
-        let echo_server = TokioTcpListener::bind("127.0.0.1:0").await.unwrap();
-        let echo_port = echo_server.local_addr().unwrap().port();
-        tokio::spawn(async move {
-            while let Ok((mut stream, _)) = echo_server.accept().await {
-                tokio::spawn(async move {
-                    let mut buf = [0u8; 4096];
-                    loop {
-                        match stream.read(&mut buf).await {
-                            Ok(0) | Err(_) => break,
-                            Ok(n) => { let _ = stream.write_all(&buf[..n]).await; }
-                        }
-                    }
-                });
-            }
-        });
-
-        let ct = setup_constrained_tunnel(buffer_cap, drain_interval, latency).await;
-        let relay_stats = ct.relay_stats.clone();
-        let mut tunnel = ct.tunnel;
-        let timeout = std::time::Duration::from_secs(timeout_secs);
-
-        // Handshake
-        let mut tcp = RawTcpClient::new([10, 0, 0, 2], [127, 0, 0, 1], 40001, echo_port);
-        Pin::new(&mut tunnel.client_transport).send(tcp.build_syn()).await.unwrap();
-        let syn_ack = recv_tcp(&mut tunnel.client_transport, timeout).await;
-        tcp.process_syn_ack(&syn_ack);
-        Pin::new(&mut tunnel.client_transport).send(tcp.build_ack()).await.unwrap();
-
-        // Send data in segments (client→server, unconstrained)
-        let full_payload: Vec<u8> = (0..download_size).map(|i| (i % 256) as u8).collect();
-        for chunk in full_payload.chunks(500) {
-            Pin::new(&mut tunnel.client_transport)
-                .send(tcp.build_data(chunk))
-                .await
-                .unwrap();
-            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
-        }
-
-        // Receive echoed data (server→client, constrained)
-        let mut receiver = BulkTcpReceiver::new([10, 0, 0, 2], [127, 0, 0, 1], 40001, echo_port);
-        receiver.initial_remote_seq = tcp.ack;
-        receiver.local_seq = tcp.seq;
-
-        let mut segments_from_server: u64 = 0;
-        let mut dup_acks_sent: u64 = 0;
-        let mut last_ack_num: u32 = 0;
-
-        let start = std::time::Instant::now();
-        let _ = tokio::time::timeout(timeout, async {
-            loop {
-                let pkt = recv_tcp(&mut tunnel.client_transport, timeout).await;
-                segments_from_server += 1;
-
-                let prev_contiguous = receiver.contiguous_end;
-                let ack = receiver.process_segment(&pkt);
-
-                // Check if this ACK is a duplicate (same ack number as last)
-                let ack_num = receiver.initial_remote_seq + receiver.contiguous_end as u32;
-                if ack_num == last_ack_num && receiver.contiguous_end == prev_contiguous {
-                    dup_acks_sent += 1;
-                }
-                last_ack_num = ack_num;
-
-                Pin::new(&mut tunnel.client_transport)
-                    .send(ack)
-                    .await
-                    .unwrap();
-
-                if receiver.contiguous_bytes() >= download_size {
-                    break;
-                }
-            }
-        })
-        .await;
-        let elapsed = start.elapsed();
-
-        let received = receiver.contiguous_bytes();
-        tunnel.server_cancel.cancel();
-
-        EchoResult {
-            received_bytes: received,
-            elapsed,
-            segments_from_server,
-            dup_acks_sent,
-            relay_a_to_b: relay_stats.a_to_b.load(Ordering::Relaxed),
-            relay_b_to_a_recv: relay_stats.b_to_a_recv.load(Ordering::Relaxed),
-            relay_b_to_a_fwd: relay_stats.b_to_a_fwd.load(Ordering::Relaxed),
-            relay_b_to_a_evict: relay_stats.b_to_a_evict.load(Ordering::Relaxed),
-        }
-    }
-
-    /// 256KB echo through a constrained relay that simulates the production
-    /// bottleneck: finite buffer (FIFO eviction) + drain rate + network latency.
-    ///
-    /// Reproduces the death spiral:
-    ///   smoltcp blasts data → buffer fills → oldest evicted (including ACKs)
-    ///   → smoltcp retransmits → more data → more eviction → throughput collapses
-    ///
-    /// Parameters: buf=5, drain=5ms (200 pkt/s), latency=100ms (200ms RTT).
-    /// A successful fix should complete 256KB within the 60s timeout.
-    #[tokio::test]
-    async fn tcp_bulk_download_constrained_relay() {
-        const DOWNLOAD_SIZE: usize = 256 * 1024; // 256KB
-        let r = run_constrained_echo(
-            5,
-            std::time::Duration::from_millis(5),
-            std::time::Duration::from_millis(100),
-            DOWNLOAD_SIZE,
-            60,
-        ).await;
-
-        let throughput_kbps = if r.elapsed.as_secs_f64() > 0.0 {
-            r.received_bytes as f64 / r.elapsed.as_secs_f64() / 1024.0
-        } else {
-            0.0
-        };
-        let pct = r.received_bytes as f64 / DOWNLOAD_SIZE as f64 * 100.0;
-        eprintln!("=== Constrained relay (buf=5, drain=5ms, lat=100ms, 256KB) ===");
-        eprintln!("  Data: {}/{} bytes ({:.1}%) in {:.2}s = {:.1} KB/s",
-            r.received_bytes, DOWNLOAD_SIZE, pct, r.elapsed.as_secs_f64(), throughput_kbps);
-        eprintln!("  Client: {} segments received, {} dup ACKs sent",
-            r.segments_from_server, r.dup_acks_sent);
-        eprintln!("  Relay client→server: {} pkts forwarded", r.relay_a_to_b);
-        eprintln!("  Relay server→client: {} recv, {} forwarded, {} evicted ({:.1}% loss)",
-            r.relay_b_to_a_recv, r.relay_b_to_a_fwd, r.relay_b_to_a_evict,
-            if r.relay_b_to_a_recv > 0 {
-                r.relay_b_to_a_evict as f64 / r.relay_b_to_a_recv as f64 * 100.0
-            } else { 0.0 });
-    }
 }

@@ -5,16 +5,12 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::task::{AbortHandle, JoinHandle};
-use relay_client::{RelayService, SubConnection};
 use tokio_util::sync::CancellationToken;
 use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
 use log::{error, info, trace, warn};
 use futures_util::{Sink, Stream, SinkExt, StreamExt};
 use crate::transport::IpTransport;
-use crate::transport::keepalive::{KeepAliveConfig, KeepAliveTransport};
-use crate::transport::relay::relay_connection;
-use crate::transport::upgradable::upgradable_transport;
-use crate::{Config, SocketProtector};
+use crate::SocketProtector;
 
 const EGRESS_CHANNEL_CAPACITY: usize = 4096;
 
@@ -275,7 +271,7 @@ async fn new_tcp_stream(addr: SocketAddr, protector: &SocketProtector) -> std::i
     socket.set_nonblocking(true)?;
 
     #[cfg(unix)]
-    if let Some(ref f) = protector {
+    if let Some(f) = protector {
         use std::os::unix::io::AsRawFd;
         f(socket.as_raw_fd());
     }
@@ -382,7 +378,7 @@ async fn new_udp_packet(addr: SocketAddr, protector: &SocketProtector) -> std::i
     socket.set_nonblocking(true)?;
 
     #[cfg(unix)]
-    if let Some(ref f) = protector {
+    if let Some(f) = protector {
         use std::os::unix::io::AsRawFd;
         f(socket.as_raw_fd());
     }
@@ -449,137 +445,3 @@ pub(crate) async fn start_tunnel(transport: IpTransport, protector: SocketProtec
     Ok(())
 }
 
-pub struct PeerPort {
-    pub key: String,
-    pub endpoint: String,
-    /// Connection from the initial subscription — used for the first iteration of run().
-    initial_conn: Option<SubConnection>,
-    config: Config,
-}
-
-impl PeerPort {
-    async fn connect_relay(key: &str, config: &Config) -> io::Result<SubConnection> {
-        let crypto = relay_client::build_client_crypto();
-        let mut transport = relay_client::default_transport_config();
-        transport.keep_alive_interval(Some(Duration::from_secs(20)));
-        let endpoint = relay_client::build_endpoint_with_transport_config(
-            crypto, transport, &config.protector,
-        )?;
-        let relay = RelayService::new(&config.relay_host, config.relay_port);
-        relay.sub_with_endpoint(key, &endpoint).await
-    }
-
-    pub async fn new(key: String, config: Config) -> io::Result<Self> {
-        let sub_conn = Self::connect_relay(&key, &config).await?;
-        let endpoint = sub_conn.endpoint.clone();
-        Ok(PeerPort {
-            key,
-            endpoint,
-            initial_conn: Some(sub_conn),
-            config,
-        })
-    }
-
-    pub async fn run(mut self, cancel: CancellationToken) {
-        let mut tunnel_cancel: Option<CancellationToken> = None;
-        let mut iteration = 0u32;
-
-        loop {
-            iteration += 1;
-            info!("[share loop #{}] Waiting for peer to connect...", iteration);
-
-            // Use the connection from new() on the first iteration,
-            // re-subscribe on subsequent iterations.
-            let mut sub_conn = if let Some(conn) = self.initial_conn.take() {
-                info!("[share loop #{}] Using initial connection", iteration);
-                conn
-            } else {
-                info!("[share loop #{}] Re-subscribing to relay...", iteration);
-                let result = tokio::select! {
-                    _ = cancel.cancelled() => {
-                        info!("Share session cancelled");
-                        break;
-                    }
-                    result = Self::connect_relay(&self.key, &self.config) => result,
-                };
-                match result {
-                    Ok(conn) => {
-                        info!("[share loop #{}] Re-subscription succeeded", iteration);
-                        conn
-                    }
-                    Err(e) => {
-                        warn!("[share loop #{}] Failed to subscribe to relay: {}. Retrying in 5s...", iteration, e);
-                        tokio::select! {
-                            _ = cancel.cancelled() => {
-                                info!("Share session cancelled during retry delay");
-                                return;
-                            }
-                            _ = tokio::time::sleep(tokio::time::Duration::from_secs(5)) => {}
-                        }
-                        continue;
-                    }
-                }
-            };
-
-            // Wait for a peer to connect. QUIC keepalives replace manual 0x00 packets.
-            info!("[share loop #{}] Waiting for peer match...", iteration);
-            let match_result = tokio::select! {
-                _ = cancel.cancelled() => {
-                    info!("Share session cancelled while waiting for peer");
-                    break;
-                }
-                result = sub_conn.wait_for_match() => Some(result),
-            };
-            let Some(match_result) = match_result else { break };
-            if match_result.is_err() {
-                warn!("[share loop #{}] Relay connection error while waiting for peer. Retrying...", iteration);
-                continue;
-            }
-
-            // New peer connected — kick out the previous one.
-            if let Some(tc) = tunnel_cancel.take() {
-                info!("[share loop #{}] New peer connected, cancelling previous tunnel", iteration);
-                tc.cancel();
-            }
-
-            info!("[share loop #{}] Peer connected. Setting up tunnel...", iteration);
-
-            // Demux the relay connection into IP transport and signal channel
-            let (relay_transport, signal_channel, demux_handle) =
-                relay_connection(sub_conn.connection, self.config.mtu_callback.clone());
-
-            // Wrap in upgradable transport
-            let (upgradable, upgrade_sender, router_handle) =
-                upgradable_transport(Box::new(relay_transport));
-
-            // Wrap in keepalive
-            let keepalive_cfg = KeepAliveConfig::default();
-            let transport: IpTransport =
-                Box::new(KeepAliveTransport::new(Box::new(upgradable), keepalive_cfg));
-
-            // Spawn the tunnel — does NOT block the loop.
-            let child_cancel = cancel.child_token();
-            tunnel_cancel = Some(child_cancel.clone());
-
-            // Spawn background direct upgrade task (server = responder).
-            let stun_server = self.config.stun_server.clone();
-            let upgrade_cancel = child_cancel.clone();
-            let protector = self.config.protector.clone();
-            let protector2 = self.config.protector.clone();
-            let mtu_cb = self.config.mtu_callback.clone();
-            let upgrade_task = tokio::spawn(async move {
-                crate::try_direct_upgrade(signal_channel, upgrade_sender, &stun_server, false, &protector, upgrade_cancel, None, mtu_cb).await;
-            });
-
-            tokio::spawn(async move {
-                let _ = start_tunnel(transport, protector2, child_cancel, true).await;
-                // Clean up background tasks
-                upgrade_task.abort();
-                demux_handle.abort();
-                router_handle.abort();
-            });
-
-            // Loop immediately to re-subscribe and wait for the next peer.
-        }
-    }
-}

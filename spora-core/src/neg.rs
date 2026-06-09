@@ -3,7 +3,7 @@ use std::str::FromStr;
 use log::error;
 use crate::server::TunnelError;
 use crate::server::TunnelError::ProtocolError;
-use crate::transport::relay::SignalChannel;
+use crate::signal::SignalChannel;
 
 pub trait NegChannel {
     async fn send_endpoint(&mut self, addr: SocketAddr) -> Result<(), TunnelError>;
@@ -19,29 +19,6 @@ impl<'a> SignalNegChannel<'a> {
         SignalNegChannel { channel }
     }
 
-    pub async fn send_fingerprint(&mut self, fp: &[u8; 32]) -> Result<(), TunnelError> {
-        self.channel
-            .send_signal(fp)
-            .await
-            .map_err(|e| {
-                error!("failed to send fingerprint via signal channel: {}", e);
-                TunnelError::NegChannelClosed
-            })?;
-        Ok(())
-    }
-
-    pub async fn recv_fingerprint(&mut self) -> Result<[u8; 32], TunnelError> {
-        let data = self.channel.recv_signal().await.ok_or_else(|| {
-            error!("signal channel closed while receiving fingerprint");
-            TunnelError::NegChannelClosed
-        })?;
-        data.try_into().map_err(|v: Vec<u8>| {
-            ProtocolError(format!(
-                "expected 32-byte fingerprint, got {} bytes",
-                v.len()
-            ))
-        })
-    }
 }
 
 impl<'a> NegChannel for SignalNegChannel<'a> {

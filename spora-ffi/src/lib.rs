@@ -96,11 +96,6 @@ impl std::fmt::Display for ShareError {
     }
 }
 
-#[uniffi::export]
-pub fn make_secret_key() -> String {
-    spora_core::make_secret_key()
-}
-
 /// Wrap a UniFFI callback into the closure type that spora-core expects.
 fn wrap_protector(cb: Box<dyn SocketProtectorCallback>) -> spora_core::SocketProtector {
     let cb = Arc::new(cb);
@@ -109,22 +104,34 @@ fn wrap_protector(cb: Box<dyn SocketProtectorCallback>) -> spora_core::SocketPro
     }))
 }
 
+/// Generate a fresh identity and return its serialized bytes. The platform
+/// (Android app) is expected to persist these bytes — e.g. in
+/// SharedPreferences — and pass them back to `share()` on subsequent
+/// invocations so the share URL stays stable across launches.
 #[uniffi::export]
-pub fn share(key: String, protector: Option<Box<dyn SocketProtectorCallback>>) -> Result<ShareResult, ShareError> {
+pub fn make_identity() -> Vec<u8> {
+    spora_core::identity::Identity::generate().to_bytes()
+}
+
+#[uniffi::export]
+pub fn share(
+    identity_bytes: Vec<u8>,
+    protector: Option<Box<dyn SocketProtectorCallback>>,
+) -> Result<ShareResult, ShareError> {
+    let identity = spora_core::identity::Identity::from_bytes(&identity_bytes)
+        .map_err(ShareError::Generic)?;
     let config = spora_core::Config {
         protector: protector.and_then(wrap_protector),
         ..spora_core::Config::default()
     };
     let session = RUNTIME
-        .block_on(spora_core::share(key, config))
+        .block_on(spora_core::share(identity, config))
         .map_err(|e| ShareError::Generic(e.to_string()))?;
 
-    let url = format!("https://spora.to/s/{}?r={}", session.key, session.endpoint);
+    let url = session.url.to_string();
     let cancel = session.cancel.clone();
     let task = session.task;
 
-    // Detach the cancel token from ShareSession so we manage it ourselves.
-    // We don't call session.stop() — we store the pieces directly.
     let id = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     SHARE_SESSIONS
         .lock()
@@ -188,7 +195,7 @@ pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCal
         return Err(InvalidUrl);
     }
 
-    let mtu_cb: spora_core::transport::relay::MtuCallback = mtu_callback.map(|cb| {
+    let mtu_cb: spora_core::MtuCallback = mtu_callback.map(|cb| {
         let cb = Arc::new(cb);
         Arc::new(move |mtu: u16| {
             cb.on_mtu(mtu as i32);
