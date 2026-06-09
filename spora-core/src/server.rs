@@ -312,7 +312,15 @@ async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket, protec
     loop {
         tokio::select! {
             packet = read_half.next() => {
-                let Some((data, local, remote)) = packet else { break };
+                // netstack-smoltcp's UDP `ReadHalf` yields `None` for BOTH a
+                // genuinely closed channel AND any datagram that fails to
+                // parse (`UdpPacket::new_checked` — e.g. a truncated or
+                // fragmented UDP packet). Treating that as end-of-stream used
+                // to drop this task, which closed the Stack's UDP channel and
+                // tore the entire tunnel down on the next UDP packet. Skip the
+                // bad datagram and keep going instead; real shutdown is driven
+                // by `start_tunnel` aborting this task when the tunnel ends.
+                let Some((data, local, remote)) = packet else { continue };
                 if block_local && is_local_address(remote.ip()) {
                     warn!("blocked UDP datagram to local address: {:?} => {:?}", local, remote);
                     continue;
@@ -419,29 +427,143 @@ pub(crate) async fn start_tunnel(transport: IpTransport, protector: SocketProtec
     let runner_handle = runner.map(|r| tokio::spawn(r));
 
     let w_tunnel = tokio::spawn(run_tunnel(transport, stack));
+    let w_tunnel_abort = w_tunnel.abort_handle();
     let w_tcp = tokio::spawn(handle_tcp_streams(tcp_listener, protector.clone(), block_local));
     let w_udp = tokio::spawn(handle_inbound_datagram(udp_socket, protector, block_local));
 
-    let abort_handles = [
-        w_tunnel.abort_handle(),
-        w_tcp.abort_handle(),
-        w_udp.abort_handle(),
-    ];
-    let runner_abort = runner_handle.as_ref().map(|h| h.abort_handle());
+    // `run_tunnel` owns the tunnel's lifecycle. The TCP/UDP NAT handlers and
+    // the smoltcp runner are subordinate: when the tunnel driver ends (peer
+    // gone, transport closed) or the session is cancelled, abort them all.
+    // They no longer self-terminate on channel close (the UDP handler now
+    // skips bad datagrams), so teardown has to be driven from here.
+    let mut subordinate_aborts = vec![w_tcp.abort_handle(), w_udp.abort_handle()];
+    if let Some(h) = runner_handle.as_ref() {
+        subordinate_aborts.push(h.abort_handle());
+    }
 
     tokio::select! {
         _ = cancel.cancelled() => {
             info!("Tunnel cancelled, aborting tasks");
-            for h in &abort_handles {
-                h.abort();
-            }
-            if let Some(h) = runner_abort {
-                h.abort();
-            }
+            w_tunnel_abort.abort();
         }
-        _ = async { tokio::try_join!(w_tunnel, w_tcp, w_udp) } => {}
+        _ = w_tunnel => {
+            info!("Tunnel driver ended, tearing down tunnel tasks");
+        }
+    }
+    for h in &subordinate_aborts {
+        h.abort();
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::IpTransport;
+    use crate::transport::mock::{mock_transport, MockTransportHandle};
+    use std::time::Duration;
+
+    fn icmp_echo_request(id: u16, seq: u16) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [10, 0, 0, 1], 64)
+            .icmpv4_echo_request(id, seq)
+            .write(&mut pkt, b"ping")
+            .unwrap();
+        pkt
+    }
+
+    fn is_icmp_echo_reply(pkt: &[u8]) -> bool {
+        pkt.len() >= 24 && (pkt[0] >> 4) == 4 && pkt[9] == 1 && pkt[20] == 0
+    }
+
+    /// A valid IPv4 UDP packet (to a dst the netstack will just NAT out).
+    fn valid_udp(dst_port: u16) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [10, 0, 0, 1], 64)
+            .udp(40000, dst_port)
+            .write(&mut pkt, b"hi")
+            .unwrap();
+        pkt
+    }
+
+    /// A packet whose IPv4 header is valid (so the Stack routes it to the UDP
+    /// channel by protocol) but whose UDP portion is too short to parse —
+    /// `UdpPacket::new_checked` rejects it. This is what a truncated or
+    /// fragmented UDP datagram looks like when the whole default route is
+    /// tunnelled, and it's exactly the packet that crashed the share side.
+    fn malformed_udp() -> Vec<u8> {
+        vec![
+            0x45, 0x00, 0x00, 0x18, // IPv4, IHL=5, total length = 24
+            0x00, 0x00, 0x00, 0x00, // id, flags/frag
+            0x40, 0x11, 0x00, 0x00, // TTL=64, proto=17 (UDP), checksum=0
+            10, 0, 0, 2, // src
+            10, 0, 0, 1, // dst
+            0xDE, 0xAD, 0xBE, 0xEF, // 4 bytes — shorter than the 8-byte UDP header
+        ]
+    }
+
+    async fn recv_icmp_reply(
+        handle: &mut MockTransportHandle,
+        timeout: Duration,
+    ) -> Option<Vec<u8>> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                match handle.recv().await {
+                    Some(pkt) if is_icmp_echo_reply(&pkt) => return Some(pkt),
+                    Some(_) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// Regression test: a single unparseable UDP datagram must not tear down
+    /// the whole tunnel. Reproduces the share-side crash where one bad UDP
+    /// packet ended `handle_inbound_datagram`, closing the Stack's udp channel
+    /// so the next UDP packet killed the stack driver.
+    #[tokio::test]
+    async fn malformed_udp_packet_does_not_kill_tunnel() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let (mock, mut handle) = mock_transport();
+        let transport: IpTransport = Box::new(mock);
+        let cancel = CancellationToken::new();
+        let cancel_inner = cancel.clone();
+        tokio::spawn(async move {
+            let _ = start_tunnel(transport, None, cancel_inner, false).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        // 1. Tunnel is alive: ICMP echo gets a reply.
+        handle.send(icmp_echo_request(0x1111, 1)).unwrap();
+        assert!(
+            recv_icmp_reply(&mut handle, Duration::from_secs(3)).await.is_some(),
+            "tunnel should answer ICMP before the bad packet"
+        );
+
+        // 2. A malformed UDP packet arrives.
+        handle.send(malformed_udp()).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // 3. A subsequent valid UDP packet.
+        handle.send(valid_udp(9999)).unwrap();
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        // 4. The tunnel must STILL answer ICMP. (A dead tunnel drops the
+        //    transport, so even the send can fail — treat that as failure.)
+        let alive = handle.send(icmp_echo_request(0x2222, 2)).is_ok()
+            && recv_icmp_reply(&mut handle, Duration::from_secs(3))
+                .await
+                .is_some();
+        assert!(
+            alive,
+            "tunnel stopped forwarding after a single malformed UDP packet"
+        );
+
+        cancel.cancel();
+    }
 }
 
