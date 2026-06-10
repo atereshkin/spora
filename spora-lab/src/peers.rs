@@ -27,7 +27,7 @@ use url::Url;
 
 use crate::harness;
 use crate::netns::{HostHandle, Netns};
-use crate::traffic::{BulkStats, EchoStats, TrafficCmd, TrafficPump};
+use crate::traffic::{BulkStats, EchoStats, TcpOpts, TrafficCmd, TrafficPump};
 
 /// How long `start_sharer` waits for `share()` to come up (it only binds a
 /// socket and builds an endpoint — fast).
@@ -192,6 +192,13 @@ impl SharerHandle {
         self.events.discard_pending();
     }
 
+    /// CPU time consumed by the sharer's host thread so far (the whole share
+    /// side: QUIC, netstack, egress sockets — everything runs on this one
+    /// pinned thread). See [`HostHandle::cpu_time`].
+    pub fn cpu_time(&self) -> Option<Duration> {
+        self.host.as_ref()?.cpu_time()
+    }
+
     /// Cancel the share session and join the host thread.
     pub fn stop(mut self) {
         if let Some(host) = self.host.take() {
@@ -308,6 +315,70 @@ impl ClientHandle {
             })
             .map_err(|_| "client traffic pump is gone".to_string())?;
         recv_result(rx, timeout, "tcp bulk")
+    }
+
+    /// Download `bytes` over TCP from `server` (the wan SOURCE service)
+    /// through the tunnel; blocks up to `timeout`. `BulkStats::elapsed` runs
+    /// from connection establishment to the last byte.
+    pub fn tcp_download(
+        &self,
+        server: std::net::SocketAddrV4,
+        bytes: usize,
+        opts: TcpOpts,
+        timeout: Duration,
+    ) -> Result<BulkStats, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmds
+            .send(TrafficCmd::TcpDownload {
+                server,
+                bytes,
+                opts,
+                respond: tx,
+            })
+            .map_err(|_| "client traffic pump is gone".to_string())?;
+        recv_result(rx, timeout, "tcp download")
+    }
+
+    /// Upload `bytes` over TCP to `server` (the wan SINK service) through
+    /// the tunnel; blocks up to `timeout`. `BulkStats::elapsed` runs from
+    /// the first send to the sink's verified byte-count ack.
+    pub fn tcp_upload(
+        &self,
+        server: std::net::SocketAddrV4,
+        bytes: usize,
+        opts: TcpOpts,
+        timeout: Duration,
+    ) -> Result<BulkStats, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmds
+            .send(TrafficCmd::TcpUpload {
+                server,
+                bytes,
+                opts,
+                respond: tx,
+            })
+            .map_err(|_| "client traffic pump is gone".to_string())?;
+        recv_result(rx, timeout, "tcp upload")
+    }
+
+    /// CPU time of the pump THREAD (`CLOCK_THREAD_CPUTIME_ID`, measured on
+    /// the pump task). On a lab host this equals [`host_cpu_time`]
+    /// (current-thread runtime), but it also works for pumps driven outside
+    /// a `Netns` host (the loopback suite).
+    ///
+    /// [`host_cpu_time`]: ClientHandle::host_cpu_time
+    pub fn pump_cpu_time(&self, timeout: Duration) -> Result<Duration, String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmds
+            .send(TrafficCmd::CpuTime { respond: tx })
+            .map_err(|_| "client traffic pump is gone".to_string())?;
+        recv_result(rx, timeout, "cpu time")
+    }
+
+    /// CPU time consumed by the client's host thread so far (client tunnel
+    /// stack + traffic pump). See [`HostHandle::cpu_time`].
+    pub fn host_cpu_time(&self) -> Option<Duration> {
+        self.host.as_ref()?.cpu_time()
     }
 
     /// Tear down the client session and join the host thread.

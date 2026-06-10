@@ -13,6 +13,8 @@ use std::ffi::CString;
 use std::future::Future;
 use std::os::unix::process::CommandExt as _;
 use std::process::Command;
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 
@@ -93,9 +95,15 @@ impl Netns {
         // topology still owns. Capture only the path.
         let ns_path = self.path();
         let label = format!("{}@{}", label, self.name);
+        let tid: Arc<OnceLock<libc::pid_t>> = Arc::new(OnceLock::new());
+        let tid_in = tid.clone();
         let thread = std::thread::Builder::new()
             .name(label.clone())
             .spawn(move || {
+                // First thing: publish the tid so HostHandle::cpu_time can
+                // account this thread (everything the host does — peer tasks,
+                // netstack, blocking handle calls — runs right here).
+                let _ = tid_in.set(unsafe { libc::gettid() });
                 if let Err(e) = enter_by_path(&ns_path) {
                     log::error!("host {label}: {e}");
                     return;
@@ -113,7 +121,7 @@ impl Netns {
                 });
             })
             .map_err(|e| format!("spawn host thread: {e}"))?;
-        Ok(HostHandle { cancel, thread: Some(thread) })
+        Ok(HostHandle { cancel, thread: Some(thread), tid })
     }
 }
 
@@ -129,11 +137,30 @@ impl Drop for Netns {
 pub struct HostHandle {
     cancel: CancellationToken,
     thread: Option<std::thread::JoinHandle<()>>,
+    /// The host thread's kernel tid, published first thing by the thread
+    /// itself — lets [`cpu_time`](HostHandle::cpu_time) read its /proc stat.
+    tid: Arc<OnceLock<libc::pid_t>>,
 }
 
 impl HostHandle {
     pub fn stop(mut self) {
         self.shutdown();
+    }
+
+    /// CPU time (utime + stime) consumed by the host thread so far, from
+    /// `/proc/self/task/<tid>/stat`. With a current-thread runtime this is
+    /// exactly the simulated host's compute (its tasks never run elsewhere).
+    /// `None` until the thread has published its tid, or once the thread has
+    /// exited (the /proc entry is gone), or on any parse failure.
+    pub fn cpu_time(&self) -> Option<Duration> {
+        let tid = *self.tid.get()?;
+        let stat = std::fs::read_to_string(format!("/proc/self/task/{tid}/stat")).ok()?;
+        let ticks = stat_cpu_ticks(&stat)?;
+        let hz = unsafe { libc::sysconf(libc::_SC_CLK_TCK) };
+        if hz <= 0 {
+            return None;
+        }
+        Some(Duration::from_secs_f64(ticks as f64 / hz as f64))
     }
 
     fn shutdown(&mut self) {
@@ -175,4 +202,51 @@ fn run_checked(cmd: &mut Command) -> Result<String, String> {
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+/// utime + stime (clock ticks; fields 14 + 15) from a `/proc/.../stat` line.
+///
+/// Field 2 (`comm`) is parenthesized and may itself contain spaces and
+/// parentheses (it is the free-form thread name), so fields are counted
+/// from after the LAST `)`: the remainder starts at field 3 (state),
+/// putting utime at whitespace-index 11 and stime at 12.
+fn stat_cpu_ticks(stat: &str) -> Option<u64> {
+    let rest = &stat[stat.rfind(')')? + 1..];
+    let mut fields = rest.split_whitespace();
+    let utime: u64 = fields.nth(11)?.parse().ok()?;
+    let stime: u64 = fields.next()?.parse().ok()?;
+    Some(utime + stime)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::stat_cpu_ticks;
+
+    #[test]
+    fn stat_parser_survives_nasty_comm() {
+        // comm = "(a b) c": contains spaces, a nested '(' and an early ')'.
+        // Fields after the last ')': state ppid pgrp session tty_nr tpgid
+        // flags minflt cminflt majflt cmajflt utime stime ...
+        let line = "1234 ((a b) c) R 1 2 3 4 5 6 7 8 9 10 42 58 0 0 20 0 1 0 100 0 0";
+        assert_eq!(stat_cpu_ticks(line), Some(42 + 58));
+    }
+
+    #[test]
+    fn stat_parser_plain_comm() {
+        let line = "77 (tokio-runtime-w) S 1 77 77 0 -1 4194368 0 0 0 0 3 4 0 0 20 0 1 0 5 0 0";
+        assert_eq!(stat_cpu_ticks(line), Some(7));
+    }
+
+    #[test]
+    fn stat_parser_rejects_malformed_lines() {
+        assert_eq!(stat_cpu_ticks(""), None);
+        assert_eq!(stat_cpu_ticks("1234 no-parens R 1 2"), None);
+        // Truncated before utime/stime.
+        assert_eq!(stat_cpu_ticks("1234 (x) R 1 2 3 4 5 6 7 8 9 10"), None);
+        // Non-numeric utime.
+        assert_eq!(
+            stat_cpu_ticks("1234 (x) R 1 2 3 4 5 6 7 8 9 10 nope 58"),
+            None
+        );
+    }
 }

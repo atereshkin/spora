@@ -26,7 +26,7 @@ use spora_lab::topology::{Topology, TopologySpec};
 use spora_lab::{ECHO_TCP_PORT, ECHO_UDP_PORT, NatKind, WAN_SERVICES_IP, netem};
 
 fn main() {
-    spora_lab::harness::lab_main(
+    let ok = spora_lab::harness::lab_main(
         "nat_matrix",
         spora_lab::scenarios![
             open_open_direct,
@@ -36,6 +36,7 @@ fn main() {
             symmetric_symmetric_fallback,
         ],
     );
+    std::process::exit(if ok { 0 } else { 1 });
 }
 
 // ---------------------------------------------------------------------------

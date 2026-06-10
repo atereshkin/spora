@@ -8,6 +8,7 @@
 //! one pinned OS thread + current-thread tokio runtime per simulated host.
 
 pub mod harness;
+pub mod metrics;
 pub mod nat;
 pub mod netem;
 pub mod netns;
@@ -56,6 +57,9 @@ pub const ECHO_UDP_PORT: u16 = 7;
 /// used by smoke tests to verify NAT mapping behavior.
 pub const WHOAMI_UDP_PORT: u16 = 7001;
 pub const ECHO_TCP_PORT: u16 = 7002;
+/// Bulk TCP source (download) / sink (upload) services for one-directional
+/// throughput measurement; defined next to the other extra wan services.
+pub use services::{TCP_SINK_PORT, TCP_SOURCE_PORT};
 
 /// Inner (tunneled) source address the lab client crafts packets from.
 pub const CLIENT_INNER_IP: std::net::Ipv4Addr = std::net::Ipv4Addr::new(10, 200, 0, 2);

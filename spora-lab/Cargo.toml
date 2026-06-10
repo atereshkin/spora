@@ -15,10 +15,11 @@ log = "0.4.22"
 env_logger = "0.11"
 etherparse = "0.16.0"
 smoltcp = { version = "0.12", default-features = false, features = [
-    "std", "log", "medium-ip", "proto-ipv4", "socket-tcp",
+    "std", "log", "medium-ip", "proto-ipv4", "socket-tcp", "socket-tcp-cubic",
 ] }
 url = "2.5.7"
 libc = "0.2"
+serde_json = "1"
 
 # Lab suites manage namespaces from main() and must run scenarios
 # sequentially inside one process, so they bypass libtest.
@@ -36,6 +37,12 @@ harness = false
 
 [[test]]
 name = "conditions"
+harness = false
+
+# Performance regression suite: shaped-link hard gates + report-only
+# metrics (see docs/lab.md, "Performance regression control").
+[[test]]
+name = "perf"
 harness = false
 
 # Plain tokio test (no namespaces): validates the traffic drivers over a

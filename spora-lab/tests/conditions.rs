@@ -15,7 +15,7 @@ use spora_lab::topology::{Topology, TopologySpec};
 use spora_lab::{ECHO_TCP_PORT, ECHO_UDP_PORT, NatKind, WAN_SERVICES_IP, netem};
 
 fn main() {
-    spora_lab::harness::lab_main(
+    let ok = spora_lab::harness::lab_main(
         "conditions",
         spora_lab::scenarios![
             latency_jitter,
@@ -24,6 +24,7 @@ fn main() {
             slow_link_bulk,
         ],
     );
+    std::process::exit(if ok { 0 } else { 1 });
 }
 
 // ---------------------------------------------------------------------------

@@ -77,6 +77,13 @@ async fn udp_echo_over_loopback_relay() {
         stats.rtt_min <= stats.rtt_avg && stats.rtt_avg <= stats.rtt_max,
         "inconsistent RTTs: {stats:?}"
     );
+    assert!(
+        stats.rtt_min <= stats.rtt_p50
+            && stats.rtt_p50 <= stats.rtt_p95
+            && stats.rtt_p95 <= stats.rtt_max,
+        "inconsistent RTT percentiles: {stats:?}"
+    );
+    assert!(stats.rtt_p50 > Duration::ZERO, "zero p50 with 20 echoes in: {stats:?}");
     assert!(stats.rtt_max < Duration::from_secs(5), "absurd RTT: {stats:?}");
 
     // wait_event semantics: both RelaySessionEstablished events fired during
@@ -136,6 +143,95 @@ async fn udp_echo_over_loopback_relay() {
         .expect("pump exits when the command channel closes")
         .unwrap();
     session.abort();
+}
+
+/// `TrafficCmd::CpuTime` must return a growing value as the pump does work.
+///
+/// Uses the default current-thread flavor deliberately: the pump task is
+/// then pinned to this one thread for its whole life (exactly like a lab
+/// host's runtime), so consecutive `CLOCK_THREAD_CPUTIME_ID` readings are
+/// comparable. On a multi-thread runtime the pump could migrate between
+/// workers and the readings would be from different clocks.
+#[tokio::test]
+async fn pump_cpu_time_grows_with_work() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let relay_sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay socket");
+    let relay_addr = relay_sock.local_addr().unwrap();
+    let _relay_task = tokio::spawn(relay::serve(relay_sock, relay::State::default()));
+
+    let mut opts = LabPeerOpts::new(relay_addr, "127.0.0.1:3478");
+    opts.enable_direct_upgrade = false;
+
+    let (mut share_cfg, _share_events) = opts.config();
+    share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
+    let session = spora_core::share(Identity::generate(), share_cfg)
+        .await
+        .expect("share() starts");
+
+    let (client_cfg, _client_events) = opts.config();
+    let connected = spora_core::connect(session.url.clone(), &client_cfg)
+        .await
+        .expect("connect() establishes the relay-via session");
+
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pump = tokio::spawn(peers::drive_client(connected, cmd_rx));
+
+    let cpu_before = pump_cpu(&cmd_tx).await;
+    // The QUIC handshake already burned cycles on this thread.
+    assert!(cpu_before > Duration::ZERO, "zero CPU after a QUIC handshake");
+
+    // 30 echoes' worth of pump + QUIC work, all on this same thread; the
+    // run also covers the p50/p95 ordering on a fresh stats instance.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(TrafficCmd::UdpEcho {
+            server: FAKE_SERVER,
+            count: 30,
+            payload_len: 64,
+            respond: tx,
+        })
+        .expect("pump is alive");
+    let stats = tokio::time::timeout(Duration::from_secs(30), rx)
+        .await
+        .expect("echo finishes within the deadline")
+        .expect("pump answers the command")
+        .expect("echo run succeeds");
+    assert!(stats.received > 0, "no echoes came back: {stats:?}");
+    assert!(
+        stats.rtt_min <= stats.rtt_p50
+            && stats.rtt_p50 <= stats.rtt_p95
+            && stats.rtt_p95 <= stats.rtt_max,
+        "inconsistent RTT percentiles: {stats:?}"
+    );
+    assert!(stats.rtt_p95 < Duration::from_secs(5), "absurd p95: {stats:?}");
+
+    let cpu_after = pump_cpu(&cmd_tx).await;
+    assert!(
+        cpu_after > cpu_before,
+        "thread CPU time did not grow across an echo run: {cpu_before:?} -> {cpu_after:?}"
+    );
+
+    drop(cmd_tx);
+    tokio::time::timeout(Duration::from_secs(5), pump)
+        .await
+        .expect("pump exits when the command channel closes")
+        .unwrap();
+    session.abort();
+}
+
+async fn pump_cpu(cmd_tx: &tokio::sync::mpsc::UnboundedSender<TrafficCmd>) -> Duration {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(TrafficCmd::CpuTime { respond: tx })
+        .expect("pump is alive");
+    tokio::time::timeout(Duration::from_secs(5), rx)
+        .await
+        .expect("cpu time answered within the deadline")
+        .expect("pump answers the command")
+        .expect("clock_gettime(CLOCK_THREAD_CPUTIME_ID) succeeds")
 }
 
 /// Session handler that reflects IPv4/UDP packets: swap src/dst addresses

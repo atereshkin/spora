@@ -32,12 +32,15 @@ pub fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
 }
 
 /// Enter the lab namespaces, then run every scenario (optionally filtered by
-/// substring args), reporting results libtest-style. Exits non-zero on any
-/// failure. If the environment cannot host the lab (no userns, missing
-/// tools), prints a SKIPPED line and returns cleanly so `cargo test` passes —
-/// unless `SPORA_LAB=require` is set (CI), in which case a skip is a FAILURE:
-/// a silently-skipping lab would certify nothing while staying green.
-pub fn lab_main(suite: &str, scenarios: &[Scenario]) {
+/// substring args), reporting results libtest-style. Returns `false` if any
+/// scenario failed — the caller decides the exit code, so suites with
+/// end-of-run work (the perf suite's metrics table/JSON) can still do it on
+/// failure. A skip (environment cannot host the lab, or `SPORA_LAB=skip`)
+/// returns `true` so `cargo test` passes — unless `SPORA_LAB=require` is set
+/// (CI), in which case a skip exits 1 immediately: a silently-skipping lab
+/// would certify nothing while staying green.
+#[must_use = "exit non-zero when this returns false"]
+pub fn lab_main(suite: &str, scenarios: &[Scenario]) -> bool {
     let require = std::env::var("SPORA_LAB").as_deref() == Ok("require");
     let skip = |reason: &str| {
         if require {
@@ -48,7 +51,7 @@ pub fn lab_main(suite: &str, scenarios: &[Scenario]) {
     };
     if std::env::var("SPORA_LAB").as_deref() == Ok("skip") {
         println!("{suite}: SKIPPED (SPORA_LAB=skip)");
-        return;
+        return true;
     }
     // Make sbin tools (tc, iptables) visible regardless of the user's PATH.
     // Safe: we are single-threaded here.
@@ -71,13 +74,13 @@ pub fn lab_main(suite: &str, scenarios: &[Scenario]) {
         }
         Err(NamespaceError::Environment(e)) => {
             skip(&format!("cannot enter namespaces: {e}"));
-            return;
+            return true;
         }
     }
     for tool in ["ip", "tc", "iptables"] {
         if !tool_exists(tool) {
             skip(&format!("missing required tool: {tool}"));
-            return;
+            return true;
         }
     }
 
@@ -109,6 +112,7 @@ pub fn lab_main(suite: &str, scenarios: &[Scenario]) {
 
     if failures.is_empty() {
         println!("\n{suite}: ok. {} passed", selected.len());
+        true
     } else {
         println!("\nfailures:");
         for (name, err) in &failures {
@@ -119,7 +123,7 @@ pub fn lab_main(suite: &str, scenarios: &[Scenario]) {
             selected.len() - failures.len(),
             failures.len()
         );
-        std::process::exit(1);
+        false
     }
 }
 

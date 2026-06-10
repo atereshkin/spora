@@ -24,7 +24,7 @@ use spora_lab::traffic::EchoStats;
 use spora_lab::{ECHO_UDP_PORT, NatKind, WAN_SERVICES_IP, WHOAMI_UDP_PORT, netem};
 
 fn main() {
-    spora_lab::harness::lab_main(
+    let ok = spora_lab::harness::lab_main(
         "resilience",
         spora_lab::scenarios![
             relay_restart_recovery,
@@ -33,6 +33,7 @@ fn main() {
             sharer_session_replacement,
         ],
     );
+    std::process::exit(if ok { 0 } else { 1 });
 }
 
 // ---------------------------------------------------------------------------

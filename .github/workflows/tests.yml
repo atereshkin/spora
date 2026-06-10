@@ -38,3 +38,16 @@ jobs:
           # otherwise a runner-image change could disable all e2e coverage
           # while the build stays green.
           SPORA_LAB: require
+          # Perf-suite metrics snapshot (test binaries run with the package
+          # dir as cwd, so the path must be absolute), uploaded below for
+          # trend tracking / perf-diff between commits (docs/lab.md,
+          # "Performance regression control").
+          SPORA_LAB_PERF_JSON: ${{ github.workspace }}/lab-perf.json
+
+      - name: Upload perf metrics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-perf
+          path: lab-perf.json
+          if-no-files-found: warn

@@ -1,16 +1,18 @@
 //! In-process wan services, all running on one host thread inside the wan
 //! namespace: the real relay (`relay::serve`), a minimal STUN responder,
-//! UDP/TCP echo, and UDP "whoami" responders (reply with the observed source
-//! `ip:port` as ASCII — lets tests verify NAT mapping behavior directly).
+//! UDP/TCP echo, UDP "whoami" responders (reply with the observed source
+//! `ip:port` as ASCII — lets tests verify NAT mapping behavior directly),
+//! and bulk TCP source/sink services for one-directional throughput tests.
 //!
 //! Implementation notes:
 //! - `start_wan(&wan_ns, relay_state)` spawns ONE host via `Netns::spawn_host`;
 //!   inside it, everything binds on [`crate::WAN_SERVICES_IP`] at the
 //!   [`crate::RELAY_PORT`]/[`crate::STUN_PORT`]/[`crate::ECHO_UDP_PORT`]/
-//!   [`crate::WHOAMI_UDP_PORT`]/[`WHOAMI2_UDP_PORT`]/[`crate::ECHO_TCP_PORT`]
-//!   constants, each service runs as a tokio task, and readiness (or a bind
-//!   error) is reported back through a std mpsc channel that `start_wan`
-//!   blocks on — bind errors are returned, not logged-and-lost.
+//!   [`crate::WHOAMI_UDP_PORT`]/[`WHOAMI2_UDP_PORT`]/[`crate::ECHO_TCP_PORT`]/
+//!   [`TCP_SOURCE_PORT`]/[`TCP_SINK_PORT`] constants, each service runs as a
+//!   tokio task, and readiness (or a bind error) is reported back through a
+//!   std mpsc channel that `start_wan` blocks on — bind errors are returned,
+//!   not logged-and-lost.
 //! - `relay_state` is a FACTORY (`Fn() -> relay::State`), not a value:
 //!   `restart_relay` calls it again for a fresh `State`, so scenarios with
 //!   scaled-down relay timeouts keep them across restarts.
@@ -32,7 +34,7 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
-use tokio::io::AsyncWriteExt as _;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, UdpSocket};
 use tokio::task::JoinHandle;
 
@@ -42,6 +44,14 @@ use crate::{ECHO_TCP_PORT, ECHO_UDP_PORT, RELAY_PORT, STUN_PORT, WAN_SERVICES_IP
 /// Second whoami responder: NAT mapping comparisons need two distinct wan
 /// destination endpoints queried from one client socket.
 pub const WHOAMI2_UDP_PORT: u16 = 7003;
+/// Bulk TCP source: reads an 8-byte big-endian byte count, sends exactly
+/// that many pattern bytes, closes. Download-direction throughput tests use
+/// it so bulk data crosses the tunnel in only one direction (unlike the TCP
+/// echo, which doubles every byte).
+pub const TCP_SOURCE_PORT: u16 = 7004;
+/// Bulk TCP sink: counts bytes until EOF, replies with the count as 8 bytes
+/// big-endian, closes. Upload-direction counterpart of [`TCP_SOURCE_PORT`].
+pub const TCP_SINK_PORT: u16 = 7005;
 
 const STUN_COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
 
@@ -53,7 +63,7 @@ enum Cmd {
 pub struct WanHandle {
     cmds: tokio::sync::mpsc::UnboundedSender<Cmd>,
     relay_addr: SocketAddr,
-    _host: HostHandle,
+    host: HostHandle,
 }
 
 impl WanHandle {
@@ -85,6 +95,13 @@ impl WanHandle {
     pub fn stun_server(&self) -> String {
         format!("{WAN_SERVICES_IP}:{STUN_PORT}")
     }
+
+    /// CPU time consumed by the wan-services host thread (relay + all
+    /// service tasks — they share one current-thread runtime). Perf-suite
+    /// report metric. See [`HostHandle::cpu_time`].
+    pub fn cpu_time(&self) -> Option<Duration> {
+        self.host.cpu_time()
+    }
 }
 
 /// Start all wan services; blocks until they are bound and ready.
@@ -107,14 +124,14 @@ where
                 bind_udp(svc_ip, ECHO_UDP_PORT).await?,
                 bind_udp(svc_ip, WHOAMI_UDP_PORT).await?,
                 bind_udp(svc_ip, WHOAMI2_UDP_PORT).await?,
-                TcpListener::bind((svc_ip, ECHO_TCP_PORT))
-                    .await
-                    .map_err(|e| format!("bind tcp {svc_ip}:{ECHO_TCP_PORT}: {e}"))?,
+                bind_tcp(svc_ip, ECHO_TCP_PORT).await?,
+                bind_tcp(svc_ip, TCP_SOURCE_PORT).await?,
+                bind_tcp(svc_ip, TCP_SINK_PORT).await?,
                 bind_udp(svc_ip, RELAY_PORT).await?,
             ))
         }
         .await;
-        let (stun, echo, who1, who2, tcp, relay_sock) = match bound {
+        let (stun, echo, who1, who2, tcp, source, sink, relay_sock) = match bound {
             Ok(socks) => socks,
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
@@ -126,6 +143,8 @@ where
         tokio::spawn(udp_whoami(who1));
         tokio::spawn(udp_whoami(who2));
         tokio::spawn(tcp_echo(tcp));
+        tokio::spawn(tcp_source(source));
+        tokio::spawn(tcp_sink(sink));
         let mut relay_task: Option<JoinHandle<()>> =
             Some(tokio::spawn(relay::serve(relay_sock, relay_state())));
         let _ = ready_tx.send(Ok(()));
@@ -152,7 +171,7 @@ where
     })?;
 
     match ready_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(())) => Ok(WanHandle { cmds: cmd_tx, relay_addr, _host: host }),
+        Ok(Ok(())) => Ok(WanHandle { cmds: cmd_tx, relay_addr, host }),
         Ok(Err(e)) => Err(format!("wan services: {e}")),
         Err(e) => Err(format!("wan services never became ready: {e}")),
     }
@@ -162,6 +181,12 @@ async fn bind_udp(ip: Ipv4Addr, port: u16) -> Result<UdpSocket, String> {
     UdpSocket::bind((ip, port))
         .await
         .map_err(|e| format!("bind udp {ip}:{port}: {e}"))
+}
+
+async fn bind_tcp(ip: Ipv4Addr, port: u16) -> Result<TcpListener, String> {
+    TcpListener::bind((ip, port))
+        .await
+        .map_err(|e| format!("bind tcp {ip}:{port}: {e}"))
 }
 
 /// Abort the relay task and *await* it, guaranteeing its socket is dropped
@@ -208,6 +233,64 @@ async fn tcp_echo(listener: TcpListener) {
                 });
             }
             Err(e) => log::warn!("tcp echo accept: {e}"),
+        }
+    }
+}
+
+/// Chunk size for the bulk source/sink: large writes/reads keep the wan-side
+/// syscall overhead out of throughput measurements.
+const BULK_CHUNK: usize = 256 * 1024;
+
+/// [`TCP_SOURCE_PORT`]: per connection, read an 8-byte big-endian count N,
+/// send exactly N pattern bytes ((i % 251) repeating per chunk), close.
+async fn tcp_source(listener: TcpListener) {
+    loop {
+        match listener.accept().await {
+            Ok((mut conn, _)) => {
+                tokio::spawn(async move {
+                    let mut req = [0u8; 8];
+                    if conn.read_exact(&mut req).await.is_err() {
+                        return;
+                    }
+                    let mut remaining =
+                        usize::try_from(u64::from_be_bytes(req)).unwrap_or(usize::MAX);
+                    let chunk: Vec<u8> = (0..BULK_CHUNK).map(|i| (i % 251) as u8).collect();
+                    while remaining > 0 {
+                        let n = remaining.min(chunk.len());
+                        if conn.write_all(&chunk[..n]).await.is_err() {
+                            return;
+                        }
+                        remaining -= n;
+                    }
+                    let _ = conn.shutdown().await;
+                });
+            }
+            Err(e) => log::warn!("tcp source accept: {e}"),
+        }
+    }
+}
+
+/// [`TCP_SINK_PORT`]: per connection, count bytes until EOF, write the count
+/// back as 8 bytes big-endian, close.
+async fn tcp_sink(listener: TcpListener) {
+    loop {
+        match listener.accept().await {
+            Ok((mut conn, _)) => {
+                tokio::spawn(async move {
+                    let mut buf = vec![0u8; BULK_CHUNK];
+                    let mut total: u64 = 0;
+                    loop {
+                        match conn.read(&mut buf).await {
+                            Ok(0) => break,
+                            Ok(n) => total += n as u64,
+                            Err(_) => return,
+                        }
+                    }
+                    let _ = conn.write_all(&total.to_be_bytes()).await;
+                    let _ = conn.shutdown().await;
+                });
+            }
+            Err(e) => log::warn!("tcp sink accept: {e}"),
         }
     }
 }

@@ -22,7 +22,7 @@ use spora_lab::{
 };
 
 fn main() {
-    spora_lab::harness::lab_main(
+    let ok = spora_lab::harness::lab_main(
         "smoke",
         spora_lab::scenarios![
             connectivity_basic,
@@ -33,6 +33,7 @@ fn main() {
             peers_netstack_validation,
         ],
     );
+    std::process::exit(if ok { 0 } else { 1 });
 }
 
 // ---------------------------------------------------------------------------

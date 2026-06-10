@@ -15,7 +15,7 @@
 //!   entry refreshes on outbound only. Echoes are matched by a 12-byte
 //!   payload tag (sequence number + nonce) **prefix**, so responders that
 //!   pad their replies (used to provoke share→client fragmentation) still
-//!   match. Per-packet RTT min/avg/max and loss are reported in
+//!   match. Per-packet RTT min/avg/max/p50/p95 and loss are reported in
 //!   [`EchoStats`].
 //! - **TCP bulk**: a smoltcp `Interface` over a custom in-memory device
 //!   (rx = queue fed by the pump, tx = drained straight into the transport
@@ -27,6 +27,13 @@
 //!   `bytes` while reading the echo back until all bytes round-trip →
 //!   close. `iface.poll` is driven from the pump loop with
 //!   `poll_delay`-based timers.
+//! - **TCP download / upload** (perf suites): the same smoltcp machinery
+//!   pointed at the wan source/sink services, so bulk data crosses the
+//!   tunnel in ONE direction (the echo doubles every byte). Socket buffer
+//!   sizes and congestion control (None vs Cubic) come from [`TcpOpts`];
+//!   the default matches TcpBulk's historical 64 KiB / no-CC behavior.
+//!   [`TrafficCmd::CpuTime`] reports the pump thread's CPU time
+//!   (CLOCK_THREAD_CPUTIME_ID) for perf accounting.
 //!
 //! Both drivers tolerate unrelated inbound packets interleaving (keepalive
 //! ICMP, stale echo replies, ...): everything inbound flows through an IPv4
@@ -63,6 +70,10 @@ pub struct EchoStats {
     pub rtt_min: std::time::Duration,
     pub rtt_avg: std::time::Duration,
     pub rtt_max: std::time::Duration,
+    /// Median per-packet RTT (nearest-rank percentile over received echoes).
+    pub rtt_p50: std::time::Duration,
+    /// 95th-percentile per-packet RTT.
+    pub rtt_p95: std::time::Duration,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +85,28 @@ pub struct BulkStats {
 impl BulkStats {
     pub fn throughput_mbps(&self) -> f64 {
         (self.bytes as f64 * 8.0) / self.elapsed.as_secs_f64() / 1_000_000.0
+    }
+}
+
+/// Per-command knobs for the smoltcp TCP socket used by [`TrafficCmd::TcpDownload`]
+/// / [`TrafficCmd::TcpUpload`]. The defaults match the long-standing
+/// [`TrafficCmd::TcpBulk`] behavior (64 KiB buffers, `CongestionControl::None`);
+/// perf suites pass 512 KiB / 512 KiB / cubic so the client stack is not the
+/// bottleneck being measured.
+#[derive(Debug, Clone)]
+pub struct TcpOpts {
+    pub recv_buf: usize,
+    pub send_buf: usize,
+    pub cubic: bool,
+}
+
+impl Default for TcpOpts {
+    fn default() -> Self {
+        Self {
+            recv_buf: 64 * 1024,
+            send_buf: 64 * 1024,
+            cubic: false,
+        }
     }
 }
 
@@ -89,6 +122,30 @@ pub enum TrafficCmd {
         server: std::net::SocketAddrV4,
         bytes: usize,
         respond: tokio::sync::oneshot::Sender<Result<BulkStats, String>>,
+    },
+    /// Download `bytes` from the wan TCP source service: connect, send the
+    /// 8-byte big-endian request, receive exactly `bytes`. `elapsed` runs
+    /// from connection establishment to the last byte.
+    TcpDownload {
+        server: std::net::SocketAddrV4,
+        bytes: usize,
+        opts: TcpOpts,
+        respond: tokio::sync::oneshot::Sender<Result<BulkStats, String>>,
+    },
+    /// Upload `bytes` to the wan TCP sink service: connect, send, half-close
+    /// (FIN), await the 8-byte big-endian count ack and verify it. `elapsed`
+    /// runs from the first send to the ack.
+    TcpUpload {
+        server: std::net::SocketAddrV4,
+        bytes: usize,
+        opts: TcpOpts,
+        respond: tokio::sync::oneshot::Sender<Result<BulkStats, String>>,
+    },
+    /// CPU time of the PUMP THREAD (`CLOCK_THREAD_CPUTIME_ID`). Handled
+    /// inline on the pump task, so on the lab's current-thread host runtimes
+    /// this is exactly the client-side tunnel + driver compute.
+    CpuTime {
+        respond: tokio::sync::oneshot::Sender<Result<Duration, String>>,
     },
 }
 
@@ -169,6 +226,35 @@ impl TrafficPump {
                 };
                 let _ = respond.send(result);
             }
+            TrafficCmd::TcpDownload {
+                server,
+                bytes,
+                opts,
+                respond,
+            } => {
+                let result = if self.dead {
+                    Err("transport is closed".to_string())
+                } else {
+                    self.tcp_download(server, bytes, &opts).await
+                };
+                let _ = respond.send(result);
+            }
+            TrafficCmd::TcpUpload {
+                server,
+                bytes,
+                opts,
+                respond,
+            } => {
+                let result = if self.dead {
+                    Err("transport is closed".to_string())
+                } else {
+                    self.tcp_upload(server, bytes, &opts).await
+                };
+                let _ = respond.send(result);
+            }
+            TrafficCmd::CpuTime { respond } => {
+                let _ = respond.send(thread_cpu_time());
+            }
         }
     }
 
@@ -246,8 +332,9 @@ impl TrafficPump {
             }
         }
 
-        let rtt_min = rtts.iter().min().copied().unwrap_or(Duration::ZERO);
-        let rtt_max = rtts.iter().max().copied().unwrap_or(Duration::ZERO);
+        rtts.sort_unstable();
+        let rtt_min = rtts.first().copied().unwrap_or(Duration::ZERO);
+        let rtt_max = rtts.last().copied().unwrap_or(Duration::ZERO);
         let rtt_avg = if rtts.is_empty() {
             Duration::ZERO
         } else {
@@ -259,15 +346,15 @@ impl TrafficPump {
             rtt_min,
             rtt_avg,
             rtt_max,
+            rtt_p50: percentile(&rtts, 50.0),
+            rtt_p95: percentile(&rtts, 95.0),
         })
     }
 
     /// Run a real TCP connection (smoltcp) against `server`, write `bytes`
     /// of a deterministic pattern and read the echo back, verifying content.
     async fn tcp_bulk(&mut self, server: SocketAddrV4, bytes: usize) -> Result<BulkStats, String> {
-        use smoltcp::iface::{Config as IfaceConfig, Interface, SocketSet};
         use smoltcp::socket::tcp;
-        use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
 
         /// Abort if neither direction makes progress for this long.
         const PROGRESS_TIMEOUT: Duration = Duration::from_secs(20);
@@ -281,36 +368,10 @@ impl TrafficPump {
         let started = std::time::Instant::now();
         let local_port = self.alloc_port();
 
-        let mut device = SmolDevice::default();
-        let mut iface_cfg = IfaceConfig::new(HardwareAddress::Ip);
-        iface_cfg.random_seed = fresh_nonce();
-        let mut iface = Interface::new(iface_cfg, &mut device, SmolInstant::now());
-        // Mirror a host that owns CLIENT_INNER_IP: the address on a /24,
-        // a default route, and any-ip (parity with the share-side stack).
-        iface.set_any_ip(true);
-        iface.update_ip_addrs(|addrs| {
-            addrs
-                .push(IpCidr::new(IpAddress::Ipv4(CLIENT_INNER_IP), 24))
-                .expect("first interface address always fits");
-        });
-        iface
-            .routes_mut()
-            .add_default_ipv4_route(INNER_GATEWAY)
-            .map_err(|e| format!("default route: {e}"))?;
-
-        let mut sockets = SocketSet::new(vec![]);
-        let handle = sockets.add(tcp::Socket::new(
-            tcp::SocketBuffer::new(vec![0; 64 * 1024]),
-            tcp::SocketBuffer::new(vec![0; 64 * 1024]),
-        ));
-        sockets
-            .get_mut::<tcp::Socket>(handle)
-            .connect(
-                iface.context(),
-                (IpAddress::Ipv4(*server.ip()), server.port()),
-                local_port,
-            )
-            .map_err(|e| format!("tcp connect: {e}"))?;
+        // Default opts == the historical hardcoded behavior: 64 KiB buffers,
+        // CongestionControl::None.
+        let (mut device, mut iface, mut sockets, handle) =
+            tcp_session(server, local_port, &TcpOpts::default())?;
 
         let data: Vec<u8> = (0..bytes).map(|i| (i % 251) as u8).collect();
         let mut scratch = vec![0u8; 16 * 1024];
@@ -427,6 +488,356 @@ impl TrafficPump {
             elapsed: started.elapsed(),
         })
     }
+
+    /// Download `bytes` from the wan TCP source service: send the 8-byte
+    /// big-endian request, receive exactly `bytes` (content not verified —
+    /// TCP checksums already cover integrity and the wan pattern is opaque
+    /// here). `elapsed` runs from connection establishment to the last byte.
+    async fn tcp_download(
+        &mut self,
+        server: SocketAddrV4,
+        bytes: usize,
+        opts: &TcpOpts,
+    ) -> Result<BulkStats, String> {
+        use smoltcp::socket::tcp;
+
+        const PROGRESS_TIMEOUT: Duration = Duration::from_secs(20);
+        const MAX_IDLE: Duration = Duration::from_millis(20);
+
+        let local_port = self.alloc_port();
+        let (mut device, mut iface, mut sockets, handle) = tcp_session(server, local_port, opts)?;
+
+        let mut scratch = vec![0u8; 64 * 1024];
+        let mut request_sent = false;
+        let mut received = 0usize;
+        let mut started: Option<std::time::Instant> = None; // set when established
+        let mut elapsed: Option<Duration> = None;
+        let mut reasm = Reassembler::default();
+        let mut last_progress = std::time::Instant::now();
+
+        loop {
+            iface.poll(SmolInstant::now(), &mut device, &mut sockets);
+            while let Some(frame) = device.tx.pop_front() {
+                self.transport
+                    .send(frame)
+                    .await
+                    .map_err(|e| format!("tcp download: transport send: {e}"))?;
+            }
+
+            {
+                let sock = sockets.get_mut::<tcp::Socket>(handle);
+
+                if !request_sent && sock.can_send() {
+                    // Connection just became established: the clock starts
+                    // here, and the length request goes out first.
+                    started = Some(std::time::Instant::now());
+                    let n = sock
+                        .send_slice(&(bytes as u64).to_be_bytes())
+                        .map_err(|e| format!("tcp download: request send: {e}"))?;
+                    if n != 8 {
+                        return Err("tcp download: could not queue the 8-byte request".into());
+                    }
+                    request_sent = true;
+                    last_progress = std::time::Instant::now();
+                }
+
+                while sock.can_recv() && received < bytes {
+                    let want = scratch.len().min(bytes - received);
+                    let n = sock
+                        .recv_slice(&mut scratch[..want])
+                        .map_err(|e| format!("tcp download recv: {e}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    received += n;
+                    last_progress = std::time::Instant::now();
+                }
+
+                if received >= bytes {
+                    elapsed = Some(
+                        started
+                            .expect("bytes were received, so the connection was established")
+                            .elapsed(),
+                    );
+                    sock.close();
+                } else if sock.state() == tcp::State::Closed {
+                    return Err(format!(
+                        "tcp download: connection closed early ({received}/{bytes})"
+                    ));
+                }
+            }
+
+            if let Some(elapsed) = elapsed {
+                // Best-effort: push the FIN/ACK we just queued, then finish —
+                // the measurement is done, no need to sit out the handshake.
+                iface.poll(SmolInstant::now(), &mut device, &mut sockets);
+                while let Some(frame) = device.tx.pop_front() {
+                    let _ = self.transport.send(frame).await;
+                }
+                return Ok(BulkStats {
+                    bytes: received,
+                    elapsed,
+                });
+            }
+            if last_progress.elapsed() > PROGRESS_TIMEOUT {
+                return Err(format!("tcp download stalled ({received}/{bytes})"));
+            }
+
+            let delay = iface
+                .poll_delay(SmolInstant::now(), &sockets)
+                .map(|d| Duration::from_micros(d.total_micros()))
+                .unwrap_or(MAX_IDLE)
+                .min(MAX_IDLE);
+            if delay.is_zero() {
+                continue;
+            }
+
+            tokio::select! {
+                pkt = self.transport.next() => match pkt {
+                    Some(Ok(p)) => {
+                        if let Some(full) = reasm.push(p)
+                            && is_session_tcp(&full, server, local_port)
+                        {
+                            device.rx.push_back(full);
+                        }
+                    }
+                    Some(Err(e)) => log::warn!("tcp download: transport error: {e}"),
+                    None => {
+                        self.dead = true;
+                        return Err(format!(
+                            "transport closed mid-download ({received}/{bytes})"
+                        ));
+                    }
+                },
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    }
+
+    /// Upload `bytes` to the wan TCP sink service: send a deterministic
+    /// pattern, half-close (FIN), await the sink's 8-byte big-endian byte
+    /// count and verify it equals `bytes`. `elapsed` runs from the first
+    /// send to the complete ack.
+    async fn tcp_upload(
+        &mut self,
+        server: SocketAddrV4,
+        bytes: usize,
+        opts: &TcpOpts,
+    ) -> Result<BulkStats, String> {
+        use smoltcp::socket::tcp;
+
+        const PROGRESS_TIMEOUT: Duration = Duration::from_secs(20);
+        const MAX_IDLE: Duration = Duration::from_millis(20);
+
+        let local_port = self.alloc_port();
+        let (mut device, mut iface, mut sockets, handle) = tcp_session(server, local_port, opts)?;
+
+        let data: Vec<u8> = (0..bytes).map(|i| (i % 251) as u8).collect();
+        let mut written = 0usize;
+        let mut fin_sent = false;
+        let mut started: Option<std::time::Instant> = None; // first send
+        let mut ack = [0u8; 8];
+        let mut ack_len = 0usize;
+        let mut elapsed: Option<Duration> = None;
+        let mut reasm = Reassembler::default();
+        let mut last_progress = std::time::Instant::now();
+
+        loop {
+            iface.poll(SmolInstant::now(), &mut device, &mut sockets);
+            while let Some(frame) = device.tx.pop_front() {
+                self.transport
+                    .send(frame)
+                    .await
+                    .map_err(|e| format!("tcp upload: transport send: {e}"))?;
+            }
+
+            {
+                let sock = sockets.get_mut::<tcp::Socket>(handle);
+
+                while sock.can_send() && written < bytes {
+                    if started.is_none() {
+                        started = Some(std::time::Instant::now());
+                    }
+                    let n = sock
+                        .send_slice(&data[written..])
+                        .map_err(|e| format!("tcp upload send: {e}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    written += n;
+                    last_progress = std::time::Instant::now();
+                }
+
+                if written >= bytes && !fin_sent && sock.may_send() {
+                    if started.is_none() {
+                        started = Some(std::time::Instant::now()); // bytes == 0 edge
+                    }
+                    sock.close(); // FIN goes out after the queued data drains
+                    fin_sent = true;
+                    last_progress = std::time::Instant::now();
+                }
+
+                // The sink's count ack stays readable even after the close
+                // handshake races ahead: smoltcp keeps a non-empty rx buffer
+                // receivable in any state.
+                while sock.can_recv() && ack_len < 8 {
+                    let n = sock
+                        .recv_slice(&mut ack[ack_len..])
+                        .map_err(|e| format!("tcp upload: ack recv: {e}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    ack_len += n;
+                    last_progress = std::time::Instant::now();
+                }
+
+                if ack_len == 8 {
+                    elapsed = Some(
+                        started
+                            .expect("the ack implies data was sent")
+                            .elapsed(),
+                    );
+                    let counted = u64::from_be_bytes(ack);
+                    if counted != bytes as u64 {
+                        return Err(format!(
+                            "tcp upload: sink counted {counted} bytes, expected {bytes}"
+                        ));
+                    }
+                } else if matches!(sock.state(), tcp::State::Closed | tcp::State::TimeWait) {
+                    // Remote FIN processed and rx drained: the rest of the
+                    // ack can never arrive.
+                    return Err(format!(
+                        "tcp upload: connection closed before the count ack \
+                         (wrote {written}/{bytes}, ack {ack_len}/8)"
+                    ));
+                }
+            }
+
+            if let Some(elapsed) = elapsed {
+                // Best-effort final flush (ACK of the sink's FIN), then done.
+                iface.poll(SmolInstant::now(), &mut device, &mut sockets);
+                while let Some(frame) = device.tx.pop_front() {
+                    let _ = self.transport.send(frame).await;
+                }
+                return Ok(BulkStats { bytes, elapsed });
+            }
+            if last_progress.elapsed() > PROGRESS_TIMEOUT {
+                return Err(format!(
+                    "tcp upload stalled (wrote {written}/{bytes}, ack {ack_len}/8)"
+                ));
+            }
+
+            let delay = iface
+                .poll_delay(SmolInstant::now(), &sockets)
+                .map(|d| Duration::from_micros(d.total_micros()))
+                .unwrap_or(MAX_IDLE)
+                .min(MAX_IDLE);
+            if delay.is_zero() {
+                continue;
+            }
+
+            tokio::select! {
+                pkt = self.transport.next() => match pkt {
+                    Some(Ok(p)) => {
+                        if let Some(full) = reasm.push(p)
+                            && is_session_tcp(&full, server, local_port)
+                        {
+                            device.rx.push_back(full);
+                        }
+                    }
+                    Some(Err(e)) => log::warn!("tcp upload: transport error: {e}"),
+                    None => {
+                        self.dead = true;
+                        return Err(format!(
+                            "transport closed mid-upload (wrote {written}/{bytes})"
+                        ));
+                    }
+                },
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    }
+}
+
+/// Build the smoltcp interface plus one TCP socket (already `connect`ed to
+/// `server` from `local_port`) over a fresh [`SmolDevice`], applying `opts`'
+/// buffer sizes and congestion control. Shared by TcpBulk / TcpDownload /
+/// TcpUpload.
+#[allow(clippy::type_complexity)]
+fn tcp_session(
+    server: SocketAddrV4,
+    local_port: u16,
+    opts: &TcpOpts,
+) -> Result<
+    (
+        SmolDevice,
+        smoltcp::iface::Interface,
+        smoltcp::iface::SocketSet<'static>,
+        smoltcp::iface::SocketHandle,
+    ),
+    String,
+> {
+    use smoltcp::iface::{Config as IfaceConfig, Interface, SocketSet};
+    use smoltcp::socket::tcp;
+    use smoltcp::wire::{HardwareAddress, IpAddress, IpCidr};
+
+    let mut device = SmolDevice::default();
+    let mut iface_cfg = IfaceConfig::new(HardwareAddress::Ip);
+    iface_cfg.random_seed = fresh_nonce();
+    let mut iface = Interface::new(iface_cfg, &mut device, SmolInstant::now());
+    // Mirror a host that owns CLIENT_INNER_IP: the address on a /24,
+    // a default route, and any-ip (parity with the share-side stack).
+    iface.set_any_ip(true);
+    iface.update_ip_addrs(|addrs| {
+        addrs
+            .push(IpCidr::new(IpAddress::Ipv4(CLIENT_INNER_IP), 24))
+            .expect("first interface address always fits");
+    });
+    iface
+        .routes_mut()
+        .add_default_ipv4_route(INNER_GATEWAY)
+        .map_err(|e| format!("default route: {e}"))?;
+
+    let mut sockets = SocketSet::new(vec![]);
+    let mut sock = tcp::Socket::new(
+        tcp::SocketBuffer::new(vec![0; opts.recv_buf]),
+        tcp::SocketBuffer::new(vec![0; opts.send_buf]),
+    );
+    if opts.cubic {
+        sock.set_congestion_control(tcp::CongestionControl::Cubic);
+    }
+    let handle = sockets.add(sock);
+    sockets
+        .get_mut::<tcp::Socket>(handle)
+        .connect(
+            iface.context(),
+            (IpAddress::Ipv4(*server.ip()), server.port()),
+            local_port,
+        )
+        .map_err(|e| format!("tcp connect: {e}"))?;
+    Ok((device, iface, sockets, handle))
+}
+
+/// CPU time consumed by the CALLING thread
+/// (`clock_gettime(CLOCK_THREAD_CPUTIME_ID)`).
+pub fn thread_cpu_time() -> Result<Duration, String> {
+    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
+        return Err(format!(
+            "clock_gettime(CLOCK_THREAD_CPUTIME_ID): {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(Duration::new(ts.tv_sec as u64, ts.tv_nsec as u32))
+}
+
+/// Nearest-rank percentile over an ascending-sorted slice; ZERO when empty.
+fn percentile(sorted: &[Duration], p: f64) -> Duration {
+    if sorted.is_empty() {
+        return Duration::ZERO;
+    }
+    let rank = ((p / 100.0) * sorted.len() as f64).ceil() as usize;
+    sorted[rank.clamp(1, sorted.len()) - 1]
 }
 
 /// A random-enough u64 without a rand dependency: `RandomState` is seeded
@@ -773,6 +1184,22 @@ mod tests {
             off = end;
         }
         frags
+    }
+
+    #[test]
+    fn percentile_nearest_rank() {
+        let ms = |n: u64| Duration::from_millis(n);
+        assert_eq!(percentile(&[], 50.0), Duration::ZERO);
+        assert_eq!(percentile(&[ms(7)], 50.0), ms(7));
+        assert_eq!(percentile(&[ms(7)], 95.0), ms(7));
+        let sorted: Vec<Duration> = (1..=100).map(ms).collect();
+        assert_eq!(percentile(&sorted, 50.0), ms(50));
+        assert_eq!(percentile(&sorted, 95.0), ms(95));
+        assert_eq!(percentile(&sorted, 100.0), ms(100));
+        // 4 samples: p50 = ceil(2) = 2nd, p95 = ceil(3.8) = 4th.
+        let four = [ms(1), ms(2), ms(3), ms(4)];
+        assert_eq!(percentile(&four, 50.0), ms(2));
+        assert_eq!(percentile(&four, 95.0), ms(4));
     }
 
     #[test]
