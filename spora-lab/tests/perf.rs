@@ -29,14 +29,11 @@ use std::time::{Duration, Instant};
 
 use spora_core::TunnelEvent;
 use spora_lab::metrics;
-use spora_lab::netns::{HostHandle, Netns};
 use spora_lab::peers::{self, ClientHandle, LabPeerOpts, SharerHandle};
 use spora_lab::services;
 use spora_lab::topology::{Topology, TopologySpec};
 use spora_lab::traffic::TcpOpts;
-use spora_lab::{ECHO_UDP_PORT, NatKind, WAN_SERVICES_IP, netem};
-use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
-use tokio::net::TcpListener;
+use spora_lab::{ECHO_UDP_PORT, NatKind, TCP_SINK_PORT, TCP_SOURCE_PORT, WAN_SERVICES_IP, netem};
 
 fn main() {
     let mut ok = spora_lab::harness::lab_main(
@@ -85,119 +82,6 @@ fn svc_ip() -> Ipv4Addr {
 
 fn svc(port: u16) -> SocketAddrV4 {
     SocketAddrV4::new(svc_ip(), port)
-}
-
-/// Perf-suite-local TCP source/sink ports (see [`start_perf_tcp_services`]).
-const PERF_SOURCE_PORT: u16 = 7104;
-const PERF_SINK_PORT: u16 = 7105;
-
-/// PRODUCT BUG WORKAROUND — suite-local TCP source/sink that never
-/// half-close while response data may still be buffered share-side.
-///
-/// The stock wan source ([`spora_lab::TCP_SOURCE_PORT`]) closes the moment
-/// it wrote its N bytes. Through the production netstack that EOF TRUNCATES
-/// the stream tail: spora-core's `handle_tcp_streams` propagates the
-/// kernel-socket EOF via `copy_bidirectional` → `poll_shutdown` on the
-/// netstack-smoltcp 0.2.0 `TcpStream`, whose `poll_flush` is a no-op and
-/// whose `poll_shutdown` marks the write half `Close` with data still in
-/// its internal ring buffer; the netstack runner then processes SHUT_WR
-/// (smoltcp `socket.close()`) BEFORE its ring→socket drain, and `can_send()`
-/// is false after `close()` — so up to a full ring (0x3FFF*20 = 327,660 B)
-/// of tail data is silently dropped and the FIN goes out early. First perf
-/// runs reproduced it on EVERY multi-MiB download: the client stalls
-/// 286–319 KiB short of the requested size (deficit ≈ the ring size). The
-/// sink's 8-byte ack can be lost to the same close-before-drain race.
-/// Real-world shape: a wan server that half-closes right after its response
-/// (HTTP `Connection: close`) gets the response tail eaten. The fix belongs
-/// in netstack-smoltcp (defer `close()` until the ring is empty / make
-/// `poll_flush` honest) or in spora-core's proxy.
-///
-/// These variants speak the same wire protocol as the stock services
-/// (8-byte big-endian count) but hold the connection open afterwards, so
-/// the share side never sees a wan-side EOF with data in flight. Swap back
-/// to `TCP_SOURCE_PORT`/`TCP_SINK_PORT` once the product bug is fixed —
-/// that swap is itself the regression test.
-fn start_perf_tcp_services(wan: &Netns) -> Result<HostHandle, String> {
-    const CHUNK: usize = 256 * 1024;
-    let ip = svc_ip();
-    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-    let host = wan.spawn_host("perf-tcp", move |_cancel| async move {
-        let bound = async {
-            Ok::<_, String>((
-                TcpListener::bind((ip, PERF_SOURCE_PORT))
-                    .await
-                    .map_err(|e| format!("bind perf source: {e}"))?,
-                TcpListener::bind((ip, PERF_SINK_PORT))
-                    .await
-                    .map_err(|e| format!("bind perf sink: {e}"))?,
-            ))
-        }
-        .await;
-        let (source, sink) = match bound {
-            Ok(socks) => socks,
-            Err(e) => {
-                let _ = ready_tx.send(Err(e));
-                return;
-            }
-        };
-        let _ = ready_tx.send(Ok(()));
-
-        // Source: read the 8-byte count, send exactly N pattern bytes, then
-        // hold the connection until the CLIENT closes (drain to EOF).
-        let src_loop = async {
-            loop {
-                let Ok((mut conn, _)) = source.accept().await else { continue };
-                tokio::spawn(async move {
-                    let mut req = [0u8; 8];
-                    if conn.read_exact(&mut req).await.is_err() {
-                        return;
-                    }
-                    let mut remaining =
-                        usize::try_from(u64::from_be_bytes(req)).unwrap_or(usize::MAX);
-                    let chunk: Vec<u8> = (0..CHUNK).map(|i| (i % 251) as u8).collect();
-                    while remaining > 0 {
-                        let n = remaining.min(chunk.len());
-                        if conn.write_all(&chunk[..n]).await.is_err() {
-                            return;
-                        }
-                        remaining -= n;
-                    }
-                    // No shutdown: wait for the client's FIN instead.
-                    let mut scratch = [0u8; 1024];
-                    while matches!(conn.read(&mut scratch).await, Ok(n) if n > 0) {}
-                });
-            }
-        };
-        // Sink: count bytes until EOF, ack the count — then PARK instead of
-        // closing (the client already has its measurement; teardown happens
-        // with the scenario's host).
-        let sink_loop = async {
-            loop {
-                let Ok((mut conn, _)) = sink.accept().await else { continue };
-                tokio::spawn(async move {
-                    let mut buf = vec![0u8; CHUNK];
-                    let mut total: u64 = 0;
-                    loop {
-                        match conn.read(&mut buf).await {
-                            Ok(0) => break,
-                            Ok(n) => total += n as u64,
-                            Err(_) => return,
-                        }
-                    }
-                    if conn.write_all(&total.to_be_bytes()).await.is_err() {
-                        return;
-                    }
-                    tokio::time::sleep(Duration::from_secs(3600)).await;
-                    drop(conn);
-                });
-            }
-        };
-        tokio::join!(src_loop, sink_loop);
-    })?;
-    ready_rx
-        .recv_timeout(Duration::from_secs(10))
-        .map_err(|e| format!("perf tcp services not ready: {e}"))??;
-    Ok(host)
 }
 
 fn relay_established(e: &TunnelEvent) -> bool {
@@ -264,13 +148,13 @@ fn shaped_saturation(client: &ClientHandle, path: &str) -> Result<(), String> {
     const DOWNLOAD_GATE: f64 = 25.0;
     const UPLOAD_GATE: f64 = 28.0;
 
-    let dl = client.tcp_download(svc(PERF_SOURCE_PORT), 16 * MIB, perf_opts(), BULK_TIMEOUT)?;
+    let dl = client.tcp_download(svc(TCP_SOURCE_PORT), 16 * MIB, perf_opts(), BULK_TIMEOUT)?;
     let dl_mbps = dl.throughput_mbps();
     metrics::record(&format!("download_mbps.{path}.shaped50"), dl_mbps, "mbps", true, 15.0);
 
     // The upload sender is the lab's own smoltcp stack (not the production
     // netstack), hence the slightly laxer gate.
-    let ul = client.tcp_upload(svc(PERF_SINK_PORT), 8 * MIB, perf_opts(), BULK_TIMEOUT)?;
+    let ul = client.tcp_upload(svc(TCP_SINK_PORT), 8 * MIB, perf_opts(), BULK_TIMEOUT)?;
     let ul_mbps = ul.throughput_mbps();
     metrics::record(&format!("upload_mbps.{path}.shaped50"), ul_mbps, "mbps", true, 15.0);
 
@@ -305,7 +189,6 @@ fn relay_saturation() -> Result<(), String> {
         NatKind::PortRestricted,
     ))?;
     let wan = services::start_wan(&topo.wan, relay::State::default)?;
-    let _perf_tcp = start_perf_tcp_services(&topo.wan)?;
     shape_client_leg(&topo, "rate 50mbit delay 5ms")?;
 
     let mut opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
@@ -345,7 +228,6 @@ fn direct_saturation() -> Result<(), String> {
 
     let topo = Topology::build(&TopologySpec::new(NatKind::Open, NatKind::Open))?;
     let wan = services::start_wan(&topo.wan, relay::State::default)?;
-    let _perf_tcp = start_perf_tcp_services(&topo.wan)?;
     shape_client_leg(&topo, "rate 50mbit delay 5ms")?;
 
     let opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
@@ -411,7 +293,6 @@ fn bdp_window() -> Result<(), String> {
         NatKind::PortRestricted,
     ))?;
     let wan = services::start_wan(&topo.wan, relay::State::default)?;
-    let _perf_tcp = start_perf_tcp_services(&topo.wan)?;
     shape_client_leg(&topo, "rate 50mbit delay 20ms")?;
 
     let mut opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
@@ -419,13 +300,13 @@ fn bdp_window() -> Result<(), String> {
 
     let (sharer, client, _) = establish(&topo, &opts)?;
 
-    let dl = client.tcp_download(svc(PERF_SOURCE_PORT), 16 * MIB, perf_opts(), BULK_TIMEOUT)?;
+    let dl = client.tcp_download(svc(TCP_SOURCE_PORT), 16 * MIB, perf_opts(), BULK_TIMEOUT)?;
     let dl_mbps = dl.throughput_mbps();
     metrics::record("download_mbps.relay.bdp40ms", dl_mbps, "mbps", true, 15.0);
 
     // 8 MiB (not 16) for the window-limited control: at its ~13 Mbit/s
     // ceiling it already takes ~5 s; the value is a ceiling, not a race.
-    let dl64 = client.tcp_download(svc(PERF_SOURCE_PORT), 8 * MIB, TcpOpts::default(), BULK_TIMEOUT)?;
+    let dl64 = client.tcp_download(svc(TCP_SOURCE_PORT), 8 * MIB, TcpOpts::default(), BULK_TIMEOUT)?;
     let dl64_mbps = dl64.throughput_mbps();
     metrics::record("download_mbps.relay.bdp40ms.win64k", dl64_mbps, "mbps", true, 15.0);
 
@@ -552,7 +433,6 @@ fn efficiency_report() -> Result<(), String> {
 
     let topo = Topology::build(&TopologySpec::new(NatKind::Open, NatKind::Open))?;
     let wan = services::start_wan(&topo.wan, relay::State::default)?;
-    let _perf_tcp = start_perf_tcp_services(&topo.wan)?;
     let opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
 
     let mut sharer = peers::start_sharer(&topo.sharer, &opts)?;
@@ -576,7 +456,7 @@ fn efficiency_report() -> Result<(), String> {
     let client_cpu0 = client.pump_cpu_time(Duration::from_secs(10))?;
     let sharer_cpu0 = sharer.cpu_time();
 
-    let dl = client.tcp_download(svc(PERF_SOURCE_PORT), DOWNLOAD_BYTES, perf_opts(), BULK_TIMEOUT)?;
+    let dl = client.tcp_download(svc(TCP_SOURCE_PORT), DOWNLOAD_BYTES, perf_opts(), BULK_TIMEOUT)?;
 
     let client_cpu1 = client.pump_cpu_time(Duration::from_secs(10))?;
     let sharer_cpu1 = sharer.cpu_time();
@@ -600,7 +480,7 @@ fn efficiency_report() -> Result<(), String> {
         }
     };
 
-    let ul = client.tcp_upload(svc(PERF_SINK_PORT), UPLOAD_BYTES, perf_opts(), BULK_TIMEOUT)?;
+    let ul = client.tcp_upload(svc(TCP_SINK_PORT), UPLOAD_BYTES, perf_opts(), BULK_TIMEOUT)?;
     let ul_mbps = ul.throughput_mbps();
     metrics::record("upload_mbps.direct.unshaped", ul_mbps, "mbps", true, 35.0);
 

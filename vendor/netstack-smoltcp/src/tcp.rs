@@ -233,16 +233,10 @@ impl TcpListenerRunner {
                     continue;
                 }
 
-                // SHUT_WR
-                if matches!(control.send_state, TcpSocketState::Close) {
-                    trace!("closing TCP Write Half, {:?}", socket.state());
-
-                    // Close the socket. Set to FIN state
-                    socket.close();
-                    control.send_state = TcpSocketState::Closing;
-
-                    // We can still process the pending buffer.
-                }
+                // SHUT_WR is handled AFTER the writable drain below — closing
+                // here would move the socket to FIN-WAIT (can_send() == false)
+                // before the still-buffered tail is pushed into smoltcp,
+                // silently truncating the stream.
 
                 // Check if readable
                 let mut wake_receiver = false;
@@ -322,6 +316,18 @@ impl TcpListenerRunner {
                             break;
                         }
                     }
+                }
+
+                // SHUT_WR: everything the writer handed us is now in smoltcp's
+                // tx buffer, so it is safe to send the FIN. (Deferred from
+                // above so the drain loop isn't skipped — see the note there.)
+                if matches!(control.send_state, TcpSocketState::Close)
+                    && control.send_buffer.is_empty()
+                {
+                    trace!("closing TCP Write Half (drained), {:?}", socket.state());
+                    socket.close();
+                    control.send_state = TcpSocketState::Closing;
+                    wake_sender = true;
                 }
 
                 if wake_sender && control.send_waker.is_some() {
