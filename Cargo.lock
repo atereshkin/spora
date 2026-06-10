@@ -5319,6 +5319,7 @@ version = "0.1.0"
 dependencies = [
  "clap",
  "env_logger",
+ "etherparse",
  "futures-util",
  "log",
  "spora-core",

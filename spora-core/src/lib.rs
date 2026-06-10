@@ -6,7 +6,9 @@ pub mod signal;
 pub mod transport;
 pub mod tun_util;
 
+use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 use std::time::Duration;
@@ -16,7 +18,7 @@ use quinn::Connection;
 use stunclient::StunClient;
 use tokio::net::UdpSocket;
 use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
+pub use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::e2e::{accept_one, client_connect, client_endpoint, server_endpoint, E2eSession};
@@ -28,6 +30,7 @@ use crate::transport::quic::QuicPeerTransport;
 use crate::transport::upgradable::{upgradable_transport, UpgradeSender};
 use crate::transport::DialFuture;
 use crate::transport::ReconnectTransport;
+pub use crate::server::is_local_address;
 pub use crate::transport::IpTransport;
 
 /// Callback invoked once after the end-to-end QUIC connection's PMTUD has
@@ -35,6 +38,30 @@ pub use crate::transport::IpTransport;
 pub type MtuCallback = Option<Arc<dyn Fn(u16) + Send + Sync>>;
 
 pub type SocketProtector = Option<Arc<dyn Fn(i32) + Send + Sync>>;
+
+/// Future driving one share-side session; it should resolve when the session
+/// ends (transport closed/errored) or its cancellation token fires.
+pub type SessionFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+/// Invoked once per accepted client session when `ExitMode::Custom` is set.
+/// Receives the fully composed session transport (keepalive + upgradable +
+/// QUIC) and a token that is cancelled when a new peer replaces this session
+/// or the share stops.
+pub type SessionHandler = Arc<dyn Fn(IpTransport, CancellationToken) -> SessionFuture + Send + Sync>;
+
+/// How the share side turns tunneled IP packets into real traffic.
+#[derive(Clone, Default)]
+pub enum ExitMode {
+    /// Userland smoltcp netstack (default). Unprivileged: TCP/UDP flows are
+    /// terminated in-process and re-originated from ordinary OS sockets.
+    #[default]
+    Netstack,
+    /// Bypass the netstack: hand each session's `IpTransport` to the
+    /// application, which is expected to move packets into the OS (e.g. a TUN
+    /// device plus kernel forwarding/NAT). Requires privileges on the caller's
+    /// side; the core still owns accept, registration, and direct upgrade.
+    Custom(SessionHandler),
+}
 
 /// Call the protector callback with the socket's raw fd (unix only).
 pub fn protect_socket(protector: &SocketProtector, _socket: &UdpSocket) {
@@ -67,6 +94,8 @@ pub struct Config {
     pub relay_port: u16,
     pub protector: SocketProtector,
     pub mtu_callback: MtuCallback,
+    /// Share side only: what consumes the tunneled IP packets.
+    pub exit_mode: ExitMode,
 }
 
 impl Default for Config {
@@ -77,6 +106,7 @@ impl Default for Config {
             relay_port: 443,
             protector: None,
             mtu_callback: None,
+            exit_mode: ExitMode::Netstack,
         }
     }
 }
@@ -241,8 +271,14 @@ fn spawn_responder_tunnel(
         });
     }
 
+    let session_fut: SessionFuture = match &config.exit_mode {
+        ExitMode::Netstack => Box::pin(async move {
+            let _ = server::start_tunnel(transport, protector_for_tunnel, tunnel_cancel, true).await;
+        }),
+        ExitMode::Custom(handler) => handler(transport, tunnel_cancel),
+    };
     tokio::spawn(async move {
-        let _ = server::start_tunnel(transport, protector_for_tunnel, tunnel_cancel, true).await;
+        session_fut.await;
         upgrade_task.abort();
         drop(router_handle);
     });

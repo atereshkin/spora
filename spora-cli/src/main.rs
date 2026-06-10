@@ -1,9 +1,12 @@
 #[cfg(not(windows))]
-use spora_core::{connect, identity::Identity, share, tun_util, Config};
+use spora_core::{connect, identity::Identity, share, tun_util, Config, ExitMode};
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
 use tokio_tun::Tun;
 use url::Url;
+
+#[cfg(not(windows))]
+mod os_route;
 
 /// Use jemalloc on non-Windows. The default glibc allocator holds onto pages
 /// under heavy alloc/free churn (every IP packet on the share side allocates
@@ -33,6 +36,22 @@ enum Mode {
         /// persisted one.
         #[arg(long)]
         fresh: bool,
+        /// Bypass the userland netstack: write client packets to a TUN device
+        /// and let the kernel route/NAT them. Requires root (or
+        /// CAP_NET_ADMIN). Linux only.
+        #[arg(long)]
+        os_routing: bool,
+        /// TUN interface address in CIDR form (with --os-routing).
+        #[arg(long, default_value = "10.213.0.1/24", requires = "os_routing")]
+        tun_addr: String,
+        /// TUN MTU (with --os-routing).
+        #[arg(long, default_value_t = 1280, requires = "os_routing")]
+        tun_mtu: u16,
+        /// With --os-routing: don't touch ip_forward or iptables. You are
+        /// responsible for forwarding + NAT; per-client return routes on the
+        /// TUN are still installed.
+        #[arg(long, requires = "os_routing")]
+        no_nat: bool,
     },
     Use {
         url: String,
@@ -53,17 +72,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::Share {
             identity_file,
             fresh,
+            os_routing,
+            tun_addr,
+            tun_mtu,
+            no_nat,
         } => {
             let path = identity_file.unwrap_or_else(default_identity_path);
             let identity = load_or_create_identity(&path, fresh)?;
-            let session = share(identity, Config::default()).await?;
+            let mut config = Config::default();
+            let mut routing = None;
+            if os_routing {
+                let opts = os_route::Options::parse(&tun_addr, tun_mtu, !no_nat)?;
+                let guard = os_route::OsRoute::setup(&opts)?;
+                config.exit_mode = ExitMode::Custom(guard.session_handler());
+                routing = Some(guard);
+            }
+            let session = share(identity, config).await?;
             println!("Share this URL with the peer that wants to connect:");
             println!("{}", session.url);
             println!("(Identity persisted at {})", path.display());
+            if let Some(g) = &routing {
+                println!(
+                    "OS routing enabled: client traffic is forwarded by the kernel via {}.",
+                    g.tun_name()
+                );
+            }
             println!("Press Ctrl+C to stop sharing.");
-            tokio::signal::ctrl_c().await?;
+            wait_for_shutdown().await?;
             println!("Stopping share session...");
             session.stop().await;
+            // `routing` (if any) drops here, after the session has stopped,
+            // running OsRoute's cleanup. Dropping at scope end — rather than an
+            // explicit call — means cleanup also runs if `share()` errored above
+            // or the task panicked.
+            drop(routing);
         }
         Mode::Use { url } => {
             #[cfg(windows)]
@@ -85,6 +127,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     Ok(())
+}
+
+/// Wait for an interactive (Ctrl+C / SIGINT) or service (SIGTERM) shutdown
+/// signal. Handling SIGTERM matters for `--os-routing`: `systemctl stop` and
+/// `kill` send SIGTERM, and we want OsRoute's cleanup to run before we exit.
+async fn wait_for_shutdown() -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{signal, SignalKind};
+        let mut term = signal(SignalKind::terminate())?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r,
+            _ = term.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        tokio::signal::ctrl_c().await
+    }
 }
 
 #[cfg(not(windows))]

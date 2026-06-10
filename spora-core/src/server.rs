@@ -212,7 +212,7 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
 
 /// Returns `true` if the address belongs to a private, loopback, link-local,
 /// or otherwise non-public IP range that should not be reachable through the tunnel.
-fn is_local_address(addr: IpAddr) -> bool {
+pub fn is_local_address(addr: IpAddr) -> bool {
     match addr {
         IpAddr::V4(ip) => {
             let o = ip.octets();
