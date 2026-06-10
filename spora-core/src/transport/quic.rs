@@ -12,9 +12,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
-const QUIC_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
-const QUIC_KEEP_ALIVE: Duration = Duration::from_secs(10);
-
 /// SHA-256 fingerprint of a DER-encoded certificate.
 pub fn cert_fingerprint(cert_der: &[u8]) -> [u8; 32] {
     let digest = ring::digest::digest(&ring::digest::SHA256, cert_der);
@@ -311,10 +308,12 @@ impl congestion::ControllerFactory for NoopCcFactory {
     }
 }
 
-pub fn build_transport_config() -> quinn::TransportConfig {
+/// Build the shared QUIC transport config. `idle_timeout` / `keep_alive`
+/// come from [`crate::Timings`] (defaults: 30s / 10s).
+pub fn build_transport_config(idle_timeout: Duration, keep_alive: Duration) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
-    transport.max_idle_timeout(Some(QUIC_IDLE_TIMEOUT.try_into().unwrap()));
-    transport.keep_alive_interval(Some(QUIC_KEEP_ALIVE));
+    transport.max_idle_timeout(Some(idle_timeout.try_into().unwrap()));
+    transport.keep_alive_interval(Some(keep_alive));
     transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     transport.datagram_send_buffer_size(8 * 1024 * 1024);
     transport.initial_mtu(1200);

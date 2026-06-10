@@ -10,7 +10,7 @@ use tokio::net::UdpSocket as TokioUdp;
 
 use spora_core::e2e::{client_connect, client_endpoint, E2eSession};
 use spora_core::identity::{Identity, Token};
-use spora_core::{share, Config, ExitMode, SessionHandler};
+use spora_core::{share, Config, ExitMode, SessionHandler, Timings};
 
 fn icmp_echo(seq: u16) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(64);
@@ -58,7 +58,8 @@ async fn custom_exit_mode_pumps_packets() {
 
     let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     b_std.set_nonblocking(true).unwrap();
-    let b_endpoint = client_endpoint(b_std, token.routing_key).expect("client_endpoint");
+    let b_endpoint =
+        client_endpoint(b_std, token.routing_key, &Timings::default()).expect("client_endpoint");
     let endpoint = Box::leak(Box::new(b_endpoint));
     let E2eSession {
         conn: _conn,

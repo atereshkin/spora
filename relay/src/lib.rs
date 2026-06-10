@@ -27,10 +27,18 @@ pub const RECV_BUF: usize = 4096;
 
 pub type RoutingKey = [u8; ROUTING_KEY_LEN];
 
-#[derive(Default)]
 pub struct State {
     registrations: HashMap<RoutingKey, (SocketAddr, Instant)>,
     flows: HashMap<SocketAddr, (SocketAddr, Instant)>,
+    registration_timeout: Duration,
+    flow_timeout: Duration,
+    sweep_interval: Duration,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self::with_timeouts(REGISTRATION_TIMEOUT, FLOW_TIMEOUT, SWEEP_INTERVAL)
+    }
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -40,6 +48,23 @@ pub enum Action {
 }
 
 impl State {
+    /// Build a `State` with custom expiry timeouts and sweep cadence
+    /// (defaults: 120s / 60s / 5s). Used by tests and the e2e lab to make
+    /// expiry scenarios run in seconds of wall time.
+    pub fn with_timeouts(
+        registration_timeout: Duration,
+        flow_timeout: Duration,
+        sweep_interval: Duration,
+    ) -> State {
+        State {
+            registrations: HashMap::new(),
+            flows: HashMap::new(),
+            registration_timeout,
+            flow_timeout,
+            sweep_interval,
+        }
+    }
+
     /// Decide what to do with a packet from `src`. Updates internal state
     /// (registrations, flow timestamps) and returns the address to forward
     /// the bytes to, or `Drop`.
@@ -124,10 +149,12 @@ impl State {
     pub fn sweep(&mut self, now: Instant) {
         let before_reg = self.registrations.len();
         let before_flows = self.flows.len();
+        let registration_timeout = self.registration_timeout;
+        let flow_timeout = self.flow_timeout;
         self.registrations
-            .retain(|_, (_, ts)| now.duration_since(*ts) < REGISTRATION_TIMEOUT);
+            .retain(|_, (_, ts)| now.duration_since(*ts) < registration_timeout);
         self.flows
-            .retain(|_, (_, ts)| now.duration_since(*ts) < FLOW_TIMEOUT);
+            .retain(|_, (_, ts)| now.duration_since(*ts) < flow_timeout);
         let reg_removed = before_reg - self.registrations.len();
         let flow_removed = before_flows - self.flows.len();
         if reg_removed + flow_removed > 0 {
@@ -165,7 +192,7 @@ pub async fn serve(socket: UdpSocket, mut state: State) {
         {
             warn!("send_to {} ({} bytes) failed: {}", dst, n, e);
         }
-        if now.duration_since(last_sweep) >= SWEEP_INTERVAL {
+        if now.duration_since(last_sweep) >= state.sweep_interval {
             state.sweep(now);
             last_sweep = now;
         }

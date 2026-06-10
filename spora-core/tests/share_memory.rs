@@ -15,7 +15,7 @@ use tokio::net::UdpSocket as TokioUdp;
 
 use spora_core::e2e::{client_connect, client_endpoint, E2eSession};
 use spora_core::identity::{Identity, Token};
-use spora_core::{Config, share};
+use spora_core::{Config, Timings, share};
 
 fn rss_kb() -> usize {
     let s = std::fs::read_to_string("/proc/self/statm").expect("read /proc/self/statm");
@@ -57,7 +57,8 @@ async fn start_share() -> (std::net::SocketAddr, Token, spora_core::ShareSession
 async fn open_client(relay_addr: std::net::SocketAddr, token: &Token) -> E2eSession {
     let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
     b_std.set_nonblocking(true).unwrap();
-    let b_endpoint = client_endpoint(b_std, token.routing_key).expect("client_endpoint");
+    let b_endpoint =
+        client_endpoint(b_std, token.routing_key, &Timings::default()).expect("client_endpoint");
     // Endpoint must outlive the connection; we leak it deliberately for the
     // lifetime of the test process (tests are short-lived).
     let endpoint = Box::leak(Box::new(b_endpoint));

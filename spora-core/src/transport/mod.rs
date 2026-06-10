@@ -105,7 +105,8 @@ impl Sink<Vec<u8>> for UdpTransport {
 }
 
 
-const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
+/// Default sleep after a failed dial (see `Timings::reconnect_delay`).
+pub(crate) const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
 
 pub(crate) type DialFuture = Pin<Box<dyn Future<Output = io::Result<IpTransport>> + Send>>;
 type Dialer = Box<dyn FnMut() -> DialFuture + Send>;
@@ -125,19 +126,21 @@ enum ReconnectState {
 pub struct ReconnectTransport {
     dialer: Dialer,
     state: ReconnectState,
+    delay: std::time::Duration,
 }
 
 impl ReconnectTransport {
-    pub fn new(initial: IpTransport, dialer: Dialer) -> Self {
+    pub fn new(initial: IpTransport, dialer: Dialer, delay: std::time::Duration) -> Self {
         Self {
             dialer,
             state: ReconnectState::Connected(initial),
+            delay,
         }
     }
 
     fn begin_sleep(&mut self) {
-        debug!("Sleeping for {} seconds before reconnecting.", RECONNECT_DELAY.as_secs());
-        self.state = ReconnectState::Sleeping(Box::pin(sleep(RECONNECT_DELAY)));
+        debug!("Sleeping for {} seconds before reconnecting.", self.delay.as_secs());
+        self.state = ReconnectState::Sleeping(Box::pin(sleep(self.delay)));
     }
 
     fn begin_dial(&mut self) {
@@ -272,7 +275,7 @@ mod tests {
     async fn reconnect_passes_packets_through() {
         let (local, mut remote) = mock_transport_pair();
         let dialer: Dialer = Box::new(|| Box::pin(async { unreachable!("should not dial") }));
-        let mut rt = ReconnectTransport::new(Box::new(local), dialer);
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
 
         // Send from remote, receive on reconnect transport
         remote.send(vec![1, 2, 3]).await.unwrap();
@@ -306,7 +309,7 @@ mod tests {
             })
         });
 
-        let mut rt = ReconnectTransport::new(Box::new(local), dialer);
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
 
         // The first poll should see None from the dead inner, dial, and then pend (new transport is idle)
         tokio::time::timeout(std::time::Duration::from_millis(100), rt.next()).await.ok();
@@ -341,7 +344,7 @@ mod tests {
             })
         });
 
-        let mut rt = ReconnectTransport::new(Box::new(local), dialer);
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
 
         // Drive the transport: it should fail twice, sleep between, then succeed
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -385,7 +388,7 @@ mod tests {
             })
         });
 
-        let mut rt = ReconnectTransport::new(Box::new(local), dialer);
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
 
         // First, poll_next to drive past the None from the closed stream and reconnect
         tokio::time::timeout(std::time::Duration::from_millis(100), rt.next()).await.ok();
@@ -424,7 +427,7 @@ mod tests {
             })
         });
 
-        let mut rt = ReconnectTransport::new(Box::new(local), dialer);
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
 
         // Poll to drive: None → Dial → fail → Sleeping
         tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
@@ -444,7 +447,7 @@ mod tests {
             Box::pin(futures_util::future::pending())
         });
 
-        let mut rt = ReconnectTransport::new(Box::new(local), dialer);
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
 
         // Poll to drive: None → begin_dial → Dialing(pending)
         tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
@@ -463,7 +466,7 @@ mod tests {
         let (local, mut handle) = mock_transport();
 
         let dialer: Dialer = Box::new(|| Box::pin(async { unreachable!("should not dial") }));
-        let reconnect = Box::new(ReconnectTransport::new(Box::new(local), dialer)) as IpTransport;
+        let reconnect = Box::new(ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY)) as IpTransport;
 
         let ka_cfg = KeepAliveConfig {
             mode: KeepAliveMode::Periodic {
@@ -524,7 +527,7 @@ mod tests {
             })
         });
 
-        let reconnect = Box::new(ReconnectTransport::new(Box::new(local), dialer)) as IpTransport;
+        let reconnect = Box::new(ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY)) as IpTransport;
 
         let ka_cfg = KeepAliveConfig {
             mode: KeepAliveMode::Periodic {

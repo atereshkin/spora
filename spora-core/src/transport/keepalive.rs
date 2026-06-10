@@ -43,6 +43,15 @@ pub struct KeepAliveConfig {
     pub dst_ip: Ipv4Addr,
     pub icmp_id: u16,
     pub mode: KeepAliveMode,
+    /// Adaptive mode: an outbound packet after this much send-silence
+    /// re-activates probing (and is the on-demand probe interval at knob 0).
+    pub idle_threshold: std::time::Duration,
+    /// Adaptive mode: how long after a ping to wait for any inbound before
+    /// the response deadline fires.
+    pub response_timeout: std::time::Duration,
+    /// Adaptive mode: inbound within this window keeps the peer alive when
+    /// the response deadline fires.
+    pub inbound_grace: std::time::Duration,
 }
 
 impl Default for KeepAliveConfig {
@@ -55,6 +64,9 @@ impl Default for KeepAliveConfig {
                 interval: std::time::Duration::from_secs(10),
                 recv_timeout: None,
             },
+            idle_threshold: IDLE_THRESHOLD,
+            response_timeout: RESPONSE_TIMEOUT,
+            inbound_grace: INBOUND_GRACE,
         }
     }
 }
@@ -64,7 +76,7 @@ enum KeepAliveSendState {
     Sending(Vec<u8>),
 }
 
-// --- Adaptive mode constants ---
+// --- Adaptive mode defaults (see KeepAliveConfig fields) ---
 const IDLE_THRESHOLD: std::time::Duration = std::time::Duration::from_secs(20);
 const RESPONSE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
 const INBOUND_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -263,7 +275,7 @@ impl KeepAliveTransport {
                             self.send_state = KeepAliveSendState::Sending(pkt);
                             state.probe = ProbeState::Probing {
                                 ping_timer: Box::pin(sleep(interval)),
-                                response_deadline: Box::pin(sleep(RESPONSE_TIMEOUT)),
+                                response_deadline: Box::pin(sleep(self.cfg.response_timeout)),
                             };
                         } else {
                             // Park the task — set_keepalive() will wake us via the
@@ -286,7 +298,7 @@ impl KeepAliveTransport {
                                 debug!("Keepalive: ping timer fired, sending ICMP echo");
                                 self.send_state = KeepAliveSendState::Sending(pkt);
                                 ping_timer.as_mut().reset(Instant::now() + interval);
-                                response_deadline.as_mut().reset(Instant::now() + RESPONSE_TIMEOUT);
+                                response_deadline.as_mut().reset(Instant::now() + self.cfg.response_timeout);
                             }
                         }
                     }
@@ -303,7 +315,8 @@ impl KeepAliveTransport {
                 timer.as_mut().reset(Instant::now() + *interval);
             }
             ModeState::Adaptive { knob, state, .. } => {
-                let was_idle = Instant::now().duration_since(state.last_real_outbound) > IDLE_THRESHOLD;
+                let was_idle =
+                    Instant::now().duration_since(state.last_real_outbound) > self.cfg.idle_threshold;
                 state.last_real_outbound = Instant::now();
 
                 if matches!(state.probe, ProbeState::Dormant) && was_idle {
@@ -311,7 +324,7 @@ impl KeepAliveTransport {
                     let interval = if knob_val > 0 {
                         std::time::Duration::from_secs(knob_val)
                     } else {
-                        IDLE_THRESHOLD
+                        self.cfg.idle_threshold
                     };
                     info!("Keepalive: Dormant -> Probing (outbound after idle gap)");
                     if matches!(self.send_state, KeepAliveSendState::Idle) {
@@ -320,7 +333,7 @@ impl KeepAliveTransport {
                     }
                     state.probe = ProbeState::Probing {
                         ping_timer: Box::pin(sleep(interval)),
-                        response_deadline: Box::pin(sleep(RESPONSE_TIMEOUT)),
+                        response_deadline: Box::pin(sleep(self.cfg.response_timeout)),
                     };
                 }
             }
@@ -372,8 +385,8 @@ impl KeepAliveTransport {
                             // Connection not yet proven alive — keep probing but don't
                             // declare dead. The relay handshake may still be in progress.
                             debug!("Keepalive: response deadline fired but no inbound yet, waiting");
-                            response_deadline.as_mut().reset(Instant::now() + RESPONSE_TIMEOUT);
-                        } else if Instant::now().duration_since(state.last_inbound) > INBOUND_GRACE {
+                            response_deadline.as_mut().reset(Instant::now() + self.cfg.response_timeout);
+                        } else if Instant::now().duration_since(state.last_inbound) > self.cfg.inbound_grace {
                             if !state.rescue_sent {
                                 // First miss — send a rescue ping through the current transport.
                                 // This handles transport upgrades where the inner connection
@@ -384,9 +397,9 @@ impl KeepAliveTransport {
                                     self.send_state = KeepAliveSendState::Sending(pkt);
                                 }
                                 state.rescue_sent = true;
-                                response_deadline.as_mut().reset(Instant::now() + RESPONSE_TIMEOUT);
+                                response_deadline.as_mut().reset(Instant::now() + self.cfg.response_timeout);
                             } else {
-                                warn!("Keepalive: peer dead (no response to rescue ping, no inbound for {:?})", INBOUND_GRACE);
+                                warn!("Keepalive: peer dead (no response to rescue ping, no inbound for {:?})", self.cfg.inbound_grace);
                                 return Some(Poll::Ready(None));
                             }
                         } else {

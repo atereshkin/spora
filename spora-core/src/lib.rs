@@ -24,9 +24,9 @@ use url::Url;
 use crate::e2e::{accept_one, client_connect, client_endpoint, server_endpoint, E2eSession};
 use crate::identity::{Identity, Token, ROUTING_KEY_LEN, SECRET_LEN};
 use crate::neg::{NegChannel, SignalNegChannel};
+use crate::server::TunnelError;
 use crate::signal::SignalChannel;
 use crate::transport::keepalive::{KeepAliveConfig, KeepAliveMode, KeepAliveTransport};
-use crate::transport::quic::QuicPeerTransport;
 use crate::transport::upgradable::{upgradable_transport, UpgradeSender};
 use crate::transport::DialFuture;
 use crate::transport::ReconnectTransport;
@@ -87,6 +87,85 @@ pub struct ConnectResult {
     pub keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
 }
 
+/// Every protocol interval/timeout that used to be a hardcoded constant.
+/// `Default` is exactly today's production values; tests and the lab can
+/// scale them down to make slow scenarios run in seconds of wall time.
+#[derive(Clone, Debug)]
+pub struct Timings {
+    /// Cadence of the sharer's REGISTER packets to the relay.
+    pub register_interval: Duration,
+    /// QUIC max idle timeout (both relay-via and direct connections).
+    pub quic_idle_timeout: Duration,
+    /// QUIC keep-alive interval.
+    pub quic_keep_alive: Duration,
+    /// `ReconnectTransport` sleep after a failed dial.
+    pub reconnect_delay: Duration,
+    /// Initiator retry delay after a failed direct-upgrade attempt.
+    pub upgrade_retry_delay: Duration,
+    /// Timeout for each of the two punch phases (punch exchange + verify).
+    pub punch_phase_timeout: Duration,
+    /// Interval between punch/verify packets within a phase.
+    pub punch_send_interval: Duration,
+    /// Initiator timeout waiting for the responder's endpoint over the
+    /// signal channel.
+    pub endpoint_exchange_timeout: Duration,
+    /// Adaptive keepalive: send-silence gap that re-activates probing.
+    pub keepalive_idle_threshold: Duration,
+    /// Adaptive keepalive: how long to wait for a ping response.
+    pub keepalive_response_timeout: Duration,
+    /// Adaptive keepalive: inbound within this window keeps the peer alive.
+    pub keepalive_inbound_grace: Duration,
+}
+
+impl Default for Timings {
+    fn default() -> Self {
+        Self {
+            register_interval: relay_client::DEFAULT_REGISTER_INTERVAL, // 30s
+            quic_idle_timeout: Duration::from_secs(30),
+            quic_keep_alive: Duration::from_secs(10),
+            reconnect_delay: transport::RECONNECT_DELAY, // 5s
+            upgrade_retry_delay: Duration::from_secs(15),
+            punch_phase_timeout: Duration::from_secs(5),
+            punch_send_interval: Duration::from_millis(300),
+            endpoint_exchange_timeout: Duration::from_secs(10),
+            keepalive_idle_threshold: Duration::from_secs(20),
+            keepalive_response_timeout: Duration::from_secs(3),
+            keepalive_inbound_grace: Duration::from_secs(5),
+        }
+    }
+}
+
+/// Lifecycle notifications emitted by `share()`/`connect()` sessions.
+#[derive(Debug, Clone)]
+pub enum TunnelEvent {
+    /// A relay-via QUIC session is up (sharer: peer accepted; client:
+    /// connected to the sharer). `peer` is the remote address of the QUIC
+    /// connection — the relay's address when the path goes through it.
+    RelaySessionEstablished { peer: SocketAddr },
+    /// A direct connection was established and handed to the transport
+    /// router. The actual swap applies on the router's next poll, so traffic
+    /// may ride the relay for a brief moment after this event fires.
+    DirectUpgradeSucceeded { local: SocketAddr, peer: SocketAddr },
+    /// One direct-upgrade attempt failed (the upgrade task may retry).
+    DirectUpgradeFailed { reason: String },
+    /// Client only: a re-dial is starting after the transport died.
+    Reconnecting,
+    /// Client only: the re-dial succeeded.
+    Reconnected,
+}
+
+/// Hook invoked inline from the tunnel's async tasks for every
+/// [`TunnelEvent`]. **Hooks must be non-blocking** — do the minimum (e.g.
+/// push into an unbounded channel) and return; blocking here stalls the
+/// session that emitted the event.
+pub type EventHook = Option<Arc<dyn Fn(TunnelEvent) + Send + Sync>>;
+
+fn emit(hook: &EventHook, event: TunnelEvent) {
+    if let Some(h) = hook {
+        h(event);
+    }
+}
+
 #[derive(Clone)]
 pub struct Config {
     pub stun_server: String,
@@ -96,6 +175,15 @@ pub struct Config {
     pub mtu_callback: MtuCallback,
     /// Share side only: what consumes the tunneled IP packets.
     pub exit_mode: ExitMode,
+    /// Protocol intervals/timeouts. Defaults are production values.
+    pub timings: Timings,
+    /// Lifecycle event hook. Must be non-blocking (see [`EventHook`]).
+    pub event_hook: EventHook,
+    /// Whether to attempt the direct (hole-punched) upgrade after a relay-via
+    /// session is established. Disabling holds the session on the relay; the
+    /// signal channel is kept open so the peer's upgrade attempts time out
+    /// instead of seeing EOF.
+    pub enable_direct_upgrade: bool,
 }
 
 impl Default for Config {
@@ -107,6 +195,9 @@ impl Default for Config {
             protector: None,
             mtu_callback: None,
             exit_mode: ExitMode::Netstack,
+            timings: Timings::default(),
+            event_hook: None,
+            enable_direct_upgrade: true,
         }
     }
 }
@@ -158,7 +249,7 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
             .map_err(|e| format!("tokio::from_std: {}", e))?,
     );
 
-    let endpoint = server_endpoint(std_socket, &identity)?;
+    let endpoint = server_endpoint(std_socket, &identity, &config.timings)?;
     info!(
         "share: e2e endpoint up, rk {:x?}, relay {}",
         &routing_key[..4],
@@ -169,12 +260,13 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     let cancel_child = cancel.clone();
     let config_for_loop = config.clone();
     let identity_for_loop = identity.clone();
+    let register_interval = config.timings.register_interval;
     let task = tokio::spawn(async move {
         let register_task = tokio::spawn(relay_client::register_loop(
             registrar,
             relay_addr,
             routing_key,
-            relay_client::DEFAULT_REGISTER_INTERVAL,
+            register_interval,
         ));
         run_share_loop(endpoint, identity_for_loop, cancel_child, config_for_loop).await;
         register_task.abort();
@@ -210,6 +302,13 @@ async fn run_share_loop(
             },
         };
 
+        emit(
+            &config.event_hook,
+            TunnelEvent::RelaySessionEstablished {
+                peer: session.conn.remote_address(),
+            },
+        );
+
         if let Some(tc) = tunnel_cancel.take() {
             info!("[share #{}] new peer, cancelling previous tunnel", iteration);
             tc.cancel();
@@ -239,27 +338,43 @@ fn spawn_responder_tunnel(
         KeepAliveConfig::default(),
     ));
 
-    let stun_server = config.stun_server.clone();
-    let protector = config.protector.clone();
     let protector_for_tunnel = config.protector.clone();
-    let mtu_cb = config.mtu_callback.clone();
     let conn_for_mtu = conn.clone();
     let upgrade_cancel = tunnel_cancel.clone();
-    let role = DirectRole::Responder { identity };
 
-    let upgrade_task = tokio::spawn(async move {
-        try_direct_upgrade(
-            signal,
-            upgrade_sender,
-            &stun_server,
-            role,
-            &protector,
-            upgrade_cancel,
-            None,
-            mtu_cb,
-        )
-        .await;
-    });
+    let upgrade_task = if config.enable_direct_upgrade {
+        let stun_server = config.stun_server.clone();
+        let protector = config.protector.clone();
+        let mtu_cb = config.mtu_callback.clone();
+        let timings = config.timings.clone();
+        let event_hook = config.event_hook.clone();
+        let role = DirectRole::Responder { identity };
+        tokio::spawn(async move {
+            try_direct_upgrade(
+                signal,
+                upgrade_sender,
+                &stun_server,
+                role,
+                &protector,
+                upgrade_cancel,
+                None,
+                mtu_cb,
+                timings,
+                event_hook,
+            )
+            .await;
+        })
+    } else {
+        // Direct upgrade disabled: drop the UpgradeSender (the upgradable
+        // router then drains forever, by design) but keep the SignalChannel
+        // alive for the session's lifetime so the peer's signal stream
+        // doesn't see EOF.
+        drop(upgrade_sender);
+        tokio::spawn(async move {
+            upgrade_cancel.cancelled().await;
+            drop(signal);
+        })
+    };
 
     if let Some(cb) = config.mtu_callback.clone() {
         tokio::spawn(async move {
@@ -322,10 +437,22 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         let cancel = dialer_cancel.clone();
         let knob = dialer_knob.clone();
         let waker = dialer_waker.clone();
-        Box::pin(async move { dial_initiator(relay_addr, &token, &config, cancel, knob, waker).await })
+        Box::pin(async move {
+            emit(&config.event_hook, TunnelEvent::Reconnecting);
+            let result =
+                dial_initiator(relay_addr, &token, &config, cancel, knob, waker).await;
+            if result.is_ok() {
+                emit(&config.event_hook, TunnelEvent::Reconnected);
+            }
+            result
+        })
     });
 
-    let transport = Box::new(ReconnectTransport::new(initial, dialer));
+    let transport = Box::new(ReconnectTransport::new(
+        initial,
+        dialer,
+        config.timings.reconnect_delay,
+    ));
     Ok(ConnectResult {
         transport,
         cancel,
@@ -343,7 +470,8 @@ async fn dial_initiator(
     keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
 ) -> std::io::Result<IpTransport> {
     let std_socket = bind_local_udp(&config.protector).map_err(std::io::Error::other)?;
-    let endpoint = client_endpoint(std_socket, token.routing_key).map_err(std::io::Error::other)?;
+    let endpoint = client_endpoint(std_socket, token.routing_key, &config.timings)
+        .map_err(std::io::Error::other)?;
     let session = client_connect(&endpoint, relay_addr, &token.secret)
         .await
         .map_err(std::io::Error::other)?;
@@ -353,6 +481,13 @@ async fn dial_initiator(
         signal,
     } = session;
 
+    emit(
+        &config.event_hook,
+        TunnelEvent::RelaySessionEstablished {
+            peer: conn.remote_address(),
+        },
+    );
+
     let (upgradable, upgrade_sender, router_handle) = upgradable_transport(Box::new(transport));
     let upgrade_knob = keepalive_knob.clone();
     let keepalive_cfg = KeepAliveConfig {
@@ -360,33 +495,58 @@ async fn dial_initiator(
             knob: keepalive_knob,
             waker: keepalive_waker,
         },
+        idle_threshold: config.timings.keepalive_idle_threshold,
+        response_timeout: config.timings.keepalive_response_timeout,
+        inbound_grace: config.timings.keepalive_inbound_grace,
         ..Default::default()
     };
     let transport: IpTransport =
         Box::new(KeepAliveTransport::new(Box::new(upgradable), keepalive_cfg));
 
-    let role = DirectRole::Initiator {
-        routing_key: token.routing_key,
-        secret: token.secret,
-    };
-    let stun_server = config.stun_server.clone();
-    let protector = config.protector.clone();
-    let mtu_cb = config.mtu_callback.clone();
     let upgrade_cancel = cancel.clone();
-    tokio::spawn(async move {
-        try_direct_upgrade(
-            signal,
-            upgrade_sender,
-            &stun_server,
-            role,
-            &protector,
-            upgrade_cancel,
-            Some(upgrade_knob),
-            mtu_cb,
-        )
-        .await;
-        drop(router_handle);
-    });
+    if config.enable_direct_upgrade {
+        let role = DirectRole::Initiator {
+            routing_key: token.routing_key,
+            secret: token.secret,
+        };
+        let stun_server = config.stun_server.clone();
+        let protector = config.protector.clone();
+        let mtu_cb = config.mtu_callback.clone();
+        let timings = config.timings.clone();
+        let event_hook = config.event_hook.clone();
+        tokio::spawn(async move {
+            try_direct_upgrade(
+                signal,
+                upgrade_sender,
+                &stun_server,
+                role,
+                &protector,
+                upgrade_cancel,
+                Some(upgrade_knob),
+                mtu_cb,
+                timings,
+                event_hook,
+            )
+            .await;
+            drop(router_handle);
+        });
+    } else {
+        // Direct upgrade disabled: hold the SignalChannel open so the peer's
+        // signal stream doesn't see EOF. The holder must die with the
+        // *session*, not just the connect-level cancel token: each re-dial
+        // runs through here again, so a cancel-only holder would accumulate
+        // one parked task (pinning a dead connection's streams) per redial.
+        // The router drops its upgrade receiver when the session ends, so
+        // `upgrade_sender.closed()` is exactly the session-death signal.
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = upgrade_cancel.cancelled() => {}
+                _ = upgrade_sender.closed() => {}
+            }
+            drop(signal);
+            drop(router_handle);
+        });
+    }
 
     if let Some(cb) = config.mtu_callback.clone() {
         let conn = conn.clone();
@@ -414,6 +574,40 @@ pub(crate) enum DirectRole {
     },
 }
 
+/// Why a single direct-upgrade attempt failed.
+#[derive(Debug)]
+pub(crate) enum DirectError {
+    /// The signal channel is closed — no further negotiation is possible for
+    /// this session. Terminal: `try_direct_upgrade` must return (retrying
+    /// would fail instantly and hot-spin on the responder side).
+    SignalClosed(String),
+    /// Transient failure (STUN, punch, QUIC handshake, ...); a later attempt
+    /// may succeed.
+    Transient(String),
+}
+
+impl DirectError {
+    fn reason(&self) -> &str {
+        match self {
+            DirectError::SignalClosed(r) | DirectError::Transient(r) => r,
+        }
+    }
+}
+
+/// Map a negotiation-channel error to `DirectError`. `NegChannelClosed` is
+/// terminal — note this covers both a genuinely closed stream AND a length
+/// prefix over the 64 KiB signal limit (framing desync), since `recv_signal`
+/// cannot distinguish them; retrying on a desynced stream would be useless
+/// anyway. A garbled endpoint *payload* (`ProtocolError`) is transient.
+fn neg_err(e: TunnelError) -> DirectError {
+    match e {
+        TunnelError::NegChannelClosed => {
+            DirectError::SignalClosed("signal channel closed".into())
+        }
+        other => DirectError::Transient(format!("{:?}", other)),
+    }
+}
+
 /// Background task: repeatedly try to establish a direct UDP connection.
 /// On success, send the new transport via `upgrade_sender`.
 #[allow(clippy::too_many_arguments)]
@@ -426,6 +620,8 @@ pub(crate) async fn try_direct_upgrade(
     cancel: CancellationToken,
     keepalive_knob: Option<Arc<AtomicU64>>,
     mtu_callback: MtuCallback,
+    timings: Timings,
+    event_hook: EventHook,
 ) {
     const MAX_DORMANT_ATTEMPTS: u32 = 3;
     let mut dormant_attempts: u32 = 0;
@@ -475,19 +671,36 @@ pub(crate) async fn try_direct_upgrade(
             DirectRole::Initiator {
                 routing_key,
                 secret,
-            } => try_direct_as_initiator(&mut signal, stun_server, protector, *routing_key, *secret)
-                .await,
+            } => {
+                try_direct_as_initiator(
+                    &mut signal,
+                    stun_server,
+                    protector,
+                    *routing_key,
+                    *secret,
+                    &timings,
+                )
+                .await
+            }
             DirectRole::Responder { identity } => {
-                try_direct_as_responder(&mut signal, stun_server, protector, identity).await
+                try_direct_as_responder(&mut signal, stun_server, protector, identity, &timings)
+                    .await
             }
         };
         match result {
-            Ok((transport, conn)) => {
+            Ok((transport, conn, local)) => {
                 info!("Direct connection established, upgrading transport");
                 if upgrade_sender.send(transport).is_err() {
                     warn!("Failed to send upgrade — tunnel already closed");
                     return;
                 }
+                emit(
+                    &event_hook,
+                    TunnelEvent::DirectUpgradeSucceeded {
+                        local,
+                        peer: conn.remote_address(),
+                    },
+                );
                 if let Some(cb) = mtu_callback.clone() {
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_millis(1500)).await;
@@ -500,17 +713,27 @@ pub(crate) async fn try_direct_upgrade(
                 return;
             }
             Err(e) => {
-                warn!("Direct connection attempt failed: {}", e);
+                warn!("Direct connection attempt failed: {}", e.reason());
+                emit(
+                    &event_hook,
+                    TunnelEvent::DirectUpgradeFailed {
+                        reason: e.reason().to_string(),
+                    },
+                );
+                if matches!(e, DirectError::SignalClosed(_)) {
+                    info!("Signal channel closed — stopping direct upgrade for this session");
+                    return;
+                }
                 if initiator {
                     if let Some(ref knob) = keepalive_knob
                         && knob.load(std::sync::atomic::Ordering::Relaxed) == 0
                     {
                         dormant_attempts += 1;
                     }
-                    warn!("Retrying in 15s...");
+                    warn!("Retrying in {:?}...", timings.upgrade_retry_delay);
                     tokio::select! {
                         _ = cancel.cancelled() => { info!("Direct upgrade cancelled during retry wait"); return; }
-                        _ = tokio::time::sleep(Duration::from_secs(15)) => {}
+                        _ = tokio::time::sleep(timings.upgrade_retry_delay) => {}
                     }
                 }
             }
@@ -519,67 +742,104 @@ pub(crate) async fn try_direct_upgrade(
 }
 
 /// Initiator (B): STUN, exchange endpoint, punch, build direct QUIC client
-/// (cert-pinned to `routing_key`, sends `secret` on auth stream).
+/// (cert-pinned to `routing_key`, sends `secret` on auth stream). On success
+/// also returns the punched socket's local address (for event reporting).
 async fn try_direct_as_initiator(
     signal: &mut SignalChannel,
     stun_server: &str,
     protector: &SocketProtector,
     routing_key: [u8; ROUTING_KEY_LEN],
     secret: [u8; SECRET_LEN],
-) -> Result<(IpTransport, Connection), String> {
-    let (socket, external_addr) = pierce_keep_socket(stun_server, protector).await?;
+    timings: &Timings,
+) -> Result<(IpTransport, Connection, SocketAddr), DirectError> {
+    let (socket, external_addr) = pierce_keep_socket(stun_server, protector)
+        .await
+        .map_err(DirectError::Transient)?;
     let peer_addr = {
         let mut neg = SignalNegChannel::new(signal);
-        neg.send_endpoint(external_addr)
+        neg.send_endpoint(external_addr).await.map_err(neg_err)?;
+        tokio::time::timeout(timings.endpoint_exchange_timeout, neg.recv_endpoint())
             .await
-            .map_err(|_| "failed to send endpoint via signal".to_string())?;
-        tokio::time::timeout(Duration::from_secs(10), neg.recv_endpoint())
-            .await
-            .map_err(|_| "timed out waiting for peer endpoint".to_string())?
-            .map_err(|e| format!("failed to receive peer endpoint: {:?}", e))?
+            .map_err(|_| {
+                DirectError::Transient("timed out waiting for peer endpoint".to_string())
+            })?
+            .map_err(neg_err)?
     };
 
-    let socket = punch_and_verify(socket, peer_addr).await?;
-    let std_sock = socket.into_std().map_err(|e| format!("into_std: {}", e))?;
-    let endpoint = client_endpoint(std_sock, routing_key)?;
-    let session = client_connect(&endpoint, peer_addr, &secret).await?;
-    let conn = session.conn.clone();
-    let transport: IpTransport = Box::new(QuicPeerTransport::new(conn.clone()));
-    Ok((transport, conn))
+    let socket = punch_and_verify(
+        socket,
+        peer_addr,
+        timings.punch_phase_timeout,
+        timings.punch_send_interval,
+    )
+    .await
+    .map_err(DirectError::Transient)?;
+    let local_addr = socket
+        .local_addr()
+        .map_err(|e| DirectError::Transient(format!("local_addr: {}", e)))?;
+    let std_sock = socket
+        .into_std()
+        .map_err(|e| DirectError::Transient(format!("into_std: {}", e)))?;
+    let endpoint =
+        client_endpoint(std_sock, routing_key, timings).map_err(DirectError::Transient)?;
+    let session = client_connect(&endpoint, peer_addr, &secret)
+        .await
+        .map_err(DirectError::Transient)?;
+    // Reuse the session's transport: its reader task is already attached to
+    // the connection, and building a second QuicPeerTransport here would
+    // leave that reader to steal the first inbound datagram before exiting.
+    let conn = session.conn;
+    let transport: IpTransport = Box::new(session.transport);
+    Ok((transport, conn, local_addr))
 }
 
 /// Responder (A): wait for peer endpoint, STUN, send own endpoint, punch,
-/// build direct QUIC server using identity, verify peer's secret.
+/// build direct QUIC server using identity, verify peer's secret. On success
+/// also returns the punched socket's local address (for event reporting).
 async fn try_direct_as_responder(
     signal: &mut SignalChannel,
     stun_server: &str,
     protector: &SocketProtector,
     identity: &Identity,
-) -> Result<(IpTransport, Connection), String> {
+    timings: &Timings,
+) -> Result<(IpTransport, Connection, SocketAddr), DirectError> {
     let (peer_addr, socket) = {
         let mut neg = SignalNegChannel::new(signal);
-        let peer_addr = neg
-            .recv_endpoint()
+        let peer_addr = neg.recv_endpoint().await.map_err(neg_err)?;
+        let (socket, external_addr) = pierce_keep_socket(stun_server, protector)
             .await
-            .map_err(|e| format!("failed to receive peer endpoint: {:?}", e))?;
-        let (socket, external_addr) = pierce_keep_socket(stun_server, protector).await?;
-        neg.send_endpoint(external_addr)
-            .await
-            .map_err(|_| "failed to send endpoint via signal".to_string())?;
+            .map_err(DirectError::Transient)?;
+        neg.send_endpoint(external_addr).await.map_err(neg_err)?;
         (peer_addr, socket)
     };
 
-    let socket = punch_and_verify(socket, peer_addr).await?;
-    let std_sock = socket.into_std().map_err(|e| format!("into_std: {}", e))?;
-    let endpoint = server_endpoint(std_sock, identity)?;
+    let socket = punch_and_verify(
+        socket,
+        peer_addr,
+        timings.punch_phase_timeout,
+        timings.punch_send_interval,
+    )
+    .await
+    .map_err(DirectError::Transient)?;
+    let local_addr = socket
+        .local_addr()
+        .map_err(|e| DirectError::Transient(format!("local_addr: {}", e)))?;
+    let std_sock = socket
+        .into_std()
+        .map_err(|e| DirectError::Transient(format!("into_std: {}", e)))?;
+    let endpoint = server_endpoint(std_sock, identity, timings).map_err(DirectError::Transient)?;
     let Some(session_result) = accept_one(&endpoint, &identity.secret).await else {
-        return Err("direct endpoint closed before accept".into());
+        return Err(DirectError::Transient(
+            "direct endpoint closed before accept".into(),
+        ));
     };
-    let session = session_result?;
-    let conn = session.conn.clone();
-    let transport: IpTransport = Box::new(QuicPeerTransport::new(conn));
+    let session = session_result.map_err(DirectError::Transient)?;
+    // Reuse the session's transport (see the initiator-side note): a second
+    // QuicPeerTransport would orphan the session's reader, which eats the
+    // first inbound datagram on the fresh direct path.
     let conn = session.conn;
-    Ok((transport, conn))
+    let transport: IpTransport = Box::new(session.transport);
+    Ok((transport, conn, local_addr))
 }
 
 // ---------- Helpers ----------
@@ -612,12 +872,20 @@ const VERIFY_MARKER: &[u8; 7] = b"SPORA_V";
 ///
 /// Phase 2 — bidirectional verify: both sides send VERIFY packets. Receiving
 /// the peer's VERIFY proves they also completed phase 1.
-async fn punch_and_verify(socket: UdpSocket, peer_addr: SocketAddr) -> Result<UdpSocket, String> {
+///
+/// `phase_timeout` bounds each phase; `send_interval` is the packet cadence
+/// within a phase (see `Timings::punch_phase_timeout` / `punch_send_interval`).
+async fn punch_and_verify(
+    socket: UdpSocket,
+    peer_addr: SocketAddr,
+    phase_timeout: Duration,
+    send_interval: Duration,
+) -> Result<UdpSocket, String> {
     debug!("Direct connection: punching {}", peer_addr);
 
-    let phase1 = tokio::time::timeout(Duration::from_secs(5), async {
+    let phase1 = tokio::time::timeout(phase_timeout, async {
         let mut buf = [0u8; 1500];
-        let mut interval = tokio::time::interval(Duration::from_millis(300));
+        let mut interval = tokio::time::interval(send_interval);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -642,9 +910,9 @@ async fn punch_and_verify(socket: UdpSocket, peer_addr: SocketAddr) -> Result<Ud
 
     debug!("Punch received from {}, verifying bidirectional...", peer_addr);
 
-    let phase2 = tokio::time::timeout(Duration::from_secs(5), async {
+    let phase2 = tokio::time::timeout(phase_timeout, async {
         let mut buf = [0u8; 1500];
-        let mut interval = tokio::time::interval(Duration::from_millis(300));
+        let mut interval = tokio::time::interval(send_interval);
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -725,4 +993,75 @@ pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), Strin
         .local_addr()
         .map_err(|e| format!("failed to get local addr: {}", e))?;
     Ok((local_addr, external_addr))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transport::upgradable::upgradable_transport;
+
+    /// Regression test: a CLOSED signal channel must be terminal for
+    /// `try_direct_upgrade`. The responder used to loop straight back into
+    /// `try_direct_as_responder` on any error; with the peer's signal stream
+    /// gone, `recv_endpoint` fails instantly and the task hot-spins forever.
+    #[tokio::test]
+    async fn responder_upgrade_terminates_when_signal_closes() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let timings = Timings::default();
+        let identity = Arc::new(Identity::generate());
+        let secret = identity.secret;
+
+        // Direct A<->B QUIC session on loopback (no relay needed: we only
+        // want a real SignalChannel riding a real bidi stream).
+        let a_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        a_std.set_nonblocking(true).unwrap();
+        let a_addr = a_std.local_addr().unwrap();
+        let a_endpoint = server_endpoint(a_std, &identity, &timings).unwrap();
+
+        let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        b_std.set_nonblocking(true).unwrap();
+        let b_endpoint = client_endpoint(b_std, identity.routing_key, &timings).unwrap();
+
+        let accept_task =
+            tokio::spawn(async move { accept_one(&a_endpoint, &secret).await.unwrap().unwrap() });
+        let b_session = client_connect(&b_endpoint, a_addr, &secret).await.unwrap();
+        let a_session = accept_task.await.unwrap();
+
+        // Keep B's connection alive but drop ONLY its signal half, so A's
+        // upgrade-sender stays open (the relay-via transport is still up)
+        // while A's `recv_endpoint` hits a closed stream.
+        let E2eSession {
+            conn: _b_conn,
+            transport: _b_transport,
+            signal: b_signal,
+        } = b_session;
+        drop(b_signal);
+
+        // A live UpgradeSender (router task running over A's transport).
+        let (_upgradable, upgrade_sender, _router_handle) =
+            upgradable_transport(Box::new(a_session.transport));
+        assert!(!upgrade_sender.is_closed());
+
+        let cancel = CancellationToken::new();
+        let upgrade_task = tokio::spawn(async move {
+            try_direct_upgrade(
+                a_session.signal,
+                upgrade_sender,
+                "127.0.0.1:1", // never reached: recv_endpoint fails first
+                DirectRole::Responder { identity },
+                &None,
+                cancel,
+                None,
+                None,
+                Timings::default(),
+                None,
+            )
+            .await;
+        });
+
+        tokio::time::timeout(Duration::from_secs(5), upgrade_task)
+            .await
+            .expect("responder upgrade task must terminate once the signal channel is closed")
+            .unwrap();
+    }
 }

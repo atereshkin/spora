@@ -21,6 +21,7 @@ use quinn::Connection;
 use crate::identity::{Identity, RoutingKeyVerifier, ROUTING_KEY_LEN, SECRET_LEN};
 use crate::signal::SignalChannel;
 use crate::transport::quic::{build_transport_config, QuicPeerTransport};
+use crate::Timings;
 
 const E2E_ALPN: &[u8] = b"spora-e2e/1";
 const SERVER_NAME: &str = "spora.peer";
@@ -42,6 +43,7 @@ pub struct E2eSession {
 pub fn server_endpoint(
     socket: std::net::UdpSocket,
     identity: &Identity,
+    timings: &Timings,
 ) -> Result<quinn::Endpoint, String> {
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
@@ -53,7 +55,10 @@ pub fn server_endpoint(
         .map_err(|e| format!("QUIC server crypto: {}", e))?;
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_crypto));
-    server_config.transport_config(Arc::new(build_transport_config()));
+    server_config.transport_config(Arc::new(build_transport_config(
+        timings.quic_idle_timeout,
+        timings.quic_keep_alive,
+    )));
 
     let runtime = quinn::default_runtime().ok_or_else(|| "no async runtime".to_string())?;
     let endpoint = quinn::Endpoint::new(
@@ -131,6 +136,7 @@ pub async fn accept_one(
 pub fn client_endpoint(
     socket: std::net::UdpSocket,
     routing_key: [u8; ROUTING_KEY_LEN],
+    timings: &Timings,
 ) -> Result<quinn::Endpoint, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(RoutingKeyVerifier::new(routing_key, provider.clone()));
@@ -147,7 +153,10 @@ pub fn client_endpoint(
         .map_err(|e| format!("QUIC client crypto: {}", e))?;
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
-    client_config.transport_config(Arc::new(build_transport_config()));
+    client_config.transport_config(Arc::new(build_transport_config(
+        timings.quic_idle_timeout,
+        timings.quic_keep_alive,
+    )));
     let rk_bytes = routing_key.to_vec();
     client_config.initial_dst_cid_provider(Arc::new(move || {
         quinn::ConnectionId::new(&rk_bytes)
@@ -269,7 +278,7 @@ mod tests {
         let a_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         a_std.set_nonblocking(true).unwrap();
         let (a_for_quinn, _reg_h) = split_a_socket(a_std, relay_addr, routing_key);
-        let a_endpoint = server_endpoint(a_for_quinn, &identity).unwrap();
+        let a_endpoint = server_endpoint(a_for_quinn, &identity, &Timings::default()).unwrap();
 
         // Give A's first REGISTER a moment to land on the relay.
         tokio::time::sleep(Duration::from_millis(100)).await;
@@ -277,7 +286,7 @@ mod tests {
         // B's side.
         let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         b_std.set_nonblocking(true).unwrap();
-        let b_endpoint = client_endpoint(b_std, routing_key).unwrap();
+        let b_endpoint = client_endpoint(b_std, routing_key, &Timings::default()).unwrap();
 
         // Drive A's accept and B's connect concurrently.
         let accept_task = tokio::spawn(async move {
@@ -334,7 +343,7 @@ mod tests {
 
         let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         b_std.set_nonblocking(true).unwrap();
-        let b_endpoint = client_endpoint(b_std, identity.routing_key).unwrap();
+        let b_endpoint = client_endpoint(b_std, identity.routing_key, &Timings::default()).unwrap();
 
         let result = client_connect(&b_endpoint, relay_addr, &identity.secret).await;
         assert!(result.is_err(), "should fail when no A is registered");
@@ -352,7 +361,7 @@ mod tests {
         let a_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         a_std.set_nonblocking(true).unwrap();
         let (a_for_quinn, _reg_h) = split_a_socket(a_std, relay_addr, routing_key);
-        let a_endpoint = server_endpoint(a_for_quinn, &identity).unwrap();
+        let a_endpoint = server_endpoint(a_for_quinn, &identity, &Timings::default()).unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 
         // Wrong secret.
@@ -361,7 +370,7 @@ mod tests {
 
         let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         b_std.set_nonblocking(true).unwrap();
-        let b_endpoint = client_endpoint(b_std, routing_key).unwrap();
+        let b_endpoint = client_endpoint(b_std, routing_key, &Timings::default()).unwrap();
 
         let accept_task =
             tokio::spawn(async move { accept_one(&a_endpoint, &secret).await.unwrap() });

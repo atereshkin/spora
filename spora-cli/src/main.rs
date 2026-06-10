@@ -52,10 +52,38 @@ enum Mode {
         /// TUN are still installed.
         #[arg(long, requires = "os_routing")]
         no_nat: bool,
+        /// Override the relay address (host:port) used for registration and
+        /// baked into the share URL.
+        #[arg(long)]
+        relay: Option<String>,
+        /// Override the STUN server (host:port) used for direct-upgrade
+        /// endpoint discovery.
+        #[arg(long)]
+        stun: Option<String>,
     },
     Use {
         url: String,
+        /// Override the STUN server (host:port) used for direct-upgrade
+        /// endpoint discovery.
+        #[arg(long)]
+        stun: Option<String>,
     },
+}
+
+/// Split `host:port` on the LAST ':' (so bracketed IPv6 like `[::1]:443`
+/// works) and validate the port.
+fn parse_host_port(s: &str) -> Result<(String, u16), String> {
+    let Some(idx) = s.rfind(':') else {
+        return Err(format!("'{}' is not a host:port pair (no ':' found)", s));
+    };
+    let (host, port_str) = (&s[..idx], &s[idx + 1..]);
+    if host.is_empty() {
+        return Err(format!("'{}' has an empty host part", s));
+    }
+    let port: u16 = port_str
+        .parse()
+        .map_err(|_| format!("'{}' is not a valid port in '{}'", port_str, s))?;
+    Ok((host.to_string(), port))
 }
 
 #[tokio::main]
@@ -76,10 +104,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tun_addr,
             tun_mtu,
             no_nat,
+            relay,
+            stun,
         } => {
             let path = identity_file.unwrap_or_else(default_identity_path);
             let identity = load_or_create_identity(&path, fresh)?;
             let mut config = Config::default();
+            if let Some(relay) = relay {
+                let (host, port) = parse_host_port(&relay)
+                    .map_err(|e| format!("--relay: {}", e))?;
+                config.relay_host = host;
+                config.relay_port = port;
+            }
+            if let Some(stun) = stun {
+                parse_host_port(&stun).map_err(|e| format!("--stun: {}", e))?;
+                config.stun_server = stun;
+            }
             let mut routing = None;
             if os_routing {
                 let opts = os_route::Options::parse(&tun_addr, tun_mtu, !no_nat)?;
@@ -107,10 +147,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // or the task panicked.
             drop(routing);
         }
-        Mode::Use { url } => {
+        Mode::Use { url, stun } => {
             #[cfg(windows)]
             {
-                let _ = url; // silence unused warning
+                let _ = (url, stun); // silence unused warning
                 return Err("The 'use' mode is not supported on Windows yet (requires a TUN device).".into());
             }
 
@@ -120,7 +160,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if url.scheme() != "https" {
                     panic!("Unsupported scheme {}. Expected an https:// URL", url.scheme());
                 }
-                let result = connect(url, &Config::default()).await.unwrap();
+                let mut config = Config::default();
+                if let Some(stun) = stun {
+                    parse_host_port(&stun).map_err(|e| format!("--stun: {}", e))?;
+                    config.stun_server = stun;
+                }
+                let result = connect(url, &config).await.unwrap();
                 let tun = Tun::builder().name("").up().try_build().unwrap();
                 tun_util::start(result.transport, tun).await?;
             }
