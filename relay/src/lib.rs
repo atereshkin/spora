@@ -90,7 +90,18 @@ impl State {
         {
             let mut rk: RoutingKey = [0u8; ROUTING_KEY_LEN];
             rk.copy_from_slice(dcid);
-            if let Some((sharer_addr, _)) = self.registrations.get(&rk).copied() {
+            if let Some((sharer_addr, reg_ts)) = self.registrations.get(&rk).copied() {
+                // Sweep only runs when packets arrive, so a quiet relay can
+                // still hold a registration well past its timeout. Treat an
+                // expired one as absent (and drop it now) — otherwise we'd
+                // forward to a dead sharer and, worse, install a flow keyed
+                // to its address that blocks its one-flow slot until the
+                // flow itself times out.
+                if now.duration_since(reg_ts) >= self.registration_timeout {
+                    self.registrations.remove(&rk);
+                    debug!("ignoring expired registration rk {:x?} for client {}", &rk[..4], src);
+                    return Action::Drop;
+                }
                 // One-at-a-time: if the sharer is already in a flow, drop the
                 // new attempt. The first client's flow has to time out (or
                 // its QUIC connection has to end) before another client can
@@ -315,6 +326,25 @@ mod tests {
         assert_eq!(s.registration_count(), 1);
         s.sweep(t0 + REGISTRATION_TIMEOUT + Duration::from_secs(1));
         assert_eq!(s.registration_count(), 0);
+    }
+
+    #[test]
+    fn expired_registration_does_not_match_even_without_a_sweep() {
+        // A quiet relay never sweeps; a client arriving after the timeout
+        // must NOT be forwarded to the stale sharer (and no flow installed).
+        let mut s = State::default();
+        let t0 = Instant::now();
+        let a = addr("10.0.0.1:1111");
+        let b = addr("10.0.0.2:2222");
+        s.handle_packet(a, &build_register(&rk(0x55)), t0);
+
+        let late = t0 + REGISTRATION_TIMEOUT + Duration::from_secs(1);
+        assert_eq!(
+            s.handle_packet(b, &initial_with_dcid(&rk(0x55)), late),
+            Action::Drop
+        );
+        assert_eq!(s.flow_count(), 0, "no flow installed off a stale registration");
+        assert_eq!(s.registration_count(), 0, "stale registration dropped on access");
     }
 
     #[test]

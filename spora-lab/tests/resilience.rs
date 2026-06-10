@@ -214,19 +214,15 @@ fn relay_restart_recovery() -> Result<(), String> {
 // expire (6s + sweep), and a new client must fail to connect. Unblock, give
 // the sharer a couple of register intervals, and a new client succeeds.
 //
-// NOTE (product finding, encoded here): relay expiry is sweep-driven and
-// `handle_packet` does not check registration freshness, so the blocked-phase
-// client's first Initial is still forwarded to the sharer off the STALE
-// registration (the relay receives no packets during the blackout, hence no
-// sweep runs until that very Initial arrives). The connect still fails — the
-// sharer's handshake responses toward the relay are equally blocked — but the
-// failure mechanism is "sharer unreachable", not "Initial dropped". Worse,
-// that forwarding INSTALLS a relay flow for the sharer, and after the unblock
-// the sharer's doomed half-open handshake keeps refreshing it for ~3s (until
-// its QUIC idle timeout), so the recovery wait below must cover the stale
-// flow's drain (~3s refreshes + 3s flow timeout + sweep), not just a couple
-// of register intervals (verified empirically: dialing at unblock+3s loses
-// the race and fails).
+// REGRESSION TEST for the stale-registration fix: `handle_packet` now checks
+// registration freshness on the DCID lookup. Relay expiry is otherwise
+// sweep-driven and a quiet relay (blocked sharer, no client) never sweeps, so
+// without that check the blocked-phase client's Initial would be forwarded to
+// the sharer off the STALE registration AND install a flow that blocks the
+// sharer's one-flow slot for flow_timeout. With the fix the relay drops that
+// Initial (registration older than registration_timeout) and installs nothing,
+// so the connect fails cleanly and recovery only needs the sharer to
+// re-register after the unblock.
 
 fn registration_blackout() -> Result<(), String> {
     let topo = Topology::build(&TopologySpec::new(
@@ -266,12 +262,11 @@ fn registration_blackout() -> Result<(), String> {
         }
     }
 
-    // Lift the outage; the sharer re-registers within register_interval (1s),
-    // but the stale flow installed during the blackout (see NOTE above) keeps
-    // being refreshed by the sharer's dying handshake for ~3s and then needs
-    // flow_timeout (3s) + sweep (500ms) to drain — 8s covers it with margin.
+    // Lift the outage; the sharer re-registers within register_interval (1s).
+    // No stale flow blocks the slot (see NOTE — the relay dropped the
+    // blackout-phase Initial), so a few register intervals of margin suffice.
     netem::unblock(&topo.wan, topo.ext_ip_a, svc_ip())?;
-    std::thread::sleep(Duration::from_secs(8));
+    std::thread::sleep(Duration::from_secs(4));
 
     let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)
         .map_err(|e| format!("post-unblock connect should succeed: {e}"))?;
