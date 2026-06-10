@@ -767,7 +767,7 @@ async fn try_direct_as_initiator(
             .map_err(neg_err)?
     };
 
-    let socket = punch_and_verify(
+    let (socket, learned_peer) = punch_and_verify(
         socket,
         peer_addr,
         timings.punch_phase_timeout,
@@ -783,7 +783,9 @@ async fn try_direct_as_initiator(
         .map_err(|e| DirectError::Transient(format!("into_std: {}", e)))?;
     let endpoint =
         client_endpoint(std_sock, routing_key, timings).map_err(DirectError::Transient)?;
-    let session = client_connect(&endpoint, peer_addr, &secret)
+    // Dial the address the peer's packets actually came from — our NAT has a
+    // mapping open toward it, which may not be true of the signaled address.
+    let session = client_connect(&endpoint, learned_peer, &secret)
         .await
         .map_err(DirectError::Transient)?;
     // Reuse the session's transport: its reader task is already attached to
@@ -814,7 +816,9 @@ async fn try_direct_as_responder(
         (peer_addr, socket)
     };
 
-    let socket = punch_and_verify(
+    // Responder accepts from whatever source the QUIC Initial arrives on, so
+    // the learned peer address is informational here.
+    let (socket, _learned_peer) = punch_and_verify(
         socket,
         peer_addr,
         timings.punch_phase_timeout,
@@ -864,73 +868,86 @@ fn bind_local_udp(protector: &SocketProtector) -> Result<std::net::UdpSocket, St
     Ok(std)
 }
 
-const VERIFY_MARKER: &[u8; 7] = b"SPORA_V";
+// Hole-punch markers, sharing an 8-byte magic so a stray internet packet
+// can't be mistaken for one (security still comes from the QUIC handshake
+// that follows — these only steer where we point it).
+const PUNCH_PKT: &[u8] = b"sporaHP1P"; // "I'm trying to reach you"
+const VERIFY_PKT: &[u8] = b"sporaHP1V"; // "I received your packet"
 
-/// Punch through NAT and verify *bidirectional* connectivity.
+/// Punch through NAT and verify *bidirectional* connectivity, learning the
+/// peer's **observed** source address (ICE peer-reflexive style) rather than
+/// trusting only the signaled one.
 ///
-/// Phase 1 — punch exchange: send punch packets repeatedly while waiting for
-/// the peer's punch.
+/// Why observed-source: a Linux conntrack NAT can remap an outgoing punch to
+/// a different external port when an unsolicited inbound punch has already
+/// created an `UNREPLIED` entry for the port we wanted ("port-steal"), so the
+/// peer's packets routinely arrive from a port we were never told about.
+/// Matching only the signaled address makes the punch fail in exactly that
+/// case (and every retry re-poisons it). Instead we accept a punch/verify
+/// from any source, learn it, and also send to it — which opens our own NAT
+/// toward the address that actually works. Pointing the subsequent QUIC dial
+/// at a wrong address merely fails the cert-pinned, secret-authenticated
+/// handshake and retries, so trusting the observed source is safe.
 ///
-/// Phase 2 — bidirectional verify: both sides send VERIFY packets. Receiving
-/// the peer's VERIFY proves they also completed phase 1.
+/// Receiving a VERIFY proves both directions at once (it reached us, and the
+/// peer sent it only because they received our packet), so success is the
+/// first VERIFY received. We reply VERIFY to every source we hear from, plus
+/// a few extra on exit, so the peer converges too. Returns the punched socket
+/// and the learned peer address to dial.
 ///
-/// `phase_timeout` bounds each phase; `send_interval` is the packet cadence
-/// within a phase (see `Timings::punch_phase_timeout` / `punch_send_interval`).
+/// `phase_timeout`/`send_interval` come from `Timings` (the total budget is
+/// `2 * phase_timeout`, preserving the old two-phase wall-clock).
 async fn punch_and_verify(
     socket: UdpSocket,
-    peer_addr: SocketAddr,
+    signaled: SocketAddr,
     phase_timeout: Duration,
     send_interval: Duration,
-) -> Result<UdpSocket, String> {
-    debug!("Direct connection: punching {}", peer_addr);
+) -> Result<(UdpSocket, SocketAddr), String> {
+    debug!("Direct connection: punching {} (observed-source)", signaled);
 
-    let phase1 = tokio::time::timeout(phase_timeout, async {
+    let result = tokio::time::timeout(phase_timeout.saturating_mul(2), async {
         let mut buf = [0u8; 1500];
         let mut interval = tokio::time::interval(send_interval);
+        // Always punch the signaled address; add learned sources as we hear
+        // from them (and verify those — sending to a source opens our NAT
+        // toward it).
+        let mut targets: Vec<SocketAddr> = vec![signaled];
+        let mut learned: Vec<SocketAddr> = Vec::new();
         loop {
             tokio::select! {
                 _ = interval.tick() => {
-                    let _ = socket.send_to(&[0u8; 1], peer_addr).await;
-                }
-                result = socket.recv_from(&mut buf) => {
-                    match result {
-                        Ok((_, addr)) if addr == peer_addr => return Ok::<_, String>(()),
-                        Ok(_) => continue,
-                        Err(e) => return Err(format!("recv error: {}", e)),
+                    for t in &targets {
+                        let _ = socket.send_to(PUNCH_PKT, *t).await;
+                    }
+                    for l in &learned {
+                        let _ = socket.send_to(VERIFY_PKT, *l).await;
                     }
                 }
-            }
-        }
-    })
-    .await;
-    match phase1 {
-        Ok(Ok(())) => {}
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err("timed out during punch exchange".into()),
-    }
-
-    debug!("Punch received from {}, verifying bidirectional...", peer_addr);
-
-    let phase2 = tokio::time::timeout(phase_timeout, async {
-        let mut buf = [0u8; 1500];
-        let mut interval = tokio::time::interval(send_interval);
-        loop {
-            tokio::select! {
-                _ = interval.tick() => {
-                    let _ = socket.send_to(VERIFY_MARKER, peer_addr).await;
-                }
                 result = socket.recv_from(&mut buf) => {
-                    match result {
-                        Ok((len, addr))
-                            if addr == peer_addr
-                                && len == VERIFY_MARKER.len()
-                                && &buf[..len] == VERIFY_MARKER =>
-                        {
-                            let _ = socket.send_to(VERIFY_MARKER, peer_addr).await;
-                            return Ok::<_, String>(());
+                    let (n, src) = match result {
+                        Ok(x) => x,
+                        Err(e) => return Err(format!("recv error: {}", e)),
+                    };
+                    let msg = &buf[..n];
+                    if msg != PUNCH_PKT && msg != VERIFY_PKT {
+                        continue;
+                    }
+                    if !learned.contains(&src) {
+                        debug!("Direct connection: learned peer source {}", src);
+                        learned.push(src);
+                        if !targets.contains(&src) {
+                            targets.push(src);
                         }
-                        Ok(_) => continue,
-                        Err(e) => return Err(format!("recv error: {}", e)),
+                    }
+                    // Open our NAT toward this source and tell it we heard it.
+                    let _ = socket.send_to(VERIFY_PKT, src).await;
+                    if msg == VERIFY_PKT {
+                        // Bidirectional confirmed. A few extra VERIFYs so the
+                        // peer reaches the same conclusion before we settle.
+                        for _ in 0..3 {
+                            let _ = socket.send_to(VERIFY_PKT, src).await;
+                        }
+                        return Ok::<_, String>(src);
                     }
                 }
             }
@@ -938,14 +955,14 @@ async fn punch_and_verify(
     })
     .await;
 
-    match phase2 {
-        Ok(Ok(())) => {
-            debug!("Bidirectional direct connection confirmed with {}", peer_addr);
+    match result {
+        Ok(Ok(peer)) => {
+            debug!("Bidirectional direct connection confirmed with {}", peer);
+            Ok((socket, peer))
         }
-        Ok(Err(e)) => return Err(e),
-        Err(_) => return Err("direct connection is not bidirectional — not upgrading".into()),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err("timed out during punch exchange".into()),
     }
-    Ok(socket)
 }
 
 /// Like `pierce()` but returns the UDP socket along with the addresses,

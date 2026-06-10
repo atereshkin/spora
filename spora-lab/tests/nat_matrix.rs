@@ -1,15 +1,26 @@
 //! NAT pairing matrix: direct upgrade vs relay fallback.
 //!
-//! `punch_and_verify` (spora-core) accepts packets **only from the signaled
-//! address**, so:
-//! - pairings among {Open, FullCone, PortRestricted} upgrade to direct —
-//!   proven load-bearing by killing the relay and asserting traffic flows on;
-//! - any pairing involving Symmetric must stay on the relay: the symmetric
-//!   side's punches arrive from a non-signaled source port and are ignored
-//!   (even by a FullCone receiver that *delivers* them), and packets aimed at
-//!   the symmetric side's signaled (STUN-learned) mapping match no conntrack
-//!   flow and are dropped. Proven load-bearing for symmetric_cone by killing
-//!   the relay and asserting traffic STOPS.
+//! `punch_and_verify` (spora-core) uses observed-source (ICE peer-reflexive)
+//! punching — it learns the address the peer's packets actually arrive from,
+//! not just the signaled one — so:
+//! - pairings among {Open, FullCone, PortRestricted} upgrade to direct
+//!   (PortRestricted x PortRestricted needs production-like RTT — see
+//!   `WanLatency::PunchSafe` — because at sub-ms RTT a conntrack port-steal
+//!   shifts both sides' punch ports and their port-restricted filters then
+//!   reject each other's packets, leaving nothing to learn);
+//! - FullCone x Symmetric ALSO upgrades (the new win from observed-source):
+//!   the full-cone NAT delivers the symmetric peer's punch (endpoint-
+//!   independent filtering), the sharer learns that random source, and its
+//!   endpoint-independent mapping lets the verify reach the symmetric side's
+//!   signaled address;
+//! - Symmetric x {PortRestricted, Symmetric} still falls back: the
+//!   restricted/symmetric side never receives the symmetric peer's punch in
+//!   the first place (its filter only admits the signaled source, which the
+//!   symmetric mapping doesn't present), so there is nothing to learn.
+//!
+//! Direct pairings are proven load-bearing by killing the relay and asserting
+//! traffic flows on; symmetric_cone by killing the relay and asserting it
+//! STOPS.
 //!
 //! All scenarios run the production peers (netstack exit) end to end through
 //! real kernel NAT. Punch timings stay at production defaults; only
@@ -31,7 +42,7 @@ fn main() {
         spora_lab::scenarios![
             open_open_direct,
             cone_cone_direct,
-            fullcone_symmetric_fallback,
+            fullcone_symmetric_direct,
             symmetric_cone_fallback,
             symmetric_symmetric_fallback,
         ],
@@ -103,15 +114,18 @@ fn scaled_relay_state() -> relay::State {
 enum WanLatency {
     /// No shaping: sub-ms RTTs everywhere.
     Zero,
-    /// Latency that makes hole punching deterministic for cone x cone (see
-    /// `cone_cone_direct` for the two conntrack port-steal races):
-    /// - wan->natA egress: plain 25ms netem. The initiator's punch reaches
-    ///   the sharer's NAT well after the responder's own punch has left it.
+    /// Latency that makes hole punching deterministic for port-restricted
+    /// cone x cone. Observed-source punching unlocks full-cone x symmetric but
+    /// NOT port-restricted x port-restricted under the lab's sub-ms RTT: there
+    /// the conntrack port-steal shifts a punch's source port, and BOTH sides'
+    /// port-restricted filters then reject the peer's shifted-port packets, so
+    /// neither side ever receives one to learn from. Production RTT avoids the
+    /// steal in the first place (the early punch lands after the peer's own
+    /// mapping exists); this profile reproduces that geometry:
+    /// - wan->natA egress: plain 25ms netem;
     /// - wan->natB egress: 10ms netem for everything EXCEPT relay-sourced
-    ///   packets (tc u32 filter on src 203.0.113.100). The responder's
-    ///   punch (direct path) reaches the client's NAT well after the
-    ///   endpoint signal (relay path) made the client punch out. This is
-    ///   the production geometry where the relay sits on-path / nearby.
+    ///   packets (tc u32 filter on src 203.0.113.100), so the relay detour is
+    ///   not slower than the direct path.
     PunchSafe,
 }
 
@@ -129,8 +143,6 @@ fn setup(
         WanLatency::Zero => {}
         WanLatency::PunchSafe => {
             netem::netem(&topo.wan, &topo.wan_if_a, "delay 25ms")?;
-            // wan_if_b: prio qdisc, band 1 (default for everything) = netem,
-            // band 2 (relay/STUN/services-sourced traffic) = plain fifo.
             let dev = &topo.wan_if_b;
             topo.wan.run(&format!(
                 "tc qdisc add dev {dev} root handle 1: prio bands 2 \
@@ -176,9 +188,9 @@ fn assert_echo_works(client: &ClientHandle, label: &str) -> Result<(), String> {
 }
 
 /// Wait for the initiator's next direct-upgrade outcome and require a
-/// punch-shaped failure. An unexpected success on a Symmetric pairing means
-/// `punch_and_verify` accepted a packet from a non-signaled source — a major
-/// product regression, reported loudly.
+/// punch-shaped failure. An unexpected success on one of these pairings means
+/// the symmetric side's punch reached the restricted/symmetric peer (whose
+/// filter should have dropped it) — a behavior change worth investigating.
 fn expect_punch_failure(
     client: &mut ClientHandle,
     pairing: &str,
@@ -197,10 +209,10 @@ fn expect_punch_failure(
             }
         }
         TunnelEvent::DirectUpgradeSucceeded { local, peer } => Err(format!(
-            "{pairing}: MAJOR PRODUCT FINDING — direct upgrade SUCCEEDED ({local} -> {peer}) \
-             on a pairing that must stay on the relay. punch_and_verify is only supposed to \
-             accept packets from the signaled address; a Symmetric side cannot present one. \
-             Investigate spora-core's punch filtering."
+            "{pairing}: PRODUCT FINDING — direct upgrade SUCCEEDED ({local} -> {peer}) on a \
+             pairing expected to stay on the relay. The symmetric side's port-restricted/\
+             symmetric peer should never have received its punch. Investigate spora-core's \
+             observed-source punch logic / the NAT recipe."
         )),
         other => Err(format!("{pairing}: unexpected event {other:?}")),
     }
@@ -289,38 +301,19 @@ fn open_open_direct() -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // 2. cone_cone_direct — the classic punch case
 
-/// PRODUCT FINDING (wire-confirmed via tcpdump in this lab): hole punching
-/// between two Linux-conntrack NATs is subject to two "port-steal" races.
-/// If either peer's punch reaches the other peer's NAT BEFORE that peer's
-/// own punch has left it, the unsolicited inbound (dst port with no mapping
-/// yet, routed to the gateway's local INPUT) creates an UNREPLIED conntrack
-/// entry that makes MASQUERADE port preservation fail for the late punch:
-/// it leaves from a shifted source port (observed: 21596 instead of the
-/// signaled 54321), the receiver ignores the non-signaled source, and BOTH
-/// sides time out in the punch exchange. Once squatted the attempt and all
-/// retries are poisoned — each retry's punching refreshes the 30s UNREPLIED
-/// entry — so the session can never upgrade.
-///
-/// Race 1 (sharer's NAT): initiator's punch arrival vs responder's punch
-/// departure — the responder punches ~1ms after sending its endpoint
-/// signal, while the initiator's punch needs signal-delivery + a direct
-/// crossing to arrive, so ANY realistic path latency makes the responder
-/// win. With the lab's sub-ms RTT the initiator won deterministically and
-/// cone x cone failed on every attempt.
-///
-/// Race 2 (client's NAT): responder's punch arrival vs initiator's punch
-/// departure. Both trail the SAME endpoint signal — the responder's punch
-/// by its ~1ms send lag minus the relay-vs-direct path difference, the
-/// initiator's by signal delivery + reaction (~0.1ms) — so this race is a
-/// scheduling coin flip wherever the relay detour is not faster than the
-/// direct path (observed flaky here: same binary punched fine on one run
-/// and squatted on the next). This one is a REAL production weakness: a
-/// relay detour slower than the direct path biases it toward failure
-/// regardless of absolute RTTs.
-///
-/// `WanLatency::PunchSafe` encodes the geometry where production punching
-/// works — meaningful path latency and a relay that is not slower than the
-/// direct path — making both races deterministic for the lab.
+/// PortRestricted x PortRestricted. Hole punching between two Linux-conntrack
+/// NATs used to be subject to a "port-steal" race: if either peer's punch
+/// reached the other's NAT before that peer's own punch had left, the
+/// unsolicited inbound created an UNREPLIED conntrack entry that broke
+/// MASQUERADE port preservation, so the late punch egressed from a shifted
+/// source port — and the old `punch_and_verify`, which accepted only the
+/// signaled source, ignored it and timed out (deterministically at the lab's
+/// sub-ms RTT, and as a coin flip in production whenever the relay detour was
+/// not faster than the direct path). Observed-source punching fixes it: each
+/// side learns the address the peer's packets actually arrive from and points
+/// the verify + QUIC dial there, so the shifted port is no longer fatal. This
+/// scenario runs at sub-ms RTT — exactly the geometry that used to fail — as
+/// the regression test.
 fn cone_cone_direct() -> Result<(), String> {
     direct_pair_case(
         NatKind::PortRestricted,
@@ -330,38 +323,19 @@ fn cone_cone_direct() -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// 3. fullcone_symmetric_fallback — the subtle one
+// 3. fullcone_symmetric_direct — observed-source unlocks this pairing
 
 /// FullCone (sharer) x Symmetric (client). The full-cone NAT DNATs the
-/// client's punch all the way to the sharer's punch socket — but it arrives
-/// from the client's per-destination (random) mapping, not the signaled
-/// STUN-learned one, so `punch_and_verify` must ignore it and both sides time
-/// out in the punch exchange. Two consecutive attempts are checked so the
-/// initiator's retry (15s `upgrade_retry_delay`) fails identically.
-fn fullcone_symmetric_fallback() -> Result<(), String> {
-    let pairing = "FullCone x Symmetric";
-    let (_topo, _wan, mut sharer, mut client) = setup(
-        NatKind::FullCone,
-        NatKind::Symmetric,
-        Timings::default(),
-        relay::State::default,
-        WanLatency::Zero,
-    )?;
-
-    let r1 = expect_punch_failure(&mut client, pairing, FALLBACK_TIMEOUT)?;
-    log::info!("{pairing}: attempt 1 failed as expected: {r1:?}");
-    let r2 = expect_punch_failure(&mut client, pairing, FALLBACK_TIMEOUT)?;
-    log::info!("{pairing}: retry attempt failed as expected: {r2:?}");
-
-    assert_no_client_upgrade(&mut client, pairing)?;
-    assert_no_sharer_upgrade(&mut sharer, pairing)?;
-
-    // Session stays healthy on the relay path.
-    assert_echo_works(&client, &format!("{pairing}: via relay"))?;
-
-    client.stop();
-    sharer.stop();
-    Ok(())
+/// client's punch all the way to the sharer's punch socket; it arrives from
+/// the client's per-destination (random) mapping, NOT the signaled
+/// STUN-learned one. The old signaled-only matcher ignored it and the pairing
+/// fell back to the relay. With observed-source punching the sharer learns
+/// that random source and verifies back to it (its own full-cone mapping is
+/// endpoint-independent, so its reply reaches the client from the signaled
+/// address the client's symmetric filter accepts) — and the pairing now
+/// upgrades directly. Regression test for that improvement.
+fn fullcone_symmetric_direct() -> Result<(), String> {
+    direct_pair_case(NatKind::FullCone, NatKind::Symmetric, WanLatency::Zero)
 }
 
 // ---------------------------------------------------------------------------

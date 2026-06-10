@@ -138,15 +138,16 @@ fn start_padding_responder(wan: &Netns, port: u16, pad_len: usize) -> Result<Hos
 ///    attempt's punches refresh the 30s UNREPLIED entry, so the attempt-1
 ///    outcome is frozen for the life of the session.
 ///
-/// Without netem the responder wins the race essentially every time →
-/// deterministic punch failure (PR×PR can never upgrade in this lab; the
-/// nat_matrix suite owns that assertion). UNDER JITTER, ±10ms/hop dwarfs the
-/// sub-ms processing margin and attempt 1 becomes a coin flip — observed
-/// both ways across runs — so this scenario accepts either outcome and runs
-/// its traffic assertions on whichever path resulted (both cross the same
-/// four netem hops, so the latency expectations are identical). Real
-/// Linux-based NATs (OpenWrt et al.) poison exactly like this, so it is a
-/// genuine traversal bug, not a lab artifact.
+/// Observed-source punching (spora-core) recovers from a port-steal WHENEVER
+/// at least one side still receives the peer's shifted-port packet — which is
+/// the common case at this production-like latency, so the upgrade now
+/// usually succeeds here. It cannot recover the lab's sub-ms case where BOTH
+/// port-restricted sides get steal-shifted and filter each other out (the
+/// nat_matrix suite owns that PR×PR-needs-latency assertion via PunchSafe).
+/// Since ±10ms jitter can still occasionally land in that double-steal, this
+/// scenario accepts either outcome and runs its traffic assertions on
+/// whichever path resulted (both cross the same four netem hops, so the
+/// latency expectations are identical).
 ///
 /// The warmup batch below: a post-upgrade 18/20-then-20/20 first-batch loss
 /// observed during development turned out to be the since-fixed zombie-reader
