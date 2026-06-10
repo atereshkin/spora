@@ -32,14 +32,20 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
     let (ingress_tx, mut ingress_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
     // Task 1 — Transport reader: transport → unbounded ingress channel.
+    // The peer's tunnel IPv4-fragments any inbound datagram larger than the
+    // QUIC max_datagram_size; the netstack can't reassemble, so we do it here
+    // before the packets reach the stack (see crate::reassembly).
     let ingress = tokio::spawn(async move {
         let mut count: u64 = 0;
-        while let Some(res) = peer_stream.next().await {
+        let mut reassembler = crate::reassembly::IpReassembler::new();
+        'outer: while let Some(res) = peer_stream.next().await {
             match res {
                 Ok(pkt) => {
                     count += 1;
-                    if ingress_tx.send(pkt).is_err() {
-                        break;
+                    for whole in reassembler.process(pkt, std::time::Instant::now()) {
+                        if ingress_tx.send(whole).is_err() {
+                            break 'outer;
+                        }
                     }
                 }
                 Err(e) => {

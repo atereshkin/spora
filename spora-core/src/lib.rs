@@ -1,4 +1,5 @@
 mod neg;
+mod reassembly;
 pub mod e2e;
 pub mod identity;
 pub mod server;

@@ -530,6 +530,9 @@ fn outage_blocks() -> Result<(), String> {
 /// - UDP echo 20 x 200 B with zero loss,
 /// - oversized (1460 B payload) UDP replies round-tripping share→client via
 ///   tunnel-level IPv4 fragmentation + pump reassembly,
+/// - an oversized (1600 B payload) UDP echo round-tripping in BOTH
+///   directions — the client→share fragments are reassembled by the share
+///   netstack's reassembler (regression test for that fix),
 /// - a 128 KiB TCP bulk echo over the smoltcp traffic driver.
 fn peers_netstack_validation() -> Result<(), String> {
     let topo = Topology::build(&TopologySpec::new(
@@ -620,6 +623,18 @@ fn peers_netstack_validation() -> Result<(), String> {
     )?;
     if frag.received != 5 {
         return fail(format!("fragmented-reply echo lost packets: {frag:?}"));
+    }
+
+    // Oversized echo against the PLAIN echo server: a 1600 B payload is a
+    // 1628 B IP packet, so the request tunnel-fragments client→share and the
+    // (equal-size) reply tunnel-fragments share→client. The request half only
+    // works because the share netstack now reassembles inbound fragments —
+    // before that fix this was deterministically 0/5.
+    let bidir_frag = client.udp_echo(svc(ECHO_UDP_PORT), 5, 1600, Duration::from_secs(30))?;
+    if bidir_frag.received != 5 {
+        return fail(format!(
+            "client→share oversized echo lost packets (reassembly regression?): {bidir_frag:?}"
+        ));
     }
 
     // 128 KiB TCP bulk echo over the smoltcp driver.
