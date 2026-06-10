@@ -11,23 +11,37 @@ Spora is a peer-to-peer VPN/tunnel written in Rust. It creates encrypted network
 ```bash
 cargo build                    # Build all workspace crates
 cargo build --release          # Release build
-cargo test                     # Run tests
+cargo test                     # Run tests (includes the spora-lab network suites)
 cargo clippy                   # Lint
 ./build-ffi.sh                 # Cross-compile for Android + generate Kotlin bindings
 ```
 
 The FFI build requires Android NDK linkers configured in `~/.cargo/config.toml` and Android targets installed via `rustup target add`.
 
+### e2e network lab
+
+`cargo test -p spora-lab` runs end-to-end suites (smoke, nat_matrix, resilience,
+conditions) in Linux network namespaces with real kernel NAT (iptables) and tc
+netem — no root needed (unprivileged userns; suites self-skip if unavailable;
+`SPORA_LAB=skip` opts out). Architecture, NAT recipes, and the product findings
+the suites encode live in `docs/lab.md`. Suites are `harness = false` binaries;
+filter scenarios with e.g. `cargo test -p spora-lab --test nat_matrix -- cone`.
+Protocol timings are configurable via `Config.timings` (`Timings`, prod
+defaults); lifecycle events via `Config.event_hook` (`TunnelEvent`); the direct
+upgrade can be disabled via `Config.enable_direct_upgrade` — these exist for the
+lab but are usable by the apps (e.g. path-state display).
+
 ## Workspace Structure
 
 Workspace members (resolver v3):
 
 - **spora-core** — Core library. Exposes `share()` (sharer mode) and `connect(url)` (client mode). Contains all networking logic.
-- **spora-cli** — CLI binary with `spora share` and `spora use <URL>` subcommands. Uses `tokio-tun` for TUN device on Unix. `spora share --os-routing` enables the privileged netstack bypass (see "Share-side exit modes").
+- **spora-cli** — CLI binary with `spora share` and `spora use <URL>` subcommands. Uses `tokio-tun` for TUN device on Unix. `spora share --os-routing` enables the privileged netstack bypass (see "Share-side exit modes"). `--relay <host:port>` (share) and `--stun <host:port>` (share/use) override the built-in endpoints.
 - **spora-ffi** — Uniffi-based FFI for Android/JNI. Wraps core functions for Kotlin. Builds as `cdylib`.
 - **spora-wincore**, **spora-winui** — Windows service + UI.
 - **relay** — Dumb UDP relay (both `lib.rs` for use in tests and `main.rs` for the deployed binary). Forwards packets between peers by inspecting QUIC long-header DCIDs and tracking a small flow table. Speaks no QUIC, holds no TLS keys.
 - **relay-client** — Tiny client of the relay protocol: the wire-protocol constants (`protocol` module) and the sharer's `register_loop` helper.
+- **spora-lab** — Network-namespace e2e test lab (test-only; see `docs/lab.md`): runs the real sharer/client/relay across netns topologies with iptables NAT flavors and netem conditions, in-process (one pinned thread + current-thread tokio runtime per simulated host).
 
 ## Architecture
 
@@ -124,7 +138,7 @@ Composition (client side): `QuicPeerTransport → UpgradableTransport → KeepAl
 ### Key Constants
 
 - STUN server: `stun.l.google.com:19302`
-- Default relay: `188.166.74.116:443` (UDP, not TLS now — the relay speaks no protocol other than the magic-prefix control packets and QUIC pass-through)
+- Default relay: `167.71.66.250:443` (UDP, not TLS now — the relay speaks no protocol other than the magic-prefix control packets and QUIC pass-through)
 - Routing-key length: 20 bytes (fits in a QUIC v1 DCID)
 - Secret length: 16 bytes
 - Register interval: 30s. Relay registration timeout: 120s. Flow timeout: 60s.

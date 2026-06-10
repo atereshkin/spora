@@ -1,0 +1,40 @@
+name: tests
+
+on:
+  push:
+    branches: [main, dumbrelay]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # The spora-lab suites run inside unprivileged user namespaces.
+      # Ubuntu 24.04 restricts those via AppArmor by default; lift the
+      # restriction and make sure netem's qdisc module is available.
+      - name: Enable lab prerequisites
+        run: |
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0 || true
+          sudo modprobe sch_netem || true
+
+      - name: Build
+        run: cargo build --workspace
+
+      - name: Clippy
+        run: cargo clippy --workspace
+
+      - name: Tests (unit + integration + network lab)
+        run: cargo test --workspace
+        env:
+          RUST_LOG: info
+          # A lab suite that cannot run must FAIL CI, not silently skip —
+          # otherwise a runner-image change could disable all e2e coverage
+          # while the build stays green.
+          SPORA_LAB: require

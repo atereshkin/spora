@@ -1,0 +1,44 @@
+[package]
+name = "spora-lab"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+spora-core = { path = "../spora-core" }
+relay = { path = "../relay" }
+relay-client = { path = "../relay-client" }
+tokio = { version = "1.40.0", features = ["full"] }
+tokio-util = "0.7.17"
+futures-util = "0.3.31"
+log = "0.4.22"
+env_logger = "0.11"
+etherparse = "0.16.0"
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std", "log", "medium-ip", "proto-ipv4", "socket-tcp",
+] }
+url = "2.5.7"
+libc = "0.2"
+
+# Lab suites manage namespaces from main() and must run scenarios
+# sequentially inside one process, so they bypass libtest.
+[[test]]
+name = "smoke"
+harness = false
+
+[[test]]
+name = "nat_matrix"
+harness = false
+
+[[test]]
+name = "resilience"
+harness = false
+
+[[test]]
+name = "conditions"
+harness = false
+
+# Plain tokio test (no namespaces): validates the traffic drivers over a
+# loopback relay so it can run on any platform/CI without userns.
+[[test]]
+name = "peers_loopback"

@@ -3,6 +3,7 @@ members = [
     "spora-core", "spora-cli",
     "relay", "relay-client", "spora-ffi",
     "spora-wincore", "spora-winui",
+    "spora-lab",
 ]
 resolver = "3"
 

@@ -5370,6 +5370,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "spora-lab"
+version = "0.1.0"
+dependencies = [
+ "env_logger",
+ "etherparse",
+ "futures-util",
+ "libc",
+ "log",
+ "relay",
+ "relay-client",
+ "smoltcp",
+ "spora-core",
+ "tokio",
+ "tokio-util",
+ "url",
+]
+
+[[package]]
 name = "spora-wincore"
 version = "0.1.0"
 dependencies = [
