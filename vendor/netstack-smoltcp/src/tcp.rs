@@ -13,7 +13,9 @@ use futures::Stream;
 use smoltcp::{
     iface::{Config as InterfaceConfig, Interface, SocketHandle, SocketSet},
     phy::Device,
-    socket::tcp::{Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState},
+    socket::tcp::{
+        CongestionControl, Socket as TcpSocket, SocketBuffer as TcpSocketBuffer, State as TcpState,
+    },
     storage::RingBuffer,
     time::{Duration, Instant},
     wire::{HardwareAddress, IpAddress, IpCidr, IpProtocol, Ipv4Address, Ipv6Address, TcpPacket},
@@ -143,6 +145,12 @@ impl TcpListenerRunner {
                 socket.set_timeout(Some(Duration::from_secs(7200)));
                 // NO ACK delay
                 // socket.set_ack_delay(None);
+                // Use Cubic instead of smoltcp's default (no congestion
+                // control). These sockets terminate the tunneled TCP and
+                // re-originate it from the share host; with no controller the
+                // sender ran open-loop at a fixed window, leaving shaped/lossy
+                // links badly under-utilized.
+                socket.set_congestion_control(CongestionControl::Cubic);
 
                 if let Err(err) = socket.listen(dst_addr) {
                     error!("listen error: {:?}", err);
