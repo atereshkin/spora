@@ -5,6 +5,9 @@ members = [
     "spora-wincore", "spora-winui",
     "spora-lab",
 ]
+# Vendored third-party fork (netstack-smoltcp); built as a path dependency of
+# spora-core but not a workspace member — we don't lint or test it as our own.
+exclude = ["vendor/netstack-smoltcp"]
 resolver = "3"
 
 [workspace.dependencies]

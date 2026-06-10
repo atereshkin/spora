@@ -1,0 +1,31 @@
+# Vendored fork of netstack-smoltcp 0.2.0 (https://github.com/cavivie/netstack-smoltcp).
+# Vendored so spora can carry fixes the upstream crate hasn't released:
+#   - half-closed inbound TCP streams no longer drop their tail (tcp.rs),
+#   - share-side TCP sockets use Cubic congestion control (tcp.rs).
+# See git history for the exact diffs from upstream 0.2.0. Library only — the
+# upstream example and its dev-dependencies are not vendored.
+[package]
+name = "netstack-smoltcp"
+version = "0.2.0"
+edition = "2021"
+rust-version = "1.75.0"
+license = "MIT OR Apache-2.0"
+description = "Vendored netstack-smoltcp: TUN packets <-> TCP streams / UDP packets, smoltcp backend."
+publish = false
+
+[lib]
+name = "netstack_smoltcp"
+path = "src/lib.rs"
+
+[dependencies]
+etherparse = "0.16"
+futures = "0.3"
+rand = "0.8"
+smoltcp = { version = "0.12", default-features = false, features = [
+    "std", "log", "medium-ip", "proto-ipv4", "proto-ipv6",
+    "socket-icmp", "socket-udp", "socket-tcp", "socket-tcp-cubic",
+] }
+spin = "0.9"
+tokio = { version = "1", features = ["sync", "time", "rt", "macros"] }
+tokio-util = "0.7.10"
+tracing = { version = "0.1", default-features = false, features = ["std"] }
