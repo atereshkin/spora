@@ -350,17 +350,29 @@ impl TcpListenerRunner {
                 socket_set.remove(socket_handle);
             }
 
-            if !iface_ingress_tx_avail.load(Ordering::Acquire) {
-                let next_duration = iface
+            let next_duration = if iface_ingress_tx_avail.load(Ordering::Acquire) {
+                Duration::ZERO
+            } else {
+                iface
                     .poll_delay(before_poll, &socket_set)
-                    .unwrap_or(Duration::from_millis(5));
-                if next_duration != Duration::ZERO {
-                    let _ = tokio::time::timeout(
-                        tokio::time::Duration::from(next_duration),
-                        notify.notified(),
-                    )
-                    .await;
-                }
+                    .unwrap_or(Duration::from_millis(5))
+            };
+            if next_duration != Duration::ZERO {
+                let _ = tokio::time::timeout(
+                    tokio::time::Duration::from(next_duration),
+                    notify.notified(),
+                )
+                .await;
+            } else {
+                // poll_delay == 0 (or ingress is waiting) means smoltcp wants
+                // to run again immediately — most importantly when it has data
+                // to send but device.transmit() returned None because the
+                // egress channel is full. Busy-spinning here starves the very
+                // tasks that drain that channel (the egress writer and the
+                // QUIC driver), which deadlocks the share side at 100% CPU,
+                // stops all forwarding, and makes the process ignore SIGINT.
+                // Yield cooperatively so those tasks run and egress drains.
+                tokio::task::yield_now().await;
             }
         }
     }
