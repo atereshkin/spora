@@ -8,6 +8,10 @@ use url::Url;
 #[cfg(not(windows))]
 mod os_route;
 
+/// Active keepalive/liveness probe interval (seconds) for the always-on CLI
+/// client. Non-zero opts out of spora-core's dormant ("screen off") mode.
+const KEEPALIVE_PROBE_SECS: u64 = 10;
+
 /// Use jemalloc on non-Windows. The default glibc allocator holds onto pages
 /// under heavy alloc/free churn (every IP packet on the share side allocates
 /// a `Vec<u8>`); jemalloc returns memory to the OS far more aggressively.
@@ -166,6 +170,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     config.stun_server = stun;
                 }
                 let result = connect(url, &config).await.unwrap();
+                // The CLI is always-on and has no screen state, so opt out of the
+                // Android dormant/battery semantics. A keepalive knob of 0 means
+                // "screen off" to spora-core, which disables the liveness probe
+                // (a dead tunnel is never detected) and parks the direct upgrade
+                // after a few transient failures. Set an active probe interval so
+                // neither happens; only the Android FFI drives the knob to 0.
+                result
+                    .keepalive_knob
+                    .store(KEEPALIVE_PROBE_SECS, std::sync::atomic::Ordering::Relaxed);
+                if let Some(w) = result.keepalive_waker.lock().unwrap().take() {
+                    w.wake();
+                }
                 let tun = Tun::builder().name("").up().try_build().unwrap();
                 tun_util::start(result.transport, tun).await?;
             }
