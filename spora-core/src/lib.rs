@@ -23,7 +23,7 @@ pub use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::e2e::{
-    accept_one, authenticate_incoming, client_connect, client_endpoint, server_endpoint, E2eSession,
+    authenticate_incoming, client_connect, client_endpoint, server_endpoint, E2eSession,
 };
 use crate::identity::{Identity, Token, ROUTING_KEY_LEN, SECRET_LEN};
 use crate::neg::{NegChannel, SignalNegChannel};
@@ -867,12 +867,31 @@ async fn try_direct_as_responder(
         .into_std()
         .map_err(|e| DirectError::Transient(format!("into_std: {}", e)))?;
     let endpoint = server_endpoint(std_sock, identity, timings).map_err(DirectError::Transient)?;
-    let Some(session_result) = accept_one(&endpoint, &identity.secret).await else {
-        return Err(DirectError::Transient(
-            "direct endpoint closed before accept".into(),
-        ));
+    // Time-box only the wait for the initiator's connection attempt — not the
+    // handshake, which keeps its own deadline inside authenticate_incoming.
+    // endpoint.accept() blocks until an Incoming arrives; if the initiator's
+    // VERIFY replies were lost it never dials, and an unbounded wait would pin
+    // this task for the whole session (holding the signal channel, so no retry
+    // round can progress). On timeout we return Transient and the upgrade loop
+    // retries or observes cancellation. (After a successful mutual punch the
+    // initiator dials immediately, so this only fires when it isn't coming.)
+    let accept_deadline = timings.punch_phase_timeout * 2;
+    let incoming = match tokio::time::timeout(accept_deadline, endpoint.accept()).await {
+        Ok(Some(incoming)) => incoming,
+        Ok(None) => {
+            return Err(DirectError::Transient(
+                "direct endpoint closed before accept".into(),
+            ));
+        }
+        Err(_) => {
+            return Err(DirectError::Transient(
+                "direct accept timed out (initiator never dialed)".into(),
+            ));
+        }
     };
-    let session = session_result.map_err(DirectError::Transient)?;
+    let session = authenticate_incoming(incoming, &identity.secret)
+        .await
+        .map_err(DirectError::Transient)?;
     // Reuse the session's transport (see the initiator-side note): a second
     // QuicPeerTransport would orphan the session's reader, which eats the
     // first inbound datagram on the fresh direct path.
@@ -1050,6 +1069,7 @@ pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::e2e::accept_one;
     use crate::transport::upgradable::upgradable_transport;
 
     /// Regression test: a CLOSED signal channel must be terminal for

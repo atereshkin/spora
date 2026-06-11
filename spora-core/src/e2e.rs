@@ -471,6 +471,28 @@ mod tests {
         conn
     }
 
+    // accept_one blocks in endpoint.accept() with no deadline of its own, so a
+    // caller that has no other source of progress (the direct-upgrade responder,
+    // whose initiator may never dial) must time-box it — otherwise it hangs for
+    // the whole session. This guards the premise of that timeout.
+    #[tokio::test]
+    async fn accept_one_blocks_without_a_peer_and_must_be_timed_out() {
+        let identity = Identity::generate();
+        let s_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        s_std.set_nonblocking(true).unwrap();
+        let server_ep = server_endpoint(s_std, &identity, &Timings::default()).unwrap();
+
+        let r = tokio::time::timeout(
+            Duration::from_millis(200),
+            accept_one(&server_ep, &identity.secret),
+        )
+        .await;
+        assert!(
+            r.is_err(),
+            "accept_one must block (and so needs a caller timeout) when no peer dials"
+        );
+    }
+
     // A peer that completes the QUIC handshake but stalls the secret read (an
     // attacker who knows only the public routing key) must not block a
     // legitimate peer from authenticating. Mirrors run_share_loop's structure:
