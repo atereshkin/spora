@@ -121,7 +121,11 @@ enum ReconnectState {
 ///
 /// Policy:
 /// - retry forever
-/// - when inner yields `None` or `Err`, start reconnect
+/// - when inner yields `None` or `Err`, sleep `delay` then reconnect — pacing
+///   *every* reconnect, not just retries after a failed dial. A successful but
+///   short-lived session (e.g. a client repeatedly evicted by the share side's
+///   single-session policy) would otherwise redial instantly and, with the peer
+///   doing the same, spin in a tight mutual-eviction storm.
 /// - outbound packets are *dropped* while reconnecting
 pub struct ReconnectTransport {
     dialer: Dialer,
@@ -164,12 +168,12 @@ impl Stream for ReconnectTransport {
                         Poll::Ready(Some(Ok(pkt))) => return Poll::Ready(Some(Ok(pkt))),
                         Poll::Ready(Some(Err(e))) => {
                             warn!("Inner transport error, reconnecting: {}", e);
-                            this.begin_dial();
+                            this.begin_sleep();
                             continue;
                         }
                         Poll::Ready(None) => {
                             info!("Inner transport stream ended, reconnecting");
-                            this.begin_dial();
+                            this.begin_sleep();
                             continue;
                         }
                         Poll::Pending => return Poll::Pending,
@@ -219,7 +223,7 @@ impl Sink<Vec<u8>> for ReconnectTransport {
             ReconnectState::Connected(inner) => {
                 if let Err(e) = Pin::new(inner).start_send(item) {
                     warn!("start_send failed: {}. Reconnecting...", e);
-                    this.begin_dial();
+                    this.begin_sleep();
                 }
                 Ok(())
             },
@@ -290,6 +294,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_redials_on_inner_close() {
+        tokio::time::pause();
         let (local, handle) = mock_transport();
         handle.close(); // close the channel so local yields None
 
@@ -311,9 +316,17 @@ mod tests {
 
         let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
 
-        // The first poll should see None from the dead inner, dial, and then pend (new transport is idle)
-        tokio::time::timeout(std::time::Duration::from_millis(100), rt.next()).await.ok();
+        // First poll sees None and enters the paced sleep — it must NOT dial yet.
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+        assert_eq!(
+            dial_count.load(Ordering::SeqCst),
+            0,
+            "must not redial before the reconnect delay elapses"
+        );
 
+        // After the delay, the dial fires.
+        tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_millis(100)).await;
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
         assert!(dial_count.load(Ordering::SeqCst) >= 1, "dialer should have been called");
     }
 
@@ -368,6 +381,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_sink_error_triggers_redial() {
+        tokio::time::pause();
         let (local, handle) = mock_transport();
         // Close the handle so the inner transport's Sink returns BrokenPipe
         handle.close();
@@ -390,8 +404,10 @@ mod tests {
 
         let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
 
-        // First, poll_next to drive past the None from the closed stream and reconnect
-        tokio::time::timeout(std::time::Duration::from_millis(100), rt.next()).await.ok();
+        // Drive past the None; the redial is paced, so advance past the delay.
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+        tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_millis(100)).await;
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
         assert!(dial_count.load(Ordering::SeqCst) >= 1, "dialer should have been called from stream close");
 
         // Now close the new handle to make the Sink fail
@@ -407,8 +423,9 @@ mod tests {
         // Send through the ReconnectTransport — start_send should hit BrokenPipe and trigger redial
         Pin::new(&mut rt).send(vec![1, 2, 3]).await.unwrap();
 
-        // Drive the state machine so the dial future completes
-        tokio::time::timeout(std::time::Duration::from_millis(100), rt.next()).await.ok();
+        // The sink-error reconnect is paced too: advance past the delay, then dial.
+        tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_millis(100)).await;
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
 
         assert!(dial_count.load(Ordering::SeqCst) >= 1, "dialer should have been called after sink error");
     }
@@ -429,7 +446,7 @@ mod tests {
 
         let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
 
-        // Poll to drive: None → Dial → fail → Sleeping
+        // Poll to drive: None → Sleeping (the paced reconnect delay)
         tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
 
         // Now in Sleeping state — send should succeed (drop policy)
@@ -439,6 +456,7 @@ mod tests {
 
     #[tokio::test]
     async fn reconnect_drops_packets_while_dialing() {
+        tokio::time::pause();
         let (local, handle) = mock_transport();
         handle.close(); // trigger reconnect
 
@@ -449,7 +467,9 @@ mod tests {
 
         let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
 
-        // Poll to drive: None → begin_dial → Dialing(pending)
+        // None → Sleeping → (advance past the delay) → begin_dial → Dialing (hangs)
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+        tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_millis(100)).await;
         tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
 
         // Now in Dialing state — send should succeed (drop policy)
@@ -546,7 +566,10 @@ mod tests {
         // Close the handle to trigger reconnect
         handle.close();
 
-        // Drive the state machine — poll_next sees None, triggers dial
+        // Drive the state machine: poll_next sees None and enters the paced
+        // sleep; advance past the reconnect delay so the dial fires.
+        tokio::time::timeout(std::time::Duration::from_millis(10), stack.next()).await.ok();
+        tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_secs(1)).await;
         tokio::time::timeout(std::time::Duration::from_millis(100), stack.next()).await.ok();
 
         assert!(dial_count.load(Ordering::SeqCst) >= 1, "dialer should have been called");
