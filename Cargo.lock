@@ -5352,6 +5352,7 @@ dependencies = [
  "rustls",
  "socket2 0.5.10",
  "stunclient",
+ "subtle",
  "tokio",
  "tokio-util",
  "url",

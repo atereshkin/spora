@@ -17,6 +17,7 @@ use std::time::Duration;
 
 use log::{debug, info};
 use quinn::Connection;
+use subtle::ConstantTimeEq;
 
 use crate::identity::{Identity, RoutingKeyVerifier, ROUTING_KEY_LEN, SECRET_LEN};
 use crate::signal::SignalChannel;
@@ -125,7 +126,9 @@ pub async fn authenticate_incoming(
             return Err(format!("auth from {} timed out", peer));
         }
     };
-    if presented != *expected_secret {
+    // Constant-time compare so the secret can't be recovered by timing the
+    // reply (both are fixed 16-byte arrays).
+    if !bool::from(presented.ct_eq(expected_secret)) {
         conn.close(1u32.into(), b"bad-secret");
         return Err(format!("auth from {}: bad secret", peer));
     }

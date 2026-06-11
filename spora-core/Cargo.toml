@@ -20,6 +20,7 @@ quinn = { workspace = true }
 rustls = { workspace = true }
 rcgen = "0.13"
 ring = "0.17"
+subtle = "2"
 base64 = "0.22"
 
 [dev-dependencies]
