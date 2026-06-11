@@ -28,7 +28,31 @@ pub const FLOW_TIMEOUT: Duration = Duration::from_secs(60);
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 pub const RECV_BUF: usize = 4096;
 
+/// How long after the sharer last sent toward its client the flow still counts
+/// as "actively serving" (and so blocks a new client). Must exceed the sharer's
+/// QUIC keep-alive cadence (10s) so a live but idle session stays protected
+/// between keep-alive PINGs; short enough that a rejected/abandoned connection
+/// frees the slot quickly. See the one-at-a-time logic in `handle_packet`.
+pub const REVERSE_ACTIVITY_GRACE: Duration = Duration::from_secs(20);
+
 pub type RoutingKey = [u8; ROUTING_KEY_LEN];
+
+/// A forwarding-table entry. Stored under both endpoints of a flow.
+#[derive(Clone, Copy)]
+struct Flow {
+    /// Where to forward packets arriving from this entry's key address.
+    dst: SocketAddr,
+    /// Last time any packet refreshed this entry (for idle expiry).
+    ts: Instant,
+    /// `true` for the entry keyed by the sharer's address (so its `dst` is the
+    /// client). Lets the forwarder record return traffic only for the real
+    /// sharer→client direction.
+    from_sharer: bool,
+    /// On the sharer-keyed entry only: when the sharer last sent toward the
+    /// client. `None` until the sharer responds. Drives the "actively serving"
+    /// check that protects an established client from being displaced.
+    reverse: Option<Instant>,
+}
 
 pub struct State {
     /// `routing_key -> (sharer addr, last-seen Instant, last-accepted signed
@@ -37,7 +61,7 @@ pub struct State {
     /// captured registration replayed (e.g. from another source) is rejected
     /// while the genuine sharer keeps refreshing.
     registrations: HashMap<RoutingKey, (SocketAddr, Instant, u64)>,
-    flows: HashMap<SocketAddr, (SocketAddr, Instant)>,
+    flows: HashMap<SocketAddr, Flow>,
     registration_timeout: Duration,
     flow_timeout: Duration,
     sweep_interval: Duration,
@@ -102,9 +126,14 @@ impl State {
 
         // Existing flow? Forward by source-address lookup. This covers both
         // long- and short-header packets after the first match.
-        if let Some((dst, ts)) = self.flows.get_mut(&src) {
-            *ts = now;
-            return Action::Forward(*dst);
+        if let Some(flow) = self.flows.get_mut(&src) {
+            flow.ts = now;
+            // Record sharer→client return traffic so we can tell an actively
+            // served client (protected) from an idle/abandoned flow.
+            if flow.from_sharer {
+                flow.reverse = Some(now);
+            }
+            return Action::Forward(flow.dst);
         }
 
         // Unmatched source — only QUIC long-header packets with a DCID equal
@@ -141,21 +170,45 @@ impl State {
                     debug!("ignoring expired registration rk {:x?} for client {}", &rk[..4], src);
                     return Action::Drop;
                 }
-                // One-at-a-time: if the sharer is already in a flow, drop the
-                // new attempt. The first client's flow has to time out (or
-                // its QUIC connection has to end) before another client can
-                // be routed to the same sharer.
-                if self.flows.contains_key(&sharer_addr) {
-                    debug!(
-                        "dropping new client {} for already-serving sharer {} (rk {:x?})",
-                        src,
-                        sharer_addr,
-                        &rk[..4]
-                    );
-                    return Action::Drop;
+                // One-at-a-time, but only against an *actively serving* sharer.
+                // A flow counts as serving only while the sharer is returning
+                // traffic to its current client (within REVERSE_ACTIVITY_GRACE).
+                // A party that merely knows the (public) routing key can install
+                // a flow and keep sending client→sharer packets, but the sharer
+                // never returns sustained traffic to an unauthenticated peer (it
+                // closes the QUIC connection on auth failure/timeout), so that
+                // flow falls idle and a genuine client can displace it. Without
+                // this, a single Initial-shaped packet refreshed every <60s would
+                // hold the slot and lock out every real client.
+                let mut preserved_reverse = None;
+                if let Some(existing) = self.flows.get(&sharer_addr).copied() {
+                    if existing.dst == src {
+                        // Same client re-sending (e.g. an Initial retransmit):
+                        // keep its established serving state, just refresh below.
+                        preserved_reverse = existing.reverse;
+                    } else {
+                        let serving = existing
+                            .reverse
+                            .is_some_and(|t| now.duration_since(t) < REVERSE_ACTIVITY_GRACE);
+                        if serving {
+                            debug!(
+                                "dropping client {} for actively-serving sharer {} (rk {:x?})",
+                                src, sharer_addr, &rk[..4]
+                            );
+                            return Action::Drop;
+                        }
+                        // Idle/abandoned incumbent — displace it for this client.
+                        self.flows.remove(&existing.dst);
+                    }
                 }
-                self.flows.insert(src, (sharer_addr, now));
-                self.flows.insert(sharer_addr, (src, now));
+                self.flows.insert(
+                    src,
+                    Flow { dst: sharer_addr, ts: now, from_sharer: false, reverse: None },
+                );
+                self.flows.insert(
+                    sharer_addr,
+                    Flow { dst: src, ts: now, from_sharer: true, reverse: preserved_reverse },
+                );
                 info!(
                     "matched client {} <-> sharer {} on rk {:x?}",
                     src,
@@ -222,7 +275,7 @@ impl State {
         self.registrations
             .retain(|_, (_, ts, _)| now.duration_since(*ts) < registration_timeout);
         self.flows
-            .retain(|_, (_, ts)| now.duration_since(*ts) < flow_timeout);
+            .retain(|_, flow| now.duration_since(flow.ts) < flow_timeout);
         let reg_removed = before_reg - self.registrations.len();
         let flow_removed = before_flows - self.flows.len();
         if reg_removed + flow_removed > 0 {
@@ -355,7 +408,10 @@ mod tests {
         s.handle_packet(a, &reg.next_register_packet(), now);
         s.handle_packet(b1, &initial_with_dcid(&key), now);
         assert_eq!(s.flow_count(), 2);
+        // The sharer returns traffic to b1, so the flow is actively serving.
+        assert_eq!(s.handle_packet(a, &short_header(), now), Action::Forward(b1));
 
+        // A second client is now dropped while b1 is actively served.
         assert_eq!(
             s.handle_packet(b2, &initial_with_dcid(&key), now),
             Action::Drop
@@ -363,6 +419,58 @@ mod tests {
         assert_eq!(s.flow_count(), 2);
 
         assert_eq!(s.handle_packet(b1, &short_header(), now), Action::Forward(a));
+    }
+
+    #[test]
+    fn idle_flow_is_displaced_by_a_new_client() {
+        // The #3 fix: a flow with no return traffic from the sharer (an
+        // attacker who knows the routing key but can't get served) does not
+        // lock out a genuine client.
+        let mut s = State::default();
+        let now = Instant::now();
+        let a = addr("10.0.0.1:1111");
+        let attacker = addr("10.9.9.9:9999");
+        let client = addr("10.0.0.2:2222");
+
+        let mut reg = registrar();
+        let key = reg.routing_key();
+        s.handle_packet(a, &reg.next_register_packet(), now);
+
+        // Attacker installs a flow but the sharer never returns traffic to it.
+        assert_eq!(s.handle_packet(attacker, &initial_with_dcid(&key), now), Action::Forward(a));
+        // A genuine client displaces the idle flow.
+        assert_eq!(s.handle_packet(client, &initial_with_dcid(&key), now), Action::Forward(a));
+        // The sharer now routes to the genuine client, and the attacker's stale
+        // entry is gone (its packets no longer match a flow).
+        assert_eq!(s.handle_packet(a, &short_header(), now), Action::Forward(client));
+        assert_eq!(s.handle_packet(attacker, &short_header(), now), Action::Drop);
+    }
+
+    #[test]
+    fn actively_served_flow_becomes_displaceable_after_grace() {
+        // An actively-served client is protected, but once the sharer stops
+        // returning traffic (e.g. the connection ended) the slot frees up after
+        // REVERSE_ACTIVITY_GRACE so a new client is not blocked forever.
+        let mut s = State::default();
+        let t0 = Instant::now();
+        let a = addr("10.0.0.1:1111");
+        let b1 = addr("10.0.0.2:2222");
+        let b2 = addr("10.0.0.3:3333");
+
+        let mut reg = registrar();
+        let key = reg.routing_key();
+        s.handle_packet(a, &reg.next_register_packet(), t0);
+        s.handle_packet(b1, &initial_with_dcid(&key), t0);
+        s.handle_packet(a, &short_header(), t0); // sharer serves b1
+
+        // Within the grace window, b2 is refused.
+        let mid = t0 + REVERSE_ACTIVITY_GRACE / 2;
+        assert_eq!(s.handle_packet(b2, &initial_with_dcid(&key), mid), Action::Drop);
+
+        // After the grace window with no further return traffic, b2 displaces b1.
+        let late = t0 + REVERSE_ACTIVITY_GRACE + Duration::from_secs(1);
+        assert_eq!(s.handle_packet(b2, &initial_with_dcid(&key), late), Action::Forward(a));
+        assert_eq!(s.handle_packet(a, &short_header(), late), Action::Forward(b2));
     }
 
     #[test]
