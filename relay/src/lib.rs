@@ -47,6 +47,22 @@ pub enum Action {
     Drop,
 }
 
+/// Addresses the relay refuses to register or forward to. Unspecified,
+/// multicast, and broadcast are never legitimate peer addresses; forwarding to
+/// them turns the relay into a reflector/amplifier (one inbound packet → a
+/// multicast group, etc.). Loopback is intentionally allowed so the unit/lab
+/// tests and local development can run every peer on 127.0.0.1.
+fn is_relayable(addr: &SocketAddr) -> bool {
+    let ip = addr.ip();
+    if ip.is_unspecified() || ip.is_multicast() {
+        return false;
+    }
+    match ip {
+        std::net::IpAddr::V4(v4) => !v4.is_broadcast(),
+        std::net::IpAddr::V6(_) => true,
+    }
+}
+
 impl State {
     /// Build a `State` with custom expiry timeouts and sweep cadence
     /// (defaults: 120s / 60s / 5s). Used by tests and the e2e lab to make
@@ -91,6 +107,21 @@ impl State {
             let mut rk: RoutingKey = [0u8; ROUTING_KEY_LEN];
             rk.copy_from_slice(dcid);
             if let Some((sharer_addr, reg_ts)) = self.registrations.get(&rk).copied() {
+                // Refuse a self-referential or non-relayable flow *before* the
+                // one-at-a-time check, so a spoofed packet can neither bootstrap
+                // a self-sustaining loop nor occupy the sharer's flow slot.
+                // flows.insert(src, ...) and flows.insert(sharer_addr, ...)
+                // collapse to flows[X] = (X) when src == sharer_addr, which
+                // would make the relay forward every packet from X back to X
+                // forever from a single (spoofed) packet.
+                if src == sharer_addr || !is_relayable(&src) {
+                    debug!(
+                        "refusing self-referential/non-relayable flow for {} (rk {:x?})",
+                        src,
+                        &rk[..4]
+                    );
+                    return Action::Drop;
+                }
                 // Sweep only runs when packets arrive, so a quiet relay can
                 // still hold a registration well past its timeout. Treat an
                 // expired one as absent (and drop it now) — otherwise we'd
@@ -140,6 +171,10 @@ impl State {
                         body.len(),
                         ROUTING_KEY_LEN
                     );
+                    return;
+                }
+                if !is_relayable(&src) {
+                    warn!("ignoring REGISTER from non-relayable source {}", src);
                     return;
                 }
                 let mut rk = [0u8; ROUTING_KEY_LEN];
@@ -295,6 +330,61 @@ mod tests {
         assert_eq!(s.flow_count(), 2);
 
         assert_eq!(s.handle_packet(b1, &short_header(), now), Action::Forward(a));
+    }
+
+    #[test]
+    fn self_referential_flow_is_refused() {
+        // A client whose source address equals the registered sharer address
+        // (achievable by spoofing the source) must not install a flow: it would
+        // collapse to flows[X] = (X) and self-forward forever. Reproduces the
+        // single-packet relay loop from the review.
+        let mut s = State::default();
+        let now = Instant::now();
+        let a = addr("10.0.0.1:1111");
+
+        s.handle_packet(a, &build_register(&rk(0x66)), now);
+        assert_eq!(
+            s.handle_packet(a, &initial_with_dcid(&rk(0x66)), now),
+            Action::Drop
+        );
+        assert_eq!(s.flow_count(), 0, "no self-referential flow installed");
+        // And the sharer's slot is still free for a genuine client afterwards.
+        let b = addr("10.0.0.2:2222");
+        assert_eq!(
+            s.handle_packet(b, &initial_with_dcid(&rk(0x66)), now),
+            Action::Forward(a)
+        );
+    }
+
+    #[test]
+    fn register_from_non_relayable_source_is_ignored() {
+        let mut s = State::default();
+        let now = Instant::now();
+        // 0.0.0.0 (unspecified) and a multicast address must not be bound.
+        assert_eq!(
+            s.handle_packet(addr("0.0.0.0:9"), &build_register(&rk(0x88)), now),
+            Action::Drop
+        );
+        assert_eq!(
+            s.handle_packet(addr("224.0.0.1:9"), &build_register(&rk(0x88)), now),
+            Action::Drop
+        );
+        assert_eq!(s.registration_count(), 0);
+    }
+
+    #[test]
+    fn non_relayable_client_source_installs_no_flow() {
+        let mut s = State::default();
+        let now = Instant::now();
+        let a = addr("10.0.0.1:1111");
+        s.handle_packet(a, &build_register(&rk(0x99)), now);
+        // A client Initial whose (spoofed) source is multicast must be dropped,
+        // so the relay never reflects/amplifies to a multicast group.
+        assert_eq!(
+            s.handle_packet(addr("224.0.0.5:7"), &initial_with_dcid(&rk(0x99)), now),
+            Action::Drop
+        );
+        assert_eq!(s.flow_count(), 0);
     }
 
     #[test]
