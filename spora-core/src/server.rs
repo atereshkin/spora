@@ -296,6 +296,13 @@ struct NATKey(SocketAddr, SocketAddr);
 
 const UDP_NAT_TIMEOUT: Duration = Duration::from_secs(30);
 const UDP_NAT_SWEEP_INTERVAL: Duration = Duration::from_secs(10);
+/// Cap on concurrently-tracked UDP NAT flows. Each entry is a real OS socket
+/// (an fd) plus a recv task, so an untrusted client spraying distinct
+/// destination tuples could otherwise exhaust file descriptors before the 30s
+/// idle sweep reclaims anything. At the cap we evict the least-recently-active
+/// flow, so a flood sheds idle entries while live flows (which refresh their
+/// timestamp) survive.
+const MAX_UDP_NAT_ENTRIES: usize = 256;
 
 struct NATEntry {
     socket: Arc<UdpSocket>,
@@ -360,11 +367,16 @@ async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket, protec
                                 }
                             });
                             let _ = socket.send(&data).await;
-                            entries.insert(key, NATEntry {
-                                socket,
-                                task,
-                                last_activity: Instant::now(),
-                            });
+                            insert_bounded(
+                                &mut entries,
+                                key,
+                                NATEntry {
+                                    socket,
+                                    task,
+                                    last_activity: Instant::now(),
+                                },
+                                MAX_UDP_NAT_ENTRIES,
+                            );
                         }
                         Err(e) => {
                             warn!("failed to create udp socket for {:?}<->{:?}: {:?}", local, remote, e);
@@ -385,6 +397,26 @@ async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket, protec
             }
         }
     }
+}
+
+/// Insert a new UDP NAT entry, evicting the least-recently-active one first if
+/// the table is at `cap`. Bounds fds/tasks against a client spraying distinct
+/// destination tuples; live flows refresh `last_activity` so a flood sheds idle
+/// entries rather than active ones.
+fn insert_bounded(entries: &mut HashMap<NATKey, NATEntry>, key: NATKey, entry: NATEntry, cap: usize) {
+    if !entries.contains_key(&key) && entries.len() >= cap {
+        if let Some(oldest) = entries
+            .iter()
+            .min_by_key(|(_, e)| e.last_activity)
+            .map(|(k, _)| *k)
+        {
+            if let Some(evicted) = entries.remove(&oldest) {
+                evicted.task.abort();
+                trace!("UDP NAT table full, evicted {:?} => {:?}", oldest.0, oldest.1);
+            }
+        }
+    }
+    entries.insert(key, entry);
 }
 
 async fn new_udp_packet(addr: SocketAddr, protector: &SocketProtector) -> std::io::Result<tokio::net::UdpSocket> {
@@ -469,6 +501,43 @@ mod tests {
     use crate::transport::IpTransport;
     use crate::transport::mock::{mock_transport, MockTransportHandle};
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn udp_nat_table_evicts_least_recently_active_at_cap() {
+        async fn entry(ts: Instant) -> NATEntry {
+            let socket = Arc::new(UdpSocket::bind("127.0.0.1:0").await.unwrap());
+            NATEntry {
+                socket,
+                task: tokio::spawn(std::future::pending::<()>()),
+                last_activity: ts,
+            }
+        }
+        let key = |port: u16| {
+            NATKey(
+                "127.0.0.1:1000".parse().unwrap(),
+                format!("10.0.0.1:{port}").parse().unwrap(),
+            )
+        };
+
+        let t0 = Instant::now();
+        let mut entries: HashMap<NATKey, NATEntry> = HashMap::new();
+        // Fill to the (small) cap; key(10) is the least recently active.
+        insert_bounded(&mut entries, key(10), entry(t0).await, 3);
+        insert_bounded(&mut entries, key(11), entry(t0 + Duration::from_secs(1)).await, 3);
+        insert_bounded(&mut entries, key(12), entry(t0 + Duration::from_secs(2)).await, 3);
+        assert_eq!(entries.len(), 3);
+
+        // A distinct new tuple at the cap evicts the oldest, not a live one.
+        insert_bounded(&mut entries, key(13), entry(t0 + Duration::from_secs(3)).await, 3);
+        assert_eq!(entries.len(), 3, "table stays bounded");
+        assert!(!entries.contains_key(&key(10)), "least-recently-active evicted");
+        assert!(entries.contains_key(&key(13)), "new flow inserted");
+        assert!(entries.contains_key(&key(11)) && entries.contains_key(&key(12)));
+
+        // Refreshing an existing key never evicts.
+        insert_bounded(&mut entries, key(11), entry(t0 + Duration::from_secs(4)).await, 3);
+        assert_eq!(entries.len(), 3);
+    }
 
     fn icmp_echo_request(id: u16, seq: u16) -> Vec<u8> {
         let mut pkt = Vec::new();
