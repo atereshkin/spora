@@ -201,6 +201,26 @@ impl Sink<Vec<u8>> for QuicPeerTransport {
     }
 }
 
+impl Drop for QuicPeerTransport {
+    fn drop(&mut self) {
+        // Close the QUIC connection when this transport goes away — on a
+        // direct-upgrade swap (the old relay-via halves are dropped by the
+        // transport router), share-side session replacement, or client
+        // reconnect. Without this the connection lingers forever: keep-alive
+        // (10s) holds it under the 30s idle timeout, and the detached reader and
+        // stats tasks each keep a `Connection` clone, so quinn's
+        // drop-last-handle auto-close never fires. The orphan then PINGs through
+        // the relay for the rest of the process, refreshing its flow entry,
+        // waking the mobile radio, and contradicting the documented "old
+        // relay-via connection drains and times out". Closing sends
+        // CONNECTION_CLOSE and unblocks the reader (`read_datagram` -> Err) and
+        // stats (`close_reason()` -> Some) tasks so they exit and release the
+        // connection.
+        self.conn.close(0u32.into(), b"transport dropped");
+        self._reader.abort();
+    }
+}
+
 /// Send one datagram, logging the failure modes. A `TooLarge` here is benign
 /// (treated as a drop) — the caller is responsible for keeping datagrams
 /// within `max_datagram_size`.
@@ -585,5 +605,34 @@ mod tests {
         }
         assert!(frags.len() >= 2, "packet should have been split");
         assert_eq!(reassemble(&frags), pkt[20..], "fragments reassemble to original");
+    }
+
+    // Dropping a QuicPeerTransport must close its connection, so a superseded
+    // relay-via connection doesn't linger and keep PINGing through the relay.
+    #[tokio::test]
+    async fn dropping_transport_closes_the_connection() {
+        use futures_util::StreamExt;
+
+        let (server, mut client) = loopback_pair().await;
+        // Hold a clone of the server connection to observe its state after drop.
+        let server_conn = server.connection();
+        assert!(server_conn.close_reason().is_none(), "open before drop");
+
+        drop(server);
+
+        // Local effect: the server side records the close immediately.
+        assert!(
+            server_conn.close_reason().is_some(),
+            "dropping the transport must close its connection"
+        );
+
+        // Peer effect: the client observes the connection ending (its datagram
+        // stream errors/ends) rather than the connection lingering on keep-alive.
+        let ended = tokio::time::timeout(Duration::from_secs(2), client.next()).await;
+        match ended {
+            Ok(Some(Err(_))) | Ok(None) => {} // errored or closed — both fine
+            Ok(Some(Ok(_))) => panic!("expected the connection to close, got a datagram"),
+            Err(_) => panic!("client did not observe the connection closing"),
+        }
     }
 }
