@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     task::{Context, Poll, Waker},
@@ -39,6 +39,21 @@ use crate::{
 // NOTE: Default buffer could contain 20 AEAD packets
 const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 0x3FFF * 20;
 const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 0x3FFF * 20;
+
+// Each accepted SYN allocates four buffers of the sizes above (~1.3 MiB total)
+// before any handshake completes, and the inbound packets come from an untrusted
+// peer. Cap the number of concurrently-tracked sockets so a flood of
+// distinct-4-tuple SYNs can't exhaust host memory; at the cap, further SYNs are
+// dropped (smoltcp answers with RST). 256 bounds worst-case TCP buffer memory to
+// ~340 MiB while leaving generous headroom for real concurrent flows.
+const MAX_TCP_SOCKETS: usize = 256;
+
+// A freshly-accepted (half-open) socket gets a short idle timeout so a SYN that
+// never completes the handshake is reaped quickly and its slot freed; once the
+// connection is established the timeout is raised to the generous value below so
+// long-lived idle-but-alive connections (kept warm by keep-alive) aren't killed.
+const HALF_OPEN_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(30);
+const ESTABLISHED_TIMEOUT: smoltcp::time::Duration = smoltcp::time::Duration::from_secs(7200);
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 enum TcpSocketState {
@@ -80,9 +95,12 @@ impl TcpListenerRunner {
         Runner::new(async move {
             let notify = Arc::new(Notify::new());
             let (socket_tx, socket_rx) = unbounded_channel::<TcpSocketCreation>();
+            // Live socket count, shared so the packet task can refuse new SYNs
+            // at the cap and the socket task can release slots on close.
+            let socket_count = Arc::new(AtomicUsize::new(0));
             let res = tokio::select! {
-                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx) => v,
-                v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx) => v,
+                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, socket_count.clone()) => v,
+                v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx, socket_count) => v,
             };
             res?;
             trace!("VirtDevice::poll thread exited");
@@ -97,6 +115,7 @@ impl TcpListenerRunner {
         mut tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: UnboundedSender<TcpStream>,
         socket_tx: UnboundedSender<TcpSocketCreation>,
+        socket_count: Arc<AtomicUsize>,
     ) -> std::io::Result<()> {
         while let Some(frame) = tcp_rx.recv().await {
             let packet = match IpPacket::new_checked(frame.as_slice()) {
@@ -136,13 +155,30 @@ impl TcpListenerRunner {
 
             // TCP first handshake packet, create a new Connection
             if packet.syn() && !packet.ack() {
+                // Bound memory against a SYN flood from the untrusted peer: each
+                // socket pins ~1.3 MiB of buffers, so refuse new ones at the cap
+                // (the frame is still forwarded below, so smoltcp answers RST).
+                if socket_count.load(Ordering::Acquire) >= MAX_TCP_SOCKETS {
+                    trace!(
+                        "TCP socket cap ({}) reached; dropping SYN {} -> {}",
+                        MAX_TCP_SOCKETS, src_addr, dst_addr
+                    );
+                    iface_ingress_tx
+                        .send(frame)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
+                    iface_ingress_tx_avail.store(true, Ordering::Release);
+                    notify.notify_one();
+                    continue;
+                }
                 let mut socket = TcpSocket::new(
                     TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE as usize]),
                     TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE as usize]),
                 );
                 socket.set_keep_alive(Some(Duration::from_secs(28)));
-                // FIXME: It should follow system's setting. 7200 is Linux's default.
-                socket.set_timeout(Some(Duration::from_secs(7200)));
+                // Short timeout until the handshake completes (reaps a SYN that
+                // never finishes); raised to ESTABLISHED_TIMEOUT once the
+                // connection is established (see handle_socket).
+                socket.set_timeout(Some(HALF_OPEN_TIMEOUT));
                 // NO ACK delay
                 // socket.set_ack_delay(None);
                 // Use Cubic instead of smoltcp's default (no congestion
@@ -179,6 +215,7 @@ impl TcpListenerRunner {
                 socket_tx
                     .send(TcpSocketCreation { control, socket })
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
+                socket_count.fetch_add(1, Ordering::AcqRel);
             }
 
             // Pipeline tcp stream packet
@@ -198,6 +235,7 @@ impl TcpListenerRunner {
         iface_ingress_tx_avail: Arc<AtomicBool>,
         mut sockets: HashMap<SocketHandle, SharedControl>,
         mut socket_rx: UnboundedReceiver<TcpSocketCreation>,
+        socket_count: Arc<AtomicUsize>,
     ) -> std::io::Result<()> {
         let mut socket_set = SocketSet::new(vec![]);
         loop {
@@ -222,6 +260,15 @@ impl TcpListenerRunner {
                 let socket_handle = *socket_handle;
                 let socket = socket_set.get_mut::<TcpSocket>(socket_handle);
                 let mut control = control.lock();
+
+                // Once the handshake completes, grant the generous idle timeout
+                // (a half-open SYN keeps the short HALF_OPEN_TIMEOUT it was
+                // created with, so a never-completing SYN is reaped quickly).
+                if socket.state() == TcpState::Established
+                    && socket.timeout() != Some(ESTABLISHED_TIMEOUT)
+                {
+                    socket.set_timeout(Some(ESTABLISHED_TIMEOUT));
+                }
 
                 // Remove the socket only when it is in the closed state.
                 if socket.state() == TcpState::Closed {
@@ -345,6 +392,9 @@ impl TcpListenerRunner {
                 }
             }
 
+            if !sockets_to_remove.is_empty() {
+                socket_count.fetch_sub(sockets_to_remove.len(), Ordering::AcqRel);
+            }
             for socket_handle in sockets_to_remove {
                 sockets.remove(&socket_handle);
                 socket_set.remove(socket_handle);
@@ -581,5 +631,61 @@ impl AsyncWrite for TcpStream {
         self.notify.notify_one();
 
         Poll::Pending
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::MAX_TCP_SOCKETS;
+    use crate::StackBuilder;
+    use futures::{SinkExt, StreamExt};
+    use std::time::Duration;
+
+    /// A bare IPv4 TCP SYN for a distinct 4-tuple.
+    fn syn_packet(src_port: u16, dst_port: u16) -> Vec<u8> {
+        let builder = etherparse::PacketBuilder::ipv4([10, 0, 0, 2], [10, 0, 0, 1], 64)
+            .tcp(src_port, dst_port, 0, 64240)
+            .syn();
+        let mut out = Vec::with_capacity(builder.size(0));
+        builder.write(&mut out, &[]).unwrap();
+        out
+    }
+
+    // A flood of distinct-4-tuple SYNs from the untrusted peer must not create
+    // an unbounded number of sockets: creation stops at MAX_TCP_SOCKETS, so the
+    // host's TCP-buffer memory is bounded. Each accepted SYN emits exactly one
+    // TcpStream, so counting them counts the sockets created.
+    #[tokio::test]
+    async fn syn_flood_is_capped() {
+        let (mut stack, runner, _udp, tcp_listener) =
+            StackBuilder::default().enable_tcp(true).build().unwrap();
+        let mut tcp_listener = tcp_listener.unwrap();
+        tokio::spawn(runner.unwrap());
+
+        // Feed well past the cap. The TCP channel (512) holds these without
+        // backpressure, and half-open sockets don't close during the test, so
+        // the cap is never relieved mid-run.
+        let total = MAX_TCP_SOCKETS + 32;
+        for i in 0..total {
+            let pkt = syn_packet(20000 + i as u16, 30000 + i as u16);
+            stack.send(pkt).await.unwrap();
+        }
+
+        // Drain every emitted stream; the loop ends when no new stream arrives
+        // within the grace window (the surplus SYNs created nothing).
+        let mut created = 0usize;
+        while tokio::time::timeout(Duration::from_millis(300), tcp_listener.next())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            created += 1;
+        }
+
+        assert_eq!(
+            created, MAX_TCP_SOCKETS,
+            "socket creation must stop at the cap, got {created}"
+        );
     }
 }
