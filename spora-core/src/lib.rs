@@ -263,14 +263,18 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     let identity_for_loop = identity.clone();
     let register_interval = config.timings.register_interval;
     let task = tokio::spawn(async move {
-        let register_task = tokio::spawn(relay_client::register_loop(
-            registrar,
-            relay_addr,
-            routing_key,
-            register_interval,
-        ));
-        run_share_loop(endpoint, identity_for_loop, cancel_child, config_for_loop).await;
-        register_task.abort();
+        // Run the relay registrar concurrently *inside* this task rather than
+        // as a detached child. `register_loop` never returns, so the select
+        // resolves only when `run_share_loop` does (on cancellation or endpoint
+        // close), and dropping this task's future — e.g. via `ShareSession::abort()`,
+        // which aborts before the cancelled branch can be re-polled — drops the
+        // registrar with it. A detached `tokio::spawn` would instead leak: its
+        // `JoinHandle` is a local here, and dropping a `JoinHandle` does not abort
+        // the task, so the registrar would keep flapping the relay binding forever.
+        tokio::select! {
+            _ = relay_client::register_loop(registrar, relay_addr, routing_key, register_interval) => {}
+            _ = run_share_loop(endpoint, identity_for_loop, cancel_child, config_for_loop) => {}
+        }
     });
 
     Ok(ShareSession { url, cancel, task })
