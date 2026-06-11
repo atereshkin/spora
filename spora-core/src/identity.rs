@@ -172,16 +172,21 @@ const IDENTITY_MAGIC: [u8; 4] = *b"sIDv";
 const IDENTITY_VERSION: u8 = 1;
 
 fn read_lp_field(bytes: &[u8], cur: &mut usize, name: &str) -> Result<Vec<u8>, String> {
-    if bytes.len() < *cur + 4 {
-        return Err(format!("identity blob: {} length truncated", name));
-    }
-    let len = u32::from_be_bytes(bytes[*cur..*cur + 4].try_into().unwrap()) as usize;
-    *cur += 4;
-    if bytes.len() < *cur + len {
-        return Err(format!("identity blob: {} bytes truncated", name));
-    }
-    let field = bytes[*cur..*cur + len].to_vec();
-    *cur += len;
+    // Checked arithmetic throughout: `len` is an attacker-influenced u32 from the
+    // blob, and on 32-bit targets (armv7/i686 Android) usize is 32 bits, so a
+    // near-u32::MAX length would overflow `*cur + len` and panic instead of
+    // returning Err. from_bytes exists precisely to reject corrupted input.
+    let len_end = cur
+        .checked_add(4)
+        .filter(|e| *e <= bytes.len())
+        .ok_or_else(|| format!("identity blob: {} length truncated", name))?;
+    let len = u32::from_be_bytes(bytes[*cur..len_end].try_into().unwrap()) as usize;
+    let field_end = len_end
+        .checked_add(len)
+        .filter(|e| *e <= bytes.len())
+        .ok_or_else(|| format!("identity blob: {} bytes truncated", name))?;
+    let field = bytes[len_end..field_end].to_vec();
+    *cur = field_end;
     Ok(field)
 }
 
@@ -474,6 +479,24 @@ mod tests {
         let truncated = &bytes[..bytes.len() - 5];
         let err = match Identity::from_bytes(truncated) {
             Ok(_) => panic!("expected error"),
+            Err(e) => e,
+        };
+        assert!(err.contains("truncated"), "got: {}", err);
+    }
+
+    #[test]
+    fn identity_from_bytes_rejects_huge_length_field() {
+        // A corrupted/attacker blob with an enormous length prefix must return
+        // Err, not overflow-panic. (The panic only manifested on 32-bit usize,
+        // but the checked arithmetic must reject it on every target; on 64-bit
+        // the length simply exceeds the remaining bytes.)
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&IDENTITY_MAGIC);
+        bytes.push(IDENTITY_VERSION);
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes()); // cert_len = 0xFFFFFFFF
+        bytes.extend_from_slice(&[0u8; 8]);
+        let err = match Identity::from_bytes(&bytes) {
+            Ok(_) => panic!("expected error for huge length field"),
             Err(e) => e,
         };
         assert!(err.contains("truncated"), "got: {}", err);
