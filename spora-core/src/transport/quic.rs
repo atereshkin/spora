@@ -2,12 +2,11 @@ use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures_util::{Sink, Stream};
-use log::{error, info, warn};
+use log::{debug, error, info, warn};
 use quinn::Connection;
-use quinn::congestion;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -98,6 +97,44 @@ impl QuicPeerTransport {
                 }
             }
         });
+        // Periodic path-stats diagnostic (debug-level): rtt climbing and
+        // lost_pkts accruing under a sustained transfer is the bufferbloat /
+        // congestion-collapse signature. Per-2s deltas for datagrams/loss;
+        // stops when the connection closes. Enable with
+        // `RUST_LOG=spora_core::transport::quic=debug`.
+        let stats_conn = conn.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(2));
+            let (mut last_tx, mut last_rx, mut last_lost) = (0u64, 0u64, 0u64);
+            loop {
+                tick.tick().await;
+                if stats_conn.close_reason().is_some() {
+                    break;
+                }
+                let s = stats_conn.stats();
+                let (txd, rxd, lost) =
+                    (s.frame_tx.datagram, s.frame_rx.datagram, s.path.lost_packets);
+                debug!(
+                    "QUIC path stats: rtt={:?} cwnd={} mtu={} mds={:?} | \
+                     datagrams tx={} (+{}) rx={} (+{}) | lost_pkts={} (+{}) black_holes={}",
+                    s.path.rtt,
+                    s.path.cwnd,
+                    s.path.current_mtu,
+                    stats_conn.max_datagram_size(),
+                    txd,
+                    txd.saturating_sub(last_tx),
+                    rxd,
+                    rxd.saturating_sub(last_rx),
+                    lost,
+                    lost.saturating_sub(last_lost),
+                    s.path.black_holes_detected,
+                );
+                last_tx = txd;
+                last_rx = rxd;
+                last_lost = lost;
+            }
+        });
+
         Self {
             rx,
             conn,
@@ -281,33 +318,6 @@ fn ipv4_header_checksum(header: &[u8]) -> u16 {
     !(sum as u16)
 }
 
-/// No-op congestion controller — always allows sending.
-///
-/// We carry IP packets as QUIC datagrams; the inner TCP (smoltcp) already
-/// handles its own congestion control, so QUIC-level CC just adds latency
-/// and causes send-buffer eviction under load.
-#[derive(Debug, Clone)]
-struct NoopCc {
-    mtu: u16,
-}
-
-impl congestion::Controller for NoopCc {
-    fn on_congestion_event(&mut self, _now: Instant, _sent: Instant, _is_persistent: bool, _lost_bytes: u64) {}
-    fn on_mtu_update(&mut self, new_mtu: u16) { self.mtu = new_mtu; }
-    fn window(&self) -> u64 { u64::MAX / 2 }
-    fn clone_box(&self) -> Box<dyn congestion::Controller> { Box::new(self.clone()) }
-    fn initial_window(&self) -> u64 { u64::MAX / 2 }
-    fn into_any(self: Box<Self>) -> Box<dyn std::any::Any> { self }
-}
-
-struct NoopCcFactory;
-
-impl congestion::ControllerFactory for NoopCcFactory {
-    fn build(self: Arc<Self>, _now: Instant, _current_mtu: u16) -> Box<dyn congestion::Controller> {
-        Box::new(NoopCc { mtu: 1200 })
-    }
-}
-
 /// Build the shared QUIC transport config. `idle_timeout` / `keep_alive`
 /// come from [`crate::Timings`] (defaults: 30s / 10s).
 pub fn build_transport_config(idle_timeout: Duration, keep_alive: Duration) -> quinn::TransportConfig {
@@ -319,9 +329,20 @@ pub fn build_transport_config(idle_timeout: Duration, keep_alive: Duration) -> q
     transport.initial_mtu(1200);
     transport.min_mtu(1200);
     let mut mtud = quinn::MtuDiscoveryConfig::default();
-    mtud.black_hole_cooldown(std::time::Duration::from_secs(0));
+    // A non-trivial cooldown so congestion loss isn't repeatedly misread as an
+    // MTU black hole (0s churned the MTU under load).
+    mtud.black_hole_cooldown(std::time::Duration::from_secs(30));
     transport.mtu_discovery_config(Some(mtud));
-    transport.congestion_controller_factory(Arc::new(NoopCcFactory));
+    // BBR — it paces datagrams to the estimated bottleneck bandwidth. We carry
+    // IP packets as QUIC datagrams; the previous NoopCc paced nothing (infinite
+    // window), so the share-side smoltcp download sender — which, unlike a
+    // kernel TCP, does not pace — burst the path into ~10% self-inflicted loss
+    // and congestion collapse (download decayed to a fraction of upload). BBR's
+    // pacing gives the inner TCP a clean, low-loss pipe; doing congestion
+    // control at the tunnel layer (rather than leaning on the inner TCP's,
+    // which over a lossless-until-overflow datagram channel gets no clean
+    // signal) is the correct shape for a TCP-carrying tunnel.
+    transport.congestion_controller_factory(Arc::new(quinn::congestion::BbrConfig::default()));
     transport
 }
 
