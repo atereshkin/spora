@@ -40,6 +40,9 @@ struct FragGroup {
     header: Vec<u8>,
     /// offset-in-bytes -> payload chunk.
     chunks: BTreeMap<usize, Vec<u8>>,
+    /// Sum of stored chunk bytes — bounded to keep an overlapping-fragment
+    /// flood from ballooning a single group's memory.
+    stored_bytes: usize,
     /// Total payload length, known once the last fragment (MF=0) is seen.
     total_len: Option<usize>,
     deadline: Instant,
@@ -50,6 +53,7 @@ impl FragGroup {
         Self {
             header: Vec::new(),
             chunks: BTreeMap::new(),
+            stored_bytes: 0,
             total_len: None,
             deadline: now + REASSEMBLY_TIMEOUT,
         }
@@ -165,11 +169,20 @@ impl IpReassembler {
         if !mf {
             group.total_len = Some(offset_bytes + payload_len);
         }
-        // Insert the chunk (ignoring an exact duplicate offset to bound memory).
-        group
-            .chunks
-            .entry(offset_bytes)
-            .or_insert_with(|| pkt[ihl..].to_vec());
+        // Insert the chunk. An exact-offset duplicate is ignored. A *new*
+        // offset is rejected if it would push the group past MAX_DATAGRAM_LEN of
+        // stored payload: a legitimate datagram's fragments never overlap, so
+        // they sum to at most the datagram size, but a malicious peer can spray
+        // overlapping fragments at offsets 0,8,16,… each carrying a full payload
+        // and never completing the datagram. Without this bound that stores many
+        // MiB per group; with it, each group holds at most ~64 KiB.
+        if !group.chunks.contains_key(&offset_bytes) {
+            if group.stored_bytes + payload_len > MAX_DATAGRAM_LEN {
+                return Vec::new();
+            }
+            group.stored_bytes += payload_len;
+            group.chunks.insert(offset_bytes, pkt[ihl..].to_vec());
+        }
 
         if group.complete() {
             let group = self.groups.remove(&key).expect("just inserted");
@@ -372,6 +385,55 @@ mod tests {
         let unrelated = ipv4_udp(32, 50);
         r.process(unrelated, t0 + REASSEMBLY_TIMEOUT + Duration::from_secs(1));
         assert_eq!(r.groups.len(), 0, "stale group evicted");
+    }
+
+    /// A raw IPv4/UDP fragment at an arbitrary byte offset (MF set, never last).
+    fn raw_frag(id: u16, offset_bytes: usize, payload_len: usize) -> Vec<u8> {
+        let mut f = vec![0u8; 20 + payload_len];
+        f[0] = 0x45; // IPv4, ihl=5
+        let total = (20 + payload_len) as u16;
+        f[2..4].copy_from_slice(&total.to_be_bytes());
+        f[4..6].copy_from_slice(&id.to_be_bytes());
+        let ff = (((offset_bytes / 8) as u16) & 0x1fff) | 0x2000; // MF set
+        f[6..8].copy_from_slice(&ff.to_be_bytes());
+        f[8] = 64; // ttl
+        f[9] = 17; // UDP
+        f[12..16].copy_from_slice(&[10, 0, 0, 2]);
+        f[16..20].copy_from_slice(&[10, 0, 0, 1]);
+        let c = ipv4_header_checksum(&f[..20]);
+        f[10..12].copy_from_slice(&c.to_be_bytes());
+        f
+    }
+
+    #[test]
+    fn overlapping_fragments_are_byte_bounded() {
+        let mut r = IpReassembler::new();
+        let now = Instant::now();
+        // Spray overlapping fragments at offsets 0,8,16,… each carrying a full
+        // ~1.3 KiB payload, none completing the datagram. Each is a new offset,
+        // so without a per-group byte bound they all accumulate (many MiB).
+        let payload_len = 1304; // multiple of 8
+        for unit in 0..2000u16 {
+            let off = (unit as usize) * 8;
+            if off + payload_len > MAX_DATAGRAM_LEN {
+                break;
+            }
+            r.process(raw_frag(7, off, payload_len), now);
+        }
+        let g = r.groups.values().next().expect("one in-flight group");
+        assert!(
+            g.stored_bytes <= MAX_DATAGRAM_LEN,
+            "per-group stored bytes must be bounded, got {}",
+            g.stored_bytes
+        );
+        // And the cap doesn't break legitimate reassembly.
+        let pkt = ipv4_udp(99, 4000);
+        let frags = fragment(&pkt, 1000);
+        let mut out = Vec::new();
+        for fr in &frags {
+            out.extend(r.process(fr.clone(), now));
+        }
+        assert_eq!(out, vec![normalize(&pkt)]);
     }
 
     #[test]
