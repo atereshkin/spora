@@ -6,3 +6,9 @@ edition = "2024"
 [dependencies]
 tokio = { version = "1", features = ["full"]}
 log = "0.4"
+ring = "0.17"
+rustls-webpki = { version = "0.103", default-features = false, features = ["std", "ring"] }
+rustls-pki-types = "1"
+
+[dev-dependencies]
+rcgen = "0.13"

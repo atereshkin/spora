@@ -12,7 +12,10 @@ pub const CTRL_MAGIC: [u8; 4] = [0x80, b's', b'p', b'R'];
 
 /// Control message types (the byte immediately after `CTRL_MAGIC`).
 pub mod ctrl {
-    /// Sharer (A) registers at a routing key. Body = 20-byte routing key.
+    /// Sharer (A) registers at a routing key. Body is a *signed* registration
+    /// (see [`super::build_signed_register`]); the relay verifies it before
+    /// binding the key, so an on-path observer who learns the (public) routing
+    /// key cannot rebind it.
     pub const REGISTER: u8 = 0x01;
 }
 
@@ -20,13 +23,191 @@ pub mod ctrl {
 /// 9000 §17.2). Mirrors `spora_core::identity::ROUTING_KEY_LEN`.
 pub const ROUTING_KEY_LEN: usize = 20;
 
-/// Build a `REGISTER` control packet for the given routing key.
-pub fn build_register(routing_key: &[u8; ROUTING_KEY_LEN]) -> Vec<u8> {
-    let mut pkt = Vec::with_capacity(CTRL_MAGIC.len() + 1 + ROUTING_KEY_LEN);
+/// Width of the registration timestamp (milliseconds since the Unix epoch).
+const REGISTER_TIMESTAMP_LEN: usize = 8;
+
+/// Domain-separation prefix for the registration signature. Binds a signature
+/// to *this* use (relay registration) and protocol version so it can never be
+/// confused with any other signature the sharer's key might produce.
+const REGISTER_SIG_DOMAIN: &[u8] = b"spora-relay-register-v1";
+
+/// The exact bytes a sharer signs (and the relay verifies) for a registration:
+/// `domain || routing_key || timestamp`. The routing key is bound in, so a
+/// signature for one key cannot be replayed against another; the timestamp is
+/// bound in so the relay can reject replays by requiring it to increase.
+pub fn register_signing_input(
+    routing_key: &[u8; ROUTING_KEY_LEN],
+    timestamp_millis: u64,
+) -> Vec<u8> {
+    let mut v = Vec::with_capacity(REGISTER_SIG_DOMAIN.len() + ROUTING_KEY_LEN + REGISTER_TIMESTAMP_LEN);
+    v.extend_from_slice(REGISTER_SIG_DOMAIN);
+    v.extend_from_slice(routing_key);
+    v.extend_from_slice(&timestamp_millis.to_be_bytes());
+    v
+}
+
+/// Assemble a signed `REGISTER` control packet. Body layout:
+/// `routing_key(20) | timestamp(8, BE) | cert_len(2, BE) | cert_der | signature`.
+/// `signature` is an ECDSA-P256-SHA256 (ASN.1 DER) signature over
+/// [`register_signing_input`], made with the key whose self-signed cert is
+/// `cert_der`. The relay checks `SHA-256(cert_der)[..20] == routing_key`, so
+/// the cert (and thus the verifying key) is pinned by the routing key itself.
+pub fn build_signed_register(
+    routing_key: &[u8; ROUTING_KEY_LEN],
+    timestamp_millis: u64,
+    cert_der: &[u8],
+    signature: &[u8],
+) -> Vec<u8> {
+    debug_assert!(cert_der.len() <= u16::MAX as usize, "cert too large for u16 length");
+    let mut pkt = Vec::with_capacity(
+        CTRL_MAGIC.len() + 1 + ROUTING_KEY_LEN + REGISTER_TIMESTAMP_LEN + 2 + cert_der.len() + signature.len(),
+    );
     pkt.extend_from_slice(&CTRL_MAGIC);
     pkt.push(ctrl::REGISTER);
     pkt.extend_from_slice(routing_key);
+    pkt.extend_from_slice(&timestamp_millis.to_be_bytes());
+    pkt.extend_from_slice(&(cert_der.len() as u16).to_be_bytes());
+    pkt.extend_from_slice(cert_der);
+    pkt.extend_from_slice(signature);
     pkt
+}
+
+/// A parsed-but-not-yet-verified signed registration, borrowed from the packet.
+struct ParsedRegister<'a> {
+    routing_key: [u8; ROUTING_KEY_LEN],
+    timestamp_millis: u64,
+    cert_der: &'a [u8],
+    signature: &'a [u8],
+}
+
+fn parse_signed_register(body: &[u8]) -> Option<ParsedRegister<'_>> {
+    const HEAD: usize = ROUTING_KEY_LEN + REGISTER_TIMESTAMP_LEN + 2;
+    if body.len() < HEAD {
+        return None;
+    }
+    let mut rk = [0u8; ROUTING_KEY_LEN];
+    rk.copy_from_slice(&body[..ROUTING_KEY_LEN]);
+    let ts = u64::from_be_bytes(
+        body[ROUTING_KEY_LEN..ROUTING_KEY_LEN + REGISTER_TIMESTAMP_LEN]
+            .try_into()
+            .unwrap(),
+    );
+    let cert_len =
+        u16::from_be_bytes(body[ROUTING_KEY_LEN + REGISTER_TIMESTAMP_LEN..HEAD].try_into().unwrap())
+            as usize;
+    let cert_end = HEAD.checked_add(cert_len)?;
+    if body.len() <= cert_end {
+        return None; // need a non-empty signature after the cert
+    }
+    Some(ParsedRegister {
+        routing_key: rk,
+        timestamp_millis: ts,
+        cert_der: &body[HEAD..cert_end],
+        signature: &body[cert_end..],
+    })
+}
+
+/// Why a signed registration was rejected. The relay logs this; it carries no
+/// secret-dependent information.
+#[derive(Debug, PartialEq, Eq)]
+pub enum RegisterVerifyError {
+    /// Body did not parse as a signed registration.
+    Malformed,
+    /// `SHA-256(cert)[..20]` did not equal the claimed routing key.
+    RoutingKeyMismatch,
+    /// The certificate could not be parsed as an end-entity cert.
+    BadCert,
+    /// The signature did not verify against the cert's public key.
+    BadSignature,
+}
+
+/// Verify a signed `REGISTER` body and return the `(routing_key, timestamp)` it
+/// authorizes. The caller (relay) still enforces freshness (timestamp must
+/// exceed the last accepted one for the key) and source policy. Holding no
+/// secret, the relay can only *verify*: it confirms the routing key commits to
+/// the presented cert and that the cert's key signed this exact registration.
+pub fn verify_signed_register(
+    body: &[u8],
+) -> Result<([u8; ROUTING_KEY_LEN], u64), RegisterVerifyError> {
+    let parsed = parse_signed_register(body).ok_or(RegisterVerifyError::Malformed)?;
+
+    // The routing key must be the SHA-256 of the cert (truncated to 20 bytes) —
+    // the same derivation the client pins on. This binds the verifying key to
+    // the routing key, so an attacker cannot substitute their own cert.
+    let digest = ring::digest::digest(&ring::digest::SHA256, parsed.cert_der);
+    if digest.as_ref()[..ROUTING_KEY_LEN] != parsed.routing_key {
+        return Err(RegisterVerifyError::RoutingKeyMismatch);
+    }
+
+    let cert = rustls_pki_types::CertificateDer::from(parsed.cert_der);
+    let eec = webpki::EndEntityCert::try_from(&cert).map_err(|_| RegisterVerifyError::BadCert)?;
+    let input = register_signing_input(&parsed.routing_key, parsed.timestamp_millis);
+    eec.verify_signature(webpki::ring::ECDSA_P256_SHA256, &input, parsed.signature)
+        .map_err(|_| RegisterVerifyError::BadSignature)?;
+
+    Ok((parsed.routing_key, parsed.timestamp_millis))
+}
+
+/// Signs the sharer's periodic registrations with the identity's certificate
+/// key. Holds the parsed key pair so each tick is a cheap sign, and guarantees
+/// a strictly-increasing timestamp across this process's lifetime (so the
+/// relay's replay guard never rejects our own refreshes even if the wall clock
+/// stalls or steps backward).
+pub struct RegisterSigner {
+    key_pair: ring::signature::EcdsaKeyPair,
+    rng: ring::rand::SystemRandom,
+    cert_der: Vec<u8>,
+    routing_key: [u8; ROUTING_KEY_LEN],
+    last_ts: u64,
+}
+
+impl RegisterSigner {
+    /// Build a signer from a self-signed cert DER and its PKCS#8 private key
+    /// (exactly the `cert_der_bytes` / `key_der_bytes` an `Identity` holds).
+    pub fn new(cert_der: &[u8], key_pkcs8_der: &[u8]) -> Result<Self, String> {
+        let rng = ring::rand::SystemRandom::new();
+        let key_pair = ring::signature::EcdsaKeyPair::from_pkcs8(
+            &ring::signature::ECDSA_P256_SHA256_ASN1_SIGNING,
+            key_pkcs8_der,
+            &rng,
+        )
+        .map_err(|e| format!("register signer: rejected key: {}", e))?;
+        let digest = ring::digest::digest(&ring::digest::SHA256, cert_der);
+        let mut routing_key = [0u8; ROUTING_KEY_LEN];
+        routing_key.copy_from_slice(&digest.as_ref()[..ROUTING_KEY_LEN]);
+        Ok(Self {
+            key_pair,
+            rng,
+            cert_der: cert_der.to_vec(),
+            routing_key,
+            last_ts: 0,
+        })
+    }
+
+    /// The routing key this signer registers (derived from the cert).
+    pub fn routing_key(&self) -> [u8; ROUTING_KEY_LEN] {
+        self.routing_key
+    }
+
+    /// Produce the next signed REGISTER packet, with a fresh strictly-increasing
+    /// timestamp.
+    pub fn next_register_packet(&mut self) -> Vec<u8> {
+        let ts = now_millis().max(self.last_ts + 1);
+        self.last_ts = ts;
+        let input = register_signing_input(&self.routing_key, ts);
+        let sig = self
+            .key_pair
+            .sign(&self.rng, &input)
+            .expect("ECDSA signing of a fixed-size input does not fail");
+        build_signed_register(&self.routing_key, ts, &self.cert_der, sig.as_ref())
+    }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Classify an inbound UDP packet for the relay's dispatcher.
@@ -82,17 +263,81 @@ pub fn classify(pkt: &[u8]) -> Classified<'_> {
 mod tests {
     use super::*;
 
+    /// A self-signed ECDSA-P256 cert + PKCS#8 key, like an `Identity` carries.
+    fn test_cert() -> (Vec<u8>, Vec<u8>) {
+        let ck = rcgen::generate_simple_self_signed(vec!["spora.peer".to_string()]).unwrap();
+        (ck.cert.der().to_vec(), ck.key_pair.serialize_der())
+    }
+
     #[test]
-    fn register_roundtrip() {
-        let rk: [u8; ROUTING_KEY_LEN] = std::array::from_fn(|i| i as u8);
-        let pkt = build_register(&rk);
+    fn signed_register_classifies_as_control() {
+        let (cert, key) = test_cert();
+        let mut signer = RegisterSigner::new(&cert, &key).unwrap();
+        let pkt = signer.next_register_packet();
         match classify(&pkt) {
             Classified::Control { ty, body } => {
                 assert_eq!(ty, ctrl::REGISTER);
-                assert_eq!(body, &rk[..]);
+                let (rk, _ts) = verify_signed_register(body).expect("verifies");
+                assert_eq!(rk, signer.routing_key());
             }
             other => panic!("expected Control, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn signed_register_round_trip_and_timestamp_increases() {
+        let (cert, key) = test_cert();
+        let mut signer = RegisterSigner::new(&cert, &key).unwrap();
+        let body = |pkt: &[u8]| pkt[CTRL_MAGIC.len() + 1..].to_vec();
+
+        let p1 = signer.next_register_packet();
+        let p2 = signer.next_register_packet();
+        let (rk1, ts1) = verify_signed_register(&body(&p1)).unwrap();
+        let (rk2, ts2) = verify_signed_register(&body(&p2)).unwrap();
+        assert_eq!(rk1, signer.routing_key());
+        assert_eq!(rk2, signer.routing_key());
+        assert!(ts2 > ts1, "timestamps must strictly increase ({ts1} -> {ts2})");
+    }
+
+    #[test]
+    fn tampered_signed_register_is_rejected() {
+        let (cert, key) = test_cert();
+        let mut signer = RegisterSigner::new(&cert, &key).unwrap();
+        let pkt = signer.next_register_packet();
+        let mut body = pkt[CTRL_MAGIC.len() + 1..].to_vec();
+        assert!(verify_signed_register(&body).is_ok());
+
+        // Flip a timestamp byte: signature no longer covers the body.
+        body[ROUTING_KEY_LEN] ^= 0x01;
+        assert_eq!(
+            verify_signed_register(&body),
+            Err(RegisterVerifyError::BadSignature)
+        );
+    }
+
+    #[test]
+    fn signed_register_with_mismatched_routing_key_is_rejected() {
+        // A valid cert+signature, but the routing-key field doesn't commit to
+        // the cert — the relay must refuse to bind it.
+        let (cert, key) = test_cert();
+        let mut signer = RegisterSigner::new(&cert, &key).unwrap();
+        let mut body = signer.next_register_packet()[CTRL_MAGIC.len() + 1..].to_vec();
+        body[0] ^= 0xFF; // corrupt the routing key only
+        assert_eq!(
+            verify_signed_register(&body),
+            Err(RegisterVerifyError::RoutingKeyMismatch)
+        );
+    }
+
+    #[test]
+    fn truncated_signed_register_is_malformed() {
+        let (cert, key) = test_cert();
+        let mut signer = RegisterSigner::new(&cert, &key).unwrap();
+        let body = signer.next_register_packet()[CTRL_MAGIC.len() + 1..].to_vec();
+        assert_eq!(
+            verify_signed_register(&body[..ROUTING_KEY_LEN]),
+            Err(RegisterVerifyError::Malformed)
+        );
     }
 
     #[test]

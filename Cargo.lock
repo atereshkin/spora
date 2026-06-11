@@ -4550,6 +4550,7 @@ dependencies = [
  "clap",
  "env_logger",
  "log",
+ "rcgen",
  "relay-client",
  "tokio",
 ]
@@ -4559,6 +4560,10 @@ name = "relay-client"
 version = "0.1.0"
 dependencies = [
  "log",
+ "rcgen",
+ "ring",
+ "rustls-pki-types",
+ "rustls-webpki",
  "tokio",
 ]
 

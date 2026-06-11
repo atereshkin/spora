@@ -2,8 +2,11 @@
 //! [`serve`].
 //!
 //! Wire protocol (see also `relay_client::protocol`):
-//!   - A (sharer) sends `[CTRL_MAGIC | REGISTER | routing_key(20)]` to the
-//!     relay every ~30s. The relay stores `routing_key -> A's UDP addr`.
+//!   - A (sharer) sends a signed `REGISTER` (routing key + timestamp + cert +
+//!     signature) to the relay every ~30s. The relay verifies the signature
+//!     and the `routing_key == SHA-256(cert)[..20]` commitment, enforces a
+//!     strictly-increasing timestamp (replay guard), and stores
+//!     `routing_key -> A's UDP addr`. It holds no secret — it only verifies.
 //!   - B (client) sends a QUIC Initial with DCID = `routing_key`. The relay
 //!     reads the DCID out of the long header, looks up A's addr, installs
 //!     a bidirectional flow `(B_addr <-> A_addr)`, and forwards.
@@ -28,7 +31,12 @@ pub const RECV_BUF: usize = 4096;
 pub type RoutingKey = [u8; ROUTING_KEY_LEN];
 
 pub struct State {
-    registrations: HashMap<RoutingKey, (SocketAddr, Instant)>,
+    /// `routing_key -> (sharer addr, last-seen Instant, last-accepted signed
+    /// timestamp)`. The timestamp is the replay guard: a REGISTER is only
+    /// accepted if its signed timestamp strictly exceeds the stored one, so a
+    /// captured registration replayed (e.g. from another source) is rejected
+    /// while the genuine sharer keeps refreshing.
+    registrations: HashMap<RoutingKey, (SocketAddr, Instant, u64)>,
     flows: HashMap<SocketAddr, (SocketAddr, Instant)>,
     registration_timeout: Duration,
     flow_timeout: Duration,
@@ -106,7 +114,7 @@ impl State {
         {
             let mut rk: RoutingKey = [0u8; ROUTING_KEY_LEN];
             rk.copy_from_slice(dcid);
-            if let Some((sharer_addr, reg_ts)) = self.registrations.get(&rk).copied() {
+            if let Some((sharer_addr, reg_ts, _)) = self.registrations.get(&rk).copied() {
                 // Refuse a self-referential or non-relayable flow *before* the
                 // one-at-a-time check, so a spoofed packet can neither bootstrap
                 // a self-sustaining loop nor occupy the sharer's flow slot.
@@ -164,23 +172,37 @@ impl State {
     fn handle_control(&mut self, src: SocketAddr, ty: u8, body: &[u8], now: Instant) {
         match ty {
             protocol::ctrl::REGISTER => {
-                if body.len() != ROUTING_KEY_LEN {
-                    warn!(
-                        "REGISTER from {} has wrong body length {}, expected {}",
-                        src,
-                        body.len(),
-                        ROUTING_KEY_LEN
-                    );
-                    return;
-                }
+                // Cheap source check before spending a signature verification.
                 if !is_relayable(&src) {
                     warn!("ignoring REGISTER from non-relayable source {}", src);
                     return;
                 }
-                let mut rk = [0u8; ROUTING_KEY_LEN];
-                rk.copy_from_slice(body);
+                // Verify the signature and that the routing key commits to the
+                // presented cert. We hold no secret — this only proves the
+                // registration was authorized by the key the routing key pins.
+                let (rk, ts) = match protocol::verify_signed_register(body) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        warn!("rejecting REGISTER from {}: {:?}", src, e);
+                        return;
+                    }
+                };
+                // Replay guard: the signed timestamp must strictly exceed the
+                // last one accepted for this key. A captured registration
+                // replayed (e.g. from an attacker's address) carries an
+                // already-seen timestamp and is dropped; the genuine sharer's
+                // next refresh always carries a fresh higher one.
+                if let Some((_, _, last_ts)) = self.registrations.get(&rk)
+                    && ts <= *last_ts
+                {
+                    debug!(
+                        "rejecting stale/replayed REGISTER for rk {:x?} from {} (ts {} <= {})",
+                        &rk[..4], src, ts, last_ts
+                    );
+                    return;
+                }
                 let is_new = !self.registrations.contains_key(&rk);
-                self.registrations.insert(rk, (src, now));
+                self.registrations.insert(rk, (src, now, ts));
                 if is_new {
                     info!("REGISTER rk {:x?} from {}", &rk[..4], src);
                 } else {
@@ -198,7 +220,7 @@ impl State {
         let registration_timeout = self.registration_timeout;
         let flow_timeout = self.flow_timeout;
         self.registrations
-            .retain(|_, (_, ts)| now.duration_since(*ts) < registration_timeout);
+            .retain(|_, (_, ts, _)| now.duration_since(*ts) < registration_timeout);
         self.flows
             .retain(|_, (_, ts)| now.duration_since(*ts) < flow_timeout);
         let reg_removed = before_reg - self.registrations.len();
@@ -248,10 +270,18 @@ pub async fn serve(socket: UdpSocket, mut state: State) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use relay_client::protocol::build_register;
+    use relay_client::protocol::RegisterSigner;
 
     fn addr(s: &str) -> SocketAddr {
         s.parse().unwrap()
+    }
+
+    /// A sharer-side signer with a fresh random ECDSA-P256 cert. Its
+    /// `routing_key()` is the SHA-256 commitment the relay verifies, and
+    /// `next_register_packet()` produces a valid signed REGISTER each call.
+    fn registrar() -> RegisterSigner {
+        let ck = rcgen::generate_simple_self_signed(vec!["spora.peer".to_string()]).unwrap();
+        RegisterSigner::new(&ck.cert.der().to_vec(), &ck.key_pair.serialize_der()).unwrap()
     }
 
     fn initial_with_dcid(dcid: &[u8]) -> Vec<u8> {
@@ -277,11 +307,12 @@ mod tests {
         let a_addr = addr("10.0.0.1:1111");
         let b_addr = addr("10.0.0.2:2222");
 
-        let reg = build_register(&rk(0xAA));
-        assert_eq!(s.handle_packet(a_addr, &reg, now), Action::Drop);
+        let mut a = registrar();
+        let key = a.routing_key();
+        assert_eq!(s.handle_packet(a_addr, &a.next_register_packet(), now), Action::Drop);
         assert_eq!(s.registration_count(), 1);
 
-        let initial = initial_with_dcid(&rk(0xAA));
+        let initial = initial_with_dcid(&key);
         assert_eq!(s.handle_packet(b_addr, &initial, now), Action::Forward(a_addr));
         assert_eq!(s.flow_count(), 2);
 
@@ -319,12 +350,14 @@ mod tests {
         let b1 = addr("10.0.0.2:2222");
         let b2 = addr("10.0.0.3:3333");
 
-        s.handle_packet(a, &build_register(&rk(0x11)), now);
-        s.handle_packet(b1, &initial_with_dcid(&rk(0x11)), now);
+        let mut reg = registrar();
+        let key = reg.routing_key();
+        s.handle_packet(a, &reg.next_register_packet(), now);
+        s.handle_packet(b1, &initial_with_dcid(&key), now);
         assert_eq!(s.flow_count(), 2);
 
         assert_eq!(
-            s.handle_packet(b2, &initial_with_dcid(&rk(0x11)), now),
+            s.handle_packet(b2, &initial_with_dcid(&key), now),
             Action::Drop
         );
         assert_eq!(s.flow_count(), 2);
@@ -342,16 +375,18 @@ mod tests {
         let now = Instant::now();
         let a = addr("10.0.0.1:1111");
 
-        s.handle_packet(a, &build_register(&rk(0x66)), now);
+        let mut reg = registrar();
+        let key = reg.routing_key();
+        s.handle_packet(a, &reg.next_register_packet(), now);
         assert_eq!(
-            s.handle_packet(a, &initial_with_dcid(&rk(0x66)), now),
+            s.handle_packet(a, &initial_with_dcid(&key), now),
             Action::Drop
         );
         assert_eq!(s.flow_count(), 0, "no self-referential flow installed");
         // And the sharer's slot is still free for a genuine client afterwards.
         let b = addr("10.0.0.2:2222");
         assert_eq!(
-            s.handle_packet(b, &initial_with_dcid(&rk(0x66)), now),
+            s.handle_packet(b, &initial_with_dcid(&key), now),
             Action::Forward(a)
         );
     }
@@ -360,13 +395,15 @@ mod tests {
     fn register_from_non_relayable_source_is_ignored() {
         let mut s = State::default();
         let now = Instant::now();
-        // 0.0.0.0 (unspecified) and a multicast address must not be bound.
+        let mut reg = registrar();
+        // 0.0.0.0 (unspecified) and a multicast address must not be bound, even
+        // with an otherwise-valid signature.
         assert_eq!(
-            s.handle_packet(addr("0.0.0.0:9"), &build_register(&rk(0x88)), now),
+            s.handle_packet(addr("0.0.0.0:9"), &reg.next_register_packet(), now),
             Action::Drop
         );
         assert_eq!(
-            s.handle_packet(addr("224.0.0.1:9"), &build_register(&rk(0x88)), now),
+            s.handle_packet(addr("224.0.0.1:9"), &reg.next_register_packet(), now),
             Action::Drop
         );
         assert_eq!(s.registration_count(), 0);
@@ -377,11 +414,13 @@ mod tests {
         let mut s = State::default();
         let now = Instant::now();
         let a = addr("10.0.0.1:1111");
-        s.handle_packet(a, &build_register(&rk(0x99)), now);
+        let mut reg = registrar();
+        let key = reg.routing_key();
+        s.handle_packet(a, &reg.next_register_packet(), now);
         // A client Initial whose (spoofed) source is multicast must be dropped,
         // so the relay never reflects/amplifies to a multicast group.
         assert_eq!(
-            s.handle_packet(addr("224.0.0.5:7"), &initial_with_dcid(&rk(0x99)), now),
+            s.handle_packet(addr("224.0.0.5:7"), &initial_with_dcid(&key), now),
             Action::Drop
         );
         assert_eq!(s.flow_count(), 0);
@@ -394,8 +433,10 @@ mod tests {
         let a = addr("10.0.0.1:1111");
         let b = addr("10.0.0.2:2222");
 
-        s.handle_packet(a, &build_register(&rk(0x22)), t0);
-        s.handle_packet(b, &initial_with_dcid(&rk(0x22)), t0);
+        let mut reg = registrar();
+        let key = reg.routing_key();
+        s.handle_packet(a, &reg.next_register_packet(), t0);
+        s.handle_packet(b, &initial_with_dcid(&key), t0);
 
         let t1 = t0 + Duration::from_secs(50);
         s.handle_packet(b, &short_header(), t1);
@@ -410,7 +451,8 @@ mod tests {
     fn registration_expires_after_timeout() {
         let mut s = State::default();
         let t0 = Instant::now();
-        s.handle_packet(addr("10.0.0.1:1"), &build_register(&rk(0x33)), t0);
+        let mut reg = registrar();
+        s.handle_packet(addr("10.0.0.1:1"), &reg.next_register_packet(), t0);
         assert_eq!(s.registration_count(), 1);
         s.sweep(t0 + REGISTRATION_TIMEOUT - Duration::from_secs(1));
         assert_eq!(s.registration_count(), 1);
@@ -426,11 +468,13 @@ mod tests {
         let t0 = Instant::now();
         let a = addr("10.0.0.1:1111");
         let b = addr("10.0.0.2:2222");
-        s.handle_packet(a, &build_register(&rk(0x55)), t0);
+        let mut reg = registrar();
+        let key = reg.routing_key();
+        s.handle_packet(a, &reg.next_register_packet(), t0);
 
         let late = t0 + REGISTRATION_TIMEOUT + Duration::from_secs(1);
         assert_eq!(
-            s.handle_packet(b, &initial_with_dcid(&rk(0x55)), late),
+            s.handle_packet(b, &initial_with_dcid(&key), late),
             Action::Drop
         );
         assert_eq!(s.flow_count(), 0, "no flow installed off a stale registration");
@@ -442,11 +486,56 @@ mod tests {
         let mut s = State::default();
         let t0 = Instant::now();
         let a = addr("10.0.0.1:1");
-        s.handle_packet(a, &build_register(&rk(0x44)), t0);
+        let mut reg = registrar();
+        s.handle_packet(a, &reg.next_register_packet(), t0);
         let t1 = t0 + REGISTRATION_TIMEOUT - Duration::from_secs(5);
-        s.handle_packet(a, &build_register(&rk(0x44)), t1);
+        // A refresh carries a strictly-greater signed timestamp, so the relay
+        // accepts it and extends the registration.
+        s.handle_packet(a, &reg.next_register_packet(), t1);
         s.sweep(t0 + REGISTRATION_TIMEOUT + Duration::from_secs(1));
         assert_eq!(s.registration_count(), 1);
+    }
+
+    #[test]
+    fn replayed_register_from_other_source_does_not_rebind() {
+        // The #2 fix: an on-path attacker who captures a valid REGISTER cannot
+        // rebind the key by replaying it from its own address — the replayed
+        // copy carries an already-seen timestamp and is refused.
+        let mut s = State::default();
+        let now = Instant::now();
+        let sharer = addr("10.0.0.1:1111");
+        let attacker = addr("10.9.9.9:9999");
+        let mut reg = registrar();
+        let key = reg.routing_key();
+
+        let pkt = reg.next_register_packet();
+        assert_eq!(s.handle_packet(sharer, &pkt, now), Action::Drop);
+        // Attacker replays the identical bytes from its own source.
+        assert_eq!(s.handle_packet(attacker, &pkt, now), Action::Drop);
+
+        // A client is still routed to the genuine sharer, not the attacker.
+        let b = addr("10.0.0.2:2222");
+        assert_eq!(
+            s.handle_packet(b, &initial_with_dcid(&key), now),
+            Action::Forward(sharer)
+        );
+    }
+
+    #[test]
+    fn forged_register_for_known_routing_key_is_rejected() {
+        // Knowing the (public) routing key is not enough: an attacker using
+        // their own cert/key cannot register someone else's routing key,
+        // because it no longer commits to the presented cert.
+        let mut s = State::default();
+        let now = Instant::now();
+        let victim_key = registrar().routing_key();
+
+        let mut attacker = registrar();
+        let pkt = attacker.next_register_packet();
+        let mut body = pkt[protocol::CTRL_MAGIC.len() + 1..].to_vec();
+        body[..ROUTING_KEY_LEN].copy_from_slice(&victim_key);
+        s.handle_control(addr("10.9.9.9:9"), protocol::ctrl::REGISTER, &body, now);
+        assert_eq!(s.registration_count(), 0, "forged register must not bind");
     }
 
     #[test]
@@ -480,10 +569,11 @@ mod tests {
         let a_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let b_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
 
-        let key = rk(0x77);
+        let mut reg = registrar();
+        let key = reg.routing_key();
 
         a_sock
-            .send_to(&build_register(&key), relay_addr)
+            .send_to(&reg.next_register_packet(), relay_addr)
             .await
             .unwrap();
         tokio::time::sleep(Duration::from_millis(20)).await;

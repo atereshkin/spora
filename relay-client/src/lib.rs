@@ -14,8 +14,10 @@ pub use protocol::ROUTING_KEY_LEN;
 /// normal conditions (relay's default registration timeout is 120s).
 pub const DEFAULT_REGISTER_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// Run a sharer-side registration loop on `socket`, sending a REGISTER packet
-/// for `routing_key` to `relay_addr` every `interval`. Cancel by dropping the
+/// Run a sharer-side registration loop on `socket`, sending a freshly *signed*
+/// REGISTER packet to `relay_addr` every `interval` (a new timestamp +
+/// signature each tick, so the relay's replay guard accepts our refreshes but
+/// rejects a captured copy replayed from elsewhere). Cancel by dropping the
 /// task or the socket.
 ///
 /// `socket` should be shared (e.g. via `Arc<UdpSocket>`) with quinn's server
@@ -24,14 +26,14 @@ pub const DEFAULT_REGISTER_INTERVAL: std::time::Duration = std::time::Duration::
 pub async fn register_loop(
     socket: Arc<tokio::net::UdpSocket>,
     relay_addr: std::net::SocketAddr,
-    routing_key: [u8; ROUTING_KEY_LEN],
     interval: std::time::Duration,
+    mut signer: protocol::RegisterSigner,
 ) {
-    let pkt = protocol::build_register(&routing_key);
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tick.tick().await;
+        let pkt = signer.next_register_packet();
         if let Err(e) = socket.send_to(&pkt, relay_addr).await {
             warn!("register_loop: send_to {} failed: {}", relay_addr, e);
         }

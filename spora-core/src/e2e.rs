@@ -251,16 +251,21 @@ mod tests {
     fn split_a_socket(
         std_sock: std::net::UdpSocket,
         relay_addr: SocketAddr,
-        routing_key: [u8; ROUTING_KEY_LEN],
+        identity: &Identity,
     ) -> (std::net::UdpSocket, tokio::task::JoinHandle<()>) {
         let clone = std_sock.try_clone().expect("try_clone");
         clone.set_nonblocking(true).unwrap();
         let tokio_clone = TokioUdp::from_std(clone).unwrap();
+        let signer = relay_client::protocol::RegisterSigner::new(
+            &identity.cert_der_bytes,
+            &identity.key_der_bytes,
+        )
+        .expect("register signer");
         let h = tokio::spawn(relay_client::register_loop(
             Arc::new(tokio_clone),
             relay_addr,
-            routing_key,
             Duration::from_millis(50), // tight for tests
+            signer,
         ));
         (std_sock, h)
     }
@@ -277,7 +282,7 @@ mod tests {
 
         let a_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         a_std.set_nonblocking(true).unwrap();
-        let (a_for_quinn, _reg_h) = split_a_socket(a_std, relay_addr, routing_key);
+        let (a_for_quinn, _reg_h) = split_a_socket(a_std, relay_addr, &identity);
         let a_endpoint = server_endpoint(a_for_quinn, &identity, &Timings::default()).unwrap();
 
         // Give A's first REGISTER a moment to land on the relay.
@@ -360,7 +365,7 @@ mod tests {
 
         let a_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         a_std.set_nonblocking(true).unwrap();
-        let (a_for_quinn, _reg_h) = split_a_socket(a_std, relay_addr, routing_key);
+        let (a_for_quinn, _reg_h) = split_a_socket(a_std, relay_addr, &identity);
         let a_endpoint = server_endpoint(a_for_quinn, &identity, &Timings::default()).unwrap();
         tokio::time::sleep(Duration::from_millis(100)).await;
 

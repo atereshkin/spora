@@ -257,6 +257,13 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
         relay_addr
     );
 
+    // Sign each relay registration with the identity's certificate key, so the
+    // relay (which holds no secret) can verify the routing key is ours and
+    // reject an on-path attacker's attempt to rebind it.
+    let signer =
+        relay_client::protocol::RegisterSigner::new(&identity.cert_der_bytes, &identity.key_der_bytes)
+            .map_err(|e| format!("build register signer: {}", e))?;
+
     let cancel = CancellationToken::new();
     let cancel_child = cancel.clone();
     let config_for_loop = config.clone();
@@ -272,7 +279,7 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
         // `JoinHandle` is a local here, and dropping a `JoinHandle` does not abort
         // the task, so the registrar would keep flapping the relay binding forever.
         tokio::select! {
-            _ = relay_client::register_loop(registrar, relay_addr, routing_key, register_interval) => {}
+            _ = relay_client::register_loop(registrar, relay_addr, register_interval, signer) => {}
             _ = run_share_loop(endpoint, identity_for_loop, cancel_child, config_for_loop) => {}
         }
     });
