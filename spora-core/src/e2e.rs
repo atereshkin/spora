@@ -80,11 +80,23 @@ pub async fn accept_one(
     expected_secret: &[u8; SECRET_LEN],
 ) -> Option<Result<E2eSession, String>> {
     let incoming = endpoint.accept().await?;
-    let conn_result = tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await;
-    let conn = match conn_result {
+    Some(authenticate_incoming(incoming, expected_secret).await)
+}
+
+/// Drive one already-accepted `Incoming` through the QUIC handshake and the
+/// secret-auth step. Split out from `accept_one` so the share loop can run this
+/// concurrently per connection: a peer that completes the handshake but stalls
+/// the secret read (an attacker who knows the routing key but not the secret)
+/// only ties up its own task until `AUTH_TIMEOUT`, instead of blocking the
+/// serial accept loop and starving legitimate peers.
+pub async fn authenticate_incoming(
+    incoming: quinn::Incoming,
+    expected_secret: &[u8; SECRET_LEN],
+) -> Result<E2eSession, String> {
+    let conn = match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
         Ok(Ok(c)) => c,
-        Ok(Err(e)) => return Some(Err(format!("QUIC handshake failed: {}", e))),
-        Err(_) => return Some(Err("QUIC handshake timed out".into())),
+        Ok(Err(e)) => return Err(format!("QUIC handshake failed: {}", e)),
+        Err(_) => return Err("QUIC handshake timed out".into()),
     };
     let peer = conn.remote_address();
     debug!("e2e accept: handshake from {} complete", peer);
@@ -106,26 +118,26 @@ pub async fn accept_one(
         Ok(Ok(x)) => x,
         Ok(Err(e)) => {
             conn.close(1u32.into(), b"auth-error");
-            return Some(Err(format!("auth from {}: {}", peer, e)));
+            return Err(format!("auth from {}: {}", peer, e));
         }
         Err(_) => {
             conn.close(1u32.into(), b"auth-timeout");
-            return Some(Err(format!("auth from {} timed out", peer)));
+            return Err(format!("auth from {} timed out", peer));
         }
     };
     if presented != *expected_secret {
         conn.close(1u32.into(), b"bad-secret");
-        return Some(Err(format!("auth from {}: bad secret", peer)));
+        return Err(format!("auth from {}: bad secret", peer));
     }
     info!("e2e accept: authenticated peer {}", peer);
 
     let transport = QuicPeerTransport::new(conn.clone());
     let signal = SignalChannel::new(send, recv);
-    Some(Ok(E2eSession {
+    Ok(E2eSession {
         conn,
         transport,
         signal,
-    }))
+    })
 }
 
 // ---------- Client (B) ----------
@@ -392,5 +404,121 @@ mod tests {
             Err(e) => e,
         };
         assert!(err.contains("bad secret"), "got: {}", err);
+    }
+
+    /// Accept any server cert — only for the raw stalling client below.
+    #[derive(Debug)]
+    struct AcceptAny(Arc<rustls::crypto::CryptoProvider>);
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAny {
+        fn verify_server_cert(
+            &self,
+            _e: &rustls::pki_types::CertificateDer<'_>,
+            _i: &[rustls::pki_types::CertificateDer<'_>],
+            _s: &rustls::pki_types::ServerName<'_>,
+            _o: &[u8],
+            _n: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+        fn verify_tls12_signature(
+            &self,
+            m: &[u8],
+            c: &rustls::pki_types::CertificateDer<'_>,
+            d: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+        }
+        fn verify_tls13_signature(
+            &self,
+            m: &[u8],
+            c: &rustls::pki_types::CertificateDer<'_>,
+            d: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+        }
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    /// Connect to `addr` and complete the handshake, but never open the auth
+    /// stream — a peer that knows enough to handshake but not the secret. Uses a
+    /// fresh random DCID (unlike `client_endpoint`'s relay-routing fixed DCID),
+    /// so it doesn't collide with the legit client on the direct path.
+    async fn connect_and_stall(addr: SocketAddr) -> quinn::Connection {
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let mut cc = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAny(provider)))
+            .with_no_client_auth();
+        cc.alpn_protocols = vec![E2E_ALPN.to_vec()];
+        let mut ep = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        ep.set_default_client_config(quinn::ClientConfig::new(Arc::new(
+            quinn::crypto::rustls::QuicClientConfig::try_from(cc).unwrap(),
+        )));
+        let conn = ep
+            .connect(addr, SERVER_NAME)
+            .unwrap()
+            .await
+            .expect("stalling client handshake");
+        Box::leak(Box::new(ep)); // keep the endpoint (and thus conn) alive
+        conn
+    }
+
+    // A peer that completes the QUIC handshake but stalls the secret read (an
+    // attacker who knows only the public routing key) must not block a
+    // legitimate peer from authenticating. Mirrors run_share_loop's structure:
+    // accept connections and authenticate each in its own task. Run over the
+    // direct path so the relay's flow logic doesn't enter into it.
+    #[tokio::test]
+    async fn stalled_auth_does_not_block_other_peers() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let identity = Identity::generate();
+        let secret = identity.secret;
+        let rk = identity.routing_key;
+
+        let s_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        s_std.set_nonblocking(true).unwrap();
+        let s_addr = s_std.local_addr().unwrap();
+        let server_ep = server_endpoint(s_std, &identity, &Timings::default()).unwrap();
+
+        // Concurrent accept loop (as in run_share_loop).
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let accept_ep = server_ep.clone();
+        tokio::spawn(async move {
+            while let Some(incoming) = accept_ep.accept().await {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    if let Ok(s) = authenticate_incoming(incoming, &secret).await {
+                        let _ = tx.send(s);
+                    }
+                });
+            }
+        });
+
+        // Attacker finishes the handshake first, then deliberately stalls.
+        let _attacker = connect_and_stall(s_addr).await;
+
+        // The legit peer must connect AND be delivered to the share side
+        // promptly, well within AUTH_TIMEOUT. With a serial accept loop the
+        // server can't even drive B's handshake until the attacker's auth times
+        // out (AUTH_TIMEOUT), so this whole block would exceed the deadline.
+        let legit = tokio::time::timeout(Duration::from_secs(3), async {
+            let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+            b_std.set_nonblocking(true).unwrap();
+            let b_ep = client_endpoint(b_std, rk, &Timings::default()).unwrap();
+            let _b = client_connect(&b_ep, s_addr, &secret)
+                .await
+                .expect("legit client should authenticate");
+            rx.recv().await
+        })
+        .await;
+        assert!(
+            matches!(legit, Ok(Some(_))),
+            "legit peer must authenticate quickly despite the stalled attacker"
+        );
     }
 }

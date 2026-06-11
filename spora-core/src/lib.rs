@@ -22,7 +22,9 @@ use tokio::task::JoinHandle;
 pub use tokio_util::sync::CancellationToken;
 use url::Url;
 
-use crate::e2e::{accept_one, client_connect, client_endpoint, server_endpoint, E2eSession};
+use crate::e2e::{
+    accept_one, authenticate_incoming, client_connect, client_endpoint, server_endpoint, E2eSession,
+};
 use crate::identity::{Identity, Token, ROUTING_KEY_LEN, SECRET_LEN};
 use crate::neg::{NegChannel, SignalNegChannel};
 use crate::server::TunnelError;
@@ -296,39 +298,60 @@ async fn run_share_loop(
     let secret = identity.secret;
     let mut tunnel_cancel: Option<CancellationToken> = None;
     let mut iteration: u32 = 0;
+    // Authenticated sessions arrive here from the per-connection auth tasks.
+    let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<E2eSession>();
 
+    info!("[share] waiting for peers");
     loop {
-        iteration += 1;
-        info!("[share #{}] waiting for peer", iteration);
-        let session = tokio::select! {
+        tokio::select! {
             _ = cancel.cancelled() => {
                 info!("share cancelled");
                 if let Some(tc) = tunnel_cancel.take() { tc.cancel(); }
                 endpoint.close(0u32.into(), b"share-cancelled");
                 break;
             }
-            result = accept_one(&endpoint, &secret) => match result {
-                None => { info!("share endpoint closed"); break; }
-                Some(Ok(s)) => s,
-                Some(Err(e)) => { warn!("[share #{}] accept failed: {}", iteration, e); continue; }
-            },
-        };
+            // Accept connection attempts and authenticate each one in its own
+            // task, so a peer that stalls the secret read (an attacker who knows
+            // only the routing key) can't block the accept loop and starve
+            // legitimate peers. The sharer still serves one tunnel at a time;
+            // we just no longer serialize the handshake+auth of every attempt.
+            incoming = endpoint.accept() => {
+                match incoming {
+                    None => { info!("share endpoint closed"); break; }
+                    Some(incoming) => {
+                        let tx = session_tx.clone();
+                        let cancel = cancel.clone();
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = cancel.cancelled() => {}
+                                res = authenticate_incoming(incoming, &secret) => match res {
+                                    Ok(session) => { let _ = tx.send(session); }
+                                    Err(e) => warn!("[share] accept failed: {}", e),
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            Some(session) = session_rx.recv() => {
+                iteration += 1;
+                emit(
+                    &config.event_hook,
+                    TunnelEvent::RelaySessionEstablished {
+                        peer: session.conn.remote_address(),
+                    },
+                );
 
-        emit(
-            &config.event_hook,
-            TunnelEvent::RelaySessionEstablished {
-                peer: session.conn.remote_address(),
-            },
-        );
+                if let Some(tc) = tunnel_cancel.take() {
+                    info!("[share #{}] new peer, cancelling previous tunnel", iteration);
+                    tc.cancel();
+                }
 
-        if let Some(tc) = tunnel_cancel.take() {
-            info!("[share #{}] new peer, cancelling previous tunnel", iteration);
-            tc.cancel();
+                let child_cancel = cancel.child_token();
+                tunnel_cancel = Some(child_cancel.clone());
+                spawn_responder_tunnel(session, identity.clone(), &config, child_cancel);
+            }
         }
-
-        let child_cancel = cancel.child_token();
-        tunnel_cancel = Some(child_cancel.clone());
-        spawn_responder_tunnel(session, identity.clone(), &config, child_cancel);
     }
 }
 
