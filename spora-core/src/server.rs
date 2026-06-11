@@ -241,30 +241,36 @@ pub fn is_local_address(addr: IpAddr) -> bool {
     }
 }
 
-async fn handle_tcp_streams(mut tcp_listener: TcpListener, protector: SocketProtector, block_local: bool) {
+async fn handle_tcp_streams(
+    mut tcp_listener: TcpListener,
+    protector: SocketProtector,
+    block_local: bool,
+    cancel: CancellationToken,
+) {
     while let Some((mut stream, local, remote)) = tcp_listener.next().await {
         if block_local && is_local_address(remote.ip()) {
             warn!("blocked TCP connection to local address: {:?} => {:?}", local, remote);
             continue;
         }
         let protector = protector.clone();
+        let cancel = cancel.clone();
         tokio::spawn(async move {
             info!("new tcp connection: {:?} => {:?}", local, remote);
-            match new_tcp_stream(remote, &protector).await {
-                Ok(mut remote_stream) => {
-                    // pipe between two tcp stream
-                    match tokio::io::copy_bidirectional(&mut stream, &mut remote_stream).await {
-                        Ok(_) => {}
-                        Err(e) => warn!(
-                            "failed to copy tcp stream {:?}=>{:?}, err: {:?}",
-                            local, remote, e
-                        ),
+            // Race the proxy against teardown so the connection (and its OS
+            // socket) is dropped when the session ends, rather than leaking.
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                r = async {
+                    match new_tcp_stream(remote, &protector).await {
+                        Ok(mut remote_stream) => {
+                            // pipe between two tcp stream
+                            if let Err(e) = tokio::io::copy_bidirectional(&mut stream, &mut remote_stream).await {
+                                warn!("failed to copy tcp stream {:?}=>{:?}, err: {:?}", local, remote, e);
+                            }
+                        }
+                        Err(e) => warn!("failed to new tcp stream {:?}=>{:?}, err: {:?}", local, remote, e),
                     }
-                }
-                Err(e) => warn!(
-                    "failed to new tcp stream {:?}=>{:?}, err: {:?}",
-                    local, remote, e
-                ),
+                } => { let () = r; }
             }
         });
     }
@@ -310,12 +316,23 @@ struct NATEntry {
     last_activity: Instant,
 }
 
-async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket, protector: SocketProtector, block_local: bool) {
+async fn handle_inbound_datagram(
+    udp_socket: netstack_smoltcp::UdpSocket,
+    protector: SocketProtector,
+    block_local: bool,
+    cancel: CancellationToken,
+) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let (mut read_half, mut write_half) = udp_socket.split();
+    let writer_cancel = cancel.clone();
     tokio::spawn(async move {
-        while let Some((data, local, remote)) = rx.recv().await {
-            let _ = write_half.send((data, remote, local)).await;
+        tokio::select! {
+            _ = writer_cancel.cancelled() => {}
+            _ = async {
+                while let Some((data, local, remote)) = rx.recv().await {
+                    let _ = write_half.send((data, remote, local)).await;
+                }
+            } => {}
         }
     });
 
@@ -349,21 +366,29 @@ async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket, protec
                             let socket = Arc::new(socket);
                             let recv_socket = socket.clone();
                             let tx = tx.clone();
+                            let recv_cancel = cancel.clone();
                             let task = tokio::spawn(async move {
-                                let mut buf = vec![0; 1500];
-                                loop {
-                                    match recv_socket.recv_from(&mut buf).await {
-                                        Ok((len, _)) => {
-                                            let _ = tx.send((buf[..len].to_vec(), local, remote));
+                                // Stop on teardown so the OS socket + task are
+                                // released, not leaked, when the session ends.
+                                tokio::select! {
+                                    _ = recv_cancel.cancelled() => {}
+                                    _ = async {
+                                        let mut buf = vec![0; 1500];
+                                        loop {
+                                            match recv_socket.recv_from(&mut buf).await {
+                                                Ok((len, _)) => {
+                                                    let _ = tx.send((buf[..len].to_vec(), local, remote));
+                                                }
+                                                Err(e) => {
+                                                    warn!(
+                                                        "failed to recv udp datagram {:?}<->{:?}: {:?}",
+                                                        local, remote, e
+                                                    );
+                                                    break;
+                                                }
+                                            }
                                         }
-                                        Err(e) => {
-                                            warn!(
-                                                "failed to recv udp datagram {:?}<->{:?}: {:?}",
-                                                local, remote, e
-                                            );
-                                            break;
-                                        }
-                                    }
+                                    } => {}
                                 }
                             });
                             let _ = socket.send(&data).await;
@@ -463,10 +488,26 @@ pub(crate) async fn start_tunnel(transport: IpTransport, protector: SocketProtec
 
     let runner_handle = runner.map(|r| tokio::spawn(r));
 
+    // Cancels every per-flow task (TCP copy loops, UDP writer + NAT recv tasks)
+    // on teardown. The handlers' own tasks are aborted below, but the per-flow
+    // tasks they spawn are detached, so without this they'd leak (sockets + tasks)
+    // every time a session ends.
+    let flow_cancel = CancellationToken::new();
+
     let w_tunnel = tokio::spawn(run_tunnel(transport, stack));
     let w_tunnel_abort = w_tunnel.abort_handle();
-    let w_tcp = tokio::spawn(handle_tcp_streams(tcp_listener, protector.clone(), block_local));
-    let w_udp = tokio::spawn(handle_inbound_datagram(udp_socket, protector, block_local));
+    let w_tcp = tokio::spawn(handle_tcp_streams(
+        tcp_listener,
+        protector.clone(),
+        block_local,
+        flow_cancel.clone(),
+    ));
+    let w_udp = tokio::spawn(handle_inbound_datagram(
+        udp_socket,
+        protector,
+        block_local,
+        flow_cancel.clone(),
+    ));
 
     // `run_tunnel` owns the tunnel's lifecycle. The TCP/UDP NAT handlers and
     // the smoltcp runner are subordinate: when the tunnel driver ends (peer
@@ -487,6 +528,8 @@ pub(crate) async fn start_tunnel(transport: IpTransport, protector: SocketProtec
             info!("Tunnel driver ended, tearing down tunnel tasks");
         }
     }
+    // Stop the detached per-flow tasks first, then abort the handler loops.
+    flow_cancel.cancel();
     for h in &subordinate_aborts {
         h.abort();
     }
