@@ -270,30 +270,13 @@ impl TcpListenerRunner {
                     socket.set_timeout(Some(ESTABLISHED_TIMEOUT));
                 }
 
-                // Remove the socket only when it is in the closed state.
-                if socket.state() == TcpState::Closed {
-                    sockets_to_remove.push(socket_handle);
-
-                    control.send_state = TcpSocketState::Closed;
-                    control.recv_state = TcpSocketState::Closed;
-
-                    if let Some(waker) = control.send_waker.take() {
-                        waker.wake();
-                    }
-                    if let Some(waker) = control.recv_waker.take() {
-                        waker.wake();
-                    }
-
-                    trace!("closed TCP connection");
-                    continue;
-                }
-
-                // SHUT_WR is handled AFTER the writable drain below — closing
-                // here would move the socket to FIN-WAIT (can_send() == false)
-                // before the still-buffered tail is pushed into smoltcp,
-                // silently truncating the stream.
-
-                // Check if readable
+                // Drain readable data FIRST, *before* the closed-socket removal
+                // below. A socket can reach Closed with a tail still buffered in
+                // smoltcp — a [data, FIN] or [data, RST] burst processed in one
+                // iface.poll, or backpressure that filled our recv_buffer. The
+                // old order removed the socket before this drain, dropping that
+                // tail and reporting a clean EOF (the read-side analogue of the
+                // write-side half-close truncation fixed in 84685b8).
                 let mut wake_receiver = false;
                 while socket.can_recv() && !control.recv_buffer.is_full() {
                     let result = socket.recv(|buffer| {
@@ -319,6 +302,41 @@ impl TcpListenerRunner {
                         }
                     }
                 }
+
+                // Remove a Closed socket only once it is fully drained (or the
+                // reader is gone). If smoltcp still holds data but our
+                // recv_buffer filled and the reader is still consuming
+                // (recv_state Normal), keep the socket and wake the reader:
+                // poll_read notifies us as it frees recv_buffer, so the tail
+                // drains over the next polls. recv_state stays Normal until then,
+                // so the reader doesn't see a premature EOF (poll_read only
+                // reports EOF once recv_buffer is empty and recv_state Closed).
+                // The Normal check also bounds this: if the reader dropped, its
+                // Drop set recv_state to Close, so we remove instead of leaking.
+                if socket.state() == TcpState::Closed {
+                    if socket.can_recv() && matches!(control.recv_state, TcpSocketState::Normal) {
+                        if let Some(waker) = control.recv_waker.take() {
+                            waker.wake();
+                        }
+                    } else {
+                        sockets_to_remove.push(socket_handle);
+                        control.send_state = TcpSocketState::Closed;
+                        control.recv_state = TcpSocketState::Closed;
+                        if let Some(waker) = control.send_waker.take() {
+                            waker.wake();
+                        }
+                        if let Some(waker) = control.recv_waker.take() {
+                            waker.wake();
+                        }
+                        trace!("closed TCP connection");
+                    }
+                    continue;
+                }
+
+                // SHUT_WR is handled AFTER the writable drain below — closing
+                // here would move the socket to FIN-WAIT (can_send() == false)
+                // before the still-buffered tail is pushed into smoltcp,
+                // silently truncating the stream.
 
                 // If socket is not in ESTABLISH, FIN-WAIT-1, FIN-WAIT-2,
                 // the local client have closed our receiver.
