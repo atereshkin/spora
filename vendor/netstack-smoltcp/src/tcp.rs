@@ -1,10 +1,10 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     net::SocketAddr,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, AtomicUsize, Ordering},
-        Arc,
+        atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
     },
     task::{Context, Poll, Waker},
 };
@@ -75,7 +75,15 @@ struct TcpSocketControl {
 struct TcpSocketCreation {
     control: SharedControl,
     socket: TcpSocket<'static>,
+    flow: Flow,
 }
+
+/// A TCP connection 4-tuple: (source addr, dest addr). Used to both cap the
+/// number of live sockets and dedup retransmitted SYNs.
+type Flow = (SocketAddr, SocketAddr);
+/// The set of live connection 4-tuples, shared between the packet task (which
+/// admits new SYNs) and the socket task (which releases them on close).
+type LiveFlows = Arc<Mutex<HashSet<Flow>>>;
 
 type SharedNotify = Arc<Notify>;
 type SharedControl = Arc<SpinMutex<TcpSocketControl>>;
@@ -95,12 +103,13 @@ impl TcpListenerRunner {
         Runner::new(async move {
             let notify = Arc::new(Notify::new());
             let (socket_tx, socket_rx) = unbounded_channel::<TcpSocketCreation>();
-            // Live socket count, shared so the packet task can refuse new SYNs
-            // at the cap and the socket task can release slots on close.
-            let socket_count = Arc::new(AtomicUsize::new(0));
+            // Live connection 4-tuples, shared so the packet task can both cap
+            // the number of sockets and skip a duplicate (retransmitted) SYN,
+            // and the socket task can release them on close.
+            let live_flows: LiveFlows = Arc::new(Mutex::new(HashSet::new()));
             let res = tokio::select! {
-                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, socket_count.clone()) => v,
-                v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx, socket_count) => v,
+                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, live_flows.clone()) => v,
+                v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx, live_flows) => v,
             };
             res?;
             trace!("VirtDevice::poll thread exited");
@@ -115,7 +124,7 @@ impl TcpListenerRunner {
         mut tcp_rx: Receiver<AnyIpPktFrame>,
         stream_tx: UnboundedSender<TcpStream>,
         socket_tx: UnboundedSender<TcpSocketCreation>,
-        socket_count: Arc<AtomicUsize>,
+        live_flows: LiveFlows,
     ) -> std::io::Result<()> {
         while let Some(frame) = tcp_rx.recv().await {
             let packet = match IpPacket::new_checked(frame.as_slice()) {
@@ -155,14 +164,31 @@ impl TcpListenerRunner {
 
             // TCP first handshake packet, create a new Connection
             if packet.syn() && !packet.ack() {
-                // Bound memory against a SYN flood from the untrusted peer: each
-                // socket pins ~1.3 MiB of buffers, so refuse new ones at the cap
-                // (the frame is still forwarded below, so smoltcp answers RST).
-                if socket_count.load(Ordering::Acquire) >= MAX_TCP_SOCKETS {
-                    trace!(
-                        "TCP socket cap ({}) reached; dropping SYN {} -> {}",
-                        MAX_TCP_SOCKETS, src_addr, dst_addr
-                    );
+                let flow: Flow = (src_addr, dst_addr);
+                // Admit the SYN only if it's a genuinely new 4-tuple and we're
+                // under the socket cap. Two reasons to skip socket creation here:
+                //  - Duplicate (retransmitted) SYN: normal whenever a SYN-ACK is
+                //    lost on this product's lossy WAN. smoltcp delivers the
+                //    retransmit to the existing socket, so creating a second one
+                //    leaks ~1.3 MiB + a socket + a duplicate outbound dial.
+                //  - Cap: each socket pins ~1.3 MiB, so a flood of distinct SYNs
+                //    could exhaust memory.
+                // In both cases the frame is still forwarded below (to the
+                // existing socket, or so smoltcp answers RST at the cap).
+                let admit = {
+                    let mut flows = live_flows.lock().unwrap();
+                    if flows.contains(&flow) {
+                        trace!("duplicate SYN {} -> {}, forwarding to existing socket", src_addr, dst_addr);
+                        false
+                    } else if flows.len() >= MAX_TCP_SOCKETS {
+                        trace!("TCP socket cap ({}) reached; dropping SYN {} -> {}", MAX_TCP_SOCKETS, src_addr, dst_addr);
+                        false
+                    } else {
+                        flows.insert(flow);
+                        true
+                    }
+                };
+                if !admit {
                     iface_ingress_tx
                         .send(frame)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
@@ -213,9 +239,8 @@ impl TcpListenerRunner {
                     })
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
                 socket_tx
-                    .send(TcpSocketCreation { control, socket })
+                    .send(TcpSocketCreation { control, socket, flow })
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
-                socket_count.fetch_add(1, Ordering::AcqRel);
             }
 
             // Pipeline tcp stream packet
@@ -235,13 +260,17 @@ impl TcpListenerRunner {
         iface_ingress_tx_avail: Arc<AtomicBool>,
         mut sockets: HashMap<SocketHandle, SharedControl>,
         mut socket_rx: UnboundedReceiver<TcpSocketCreation>,
-        socket_count: Arc<AtomicUsize>,
+        live_flows: LiveFlows,
     ) -> std::io::Result<()> {
         let mut socket_set = SocketSet::new(vec![]);
+        // Maps each live socket back to its flow so we can release it from
+        // `live_flows` (which caps and dedups admissions) when it closes.
+        let mut socket_flows: HashMap<SocketHandle, Flow> = HashMap::new();
         loop {
-            while let Ok(TcpSocketCreation { control, socket }) = socket_rx.try_recv() {
+            while let Ok(TcpSocketCreation { control, socket, flow }) = socket_rx.try_recv() {
                 let handle = socket_set.add(socket);
                 sockets.insert(handle, control);
+                socket_flows.insert(handle, flow);
             }
 
             let before_poll = Instant::now();
@@ -411,7 +440,12 @@ impl TcpListenerRunner {
             }
 
             if !sockets_to_remove.is_empty() {
-                socket_count.fetch_sub(sockets_to_remove.len(), Ordering::AcqRel);
+                let mut flows = live_flows.lock().unwrap();
+                for socket_handle in &sockets_to_remove {
+                    if let Some(flow) = socket_flows.remove(socket_handle) {
+                        flows.remove(&flow);
+                    }
+                }
             }
             for socket_handle in sockets_to_remove {
                 sockets.remove(&socket_handle);
@@ -705,5 +739,32 @@ mod tests {
             created, MAX_TCP_SOCKETS,
             "socket creation must stop at the cap, got {created}"
         );
+    }
+
+    // A retransmitted SYN (same 4-tuple, e.g. after a lost SYN-ACK on the lossy
+    // WAN) must not create a second socket/stream/outbound dial.
+    #[tokio::test]
+    async fn retransmitted_syn_creates_one_socket() {
+        let (mut stack, runner, _udp, tcp_listener) =
+            StackBuilder::default().enable_tcp(true).build().unwrap();
+        let mut tcp_listener = tcp_listener.unwrap();
+        tokio::spawn(runner.unwrap());
+
+        // Same 4-tuple, sent four times.
+        let syn = syn_packet(20000, 30000);
+        for _ in 0..4 {
+            stack.send(syn.clone()).await.unwrap();
+        }
+
+        let mut created = 0usize;
+        while tokio::time::timeout(Duration::from_millis(300), tcp_listener.next())
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            created += 1;
+        }
+        assert_eq!(created, 1, "a retransmitted SYN must not create a second socket");
     }
 }
