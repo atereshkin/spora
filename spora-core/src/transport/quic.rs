@@ -1,6 +1,7 @@
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU16, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -41,6 +42,9 @@ pub fn generate_self_signed_cert() -> (CertificateDer<'static>, PrivateKeyDer<'s
 pub struct QuicPeerTransport {
     rx: mpsc::UnboundedReceiver<io::Result<Vec<u8>>>,
     conn: Connection,
+    /// Monotonic IP Identification for outbound fragmented datagrams (see
+    /// `fragment_ipv4`), so distinct datagrams never share an id.
+    ip_id_ctr: AtomicU16,
     _reader: JoinHandle<()>,
 }
 
@@ -138,6 +142,7 @@ impl QuicPeerTransport {
         Self {
             rx,
             conn,
+            ip_id_ctr: AtomicU16::new(0),
             _reader: reader,
         }
     }
@@ -168,7 +173,8 @@ impl Sink<Vec<u8>> for QuicPeerTransport {
         // IPv4-fragment them so the receiving peer's kernel reassembles.
         match self.conn.max_datagram_size() {
             Some(max) if item.len() > max => {
-                match fragment_ipv4(&item, max) {
+                let ip_id = self.ip_id_ctr.fetch_add(1, Ordering::Relaxed);
+                match fragment_ipv4(&item, max, ip_id) {
                     Some(frags) => {
                         for frag in frags {
                             send_datagram_logged(&self.conn, frag)?;
@@ -255,14 +261,16 @@ fn send_datagram_logged(conn: &Connection, pkt: Vec<u8>) -> io::Result<()> {
 
 /// Split an IPv4 packet into fragments that each fit within `max_len` bytes
 /// (header + data), so a peer's kernel can reassemble the original. Returns
-/// `None` if `pkt` isn't IPv4 or can't be fragmented to fit.
+/// `None` if `pkt` isn't IPv4 or can't be fragmented to fit. Every fragment is
+/// stamped with `ip_id` as its IP Identification — the caller must pass a value
+/// unique per datagram so the receiver doesn't splice unrelated datagrams.
 ///
 /// We clear the Don't-Fragment bit on the fragments: the alternative for a DF
 /// packet is to drop it and emit ICMP "fragmentation needed" back toward the
 /// origin, which is impractical here (the origin is out on the internet and
 /// the tunnel's small MTU isn't its real path MTU). Delivering via
 /// fragmentation is what makes UDP-based protocols work across the tunnel.
-fn fragment_ipv4(pkt: &[u8], max_len: usize) -> Option<Vec<Vec<u8>>> {
+fn fragment_ipv4(pkt: &[u8], max_len: usize, ip_id: u16) -> Option<Vec<Vec<u8>>> {
     if pkt.len() < 20 || (pkt[0] >> 4) != 4 {
         return None; // not IPv4
     }
@@ -299,6 +307,13 @@ fn fragment_ipv4(pkt: &[u8], max_len: usize) -> Option<Vec<Vec<u8>>> {
         // Total length.
         let total_len = (ihl + chunk.len()) as u16;
         frag[2..4].copy_from_slice(&total_len.to_be_bytes());
+
+        // Identification: stamp a fresh per-datagram id (shared by this
+        // datagram's fragments, distinct between datagrams). smoltcp originates
+        // packets with id=0, so without this every oversized datagram on a flow
+        // would fragment under the same (src,dst,proto,id=0) and the receiver's
+        // reassembly would splice unrelated datagrams together.
+        frag[4..6].copy_from_slice(&ip_id.to_be_bytes());
 
         // Flags + fragment offset. DF cleared; MF set on all but the last
         // (unless the original was already a mid-stream fragment).
@@ -415,7 +430,7 @@ mod tests {
         assert_eq!(pkt.len(), 1480);
         let max = 1414;
 
-        let frags = fragment_ipv4(&pkt, max).expect("should fragment");
+        let frags = fragment_ipv4(&pkt, max, 0x4242).expect("should fragment");
         assert!(frags.len() >= 2, "should split into multiple fragments");
         for f in &frags {
             assert!(f.len() <= max, "fragment {} exceeds max {}", f.len(), max);
@@ -425,9 +440,24 @@ mod tests {
     }
 
     #[test]
+    fn fragments_carry_the_given_ip_id() {
+        // All fragments of one datagram share the caller-provided id (so the
+        // receiver groups them), and the caller varies it per datagram so
+        // distinct datagrams don't collide under id=0 in reassembly.
+        let pkt = ipv4_udp(3000);
+        for id in [0x0001u16, 0xABCD, 0xFFFF] {
+            let frags = fragment_ipv4(&pkt, 1414, id).unwrap();
+            assert!(frags.len() >= 2);
+            for f in &frags {
+                assert_eq!(u16::from_be_bytes([f[4], f[5]]), id, "fragment must carry id {id:#x}");
+            }
+        }
+    }
+
+    #[test]
     fn fragment_data_is_multiple_of_eight() {
         let pkt = ipv4_udp(3000);
-        let frags = fragment_ipv4(&pkt, 1414).unwrap();
+        let frags = fragment_ipv4(&pkt, 1414, 0x4242).unwrap();
         // Every fragment but the last carries a data length that's a multiple
         // of 8 (an IPv4 fragmentation requirement).
         for f in &frags[..frags.len() - 1] {
@@ -445,7 +475,7 @@ mod tests {
         // degenerate single-chunk case; DF is cleared and the checksum is
         // recomputed, so it's not byte-identical to the input.)
         let pkt = ipv4_udp(100);
-        let frags = fragment_ipv4(&pkt, 1414).unwrap();
+        let frags = fragment_ipv4(&pkt, 1414, 0x4242).unwrap();
         assert_eq!(frags.len(), 1);
         assert_eq!(reassemble(&frags), pkt[20..]);
     }
@@ -454,16 +484,16 @@ mod tests {
     fn non_ipv4_returns_none() {
         // IPv6 version nibble.
         let pkt = vec![0x60u8; 100];
-        assert!(fragment_ipv4(&pkt, 1414).is_none());
+        assert!(fragment_ipv4(&pkt, 1414, 0x4242).is_none());
         // Too short to be IPv4.
-        assert!(fragment_ipv4(&[0x45, 0x00], 1414).is_none());
+        assert!(fragment_ipv4(&[0x45, 0x00], 1414, 0x4242).is_none());
     }
 
     #[test]
     fn tiny_max_len_returns_none() {
         let pkt = ipv4_udp(1000);
         // Can't fit header + 8 bytes.
-        assert!(fragment_ipv4(&pkt, 20).is_none());
+        assert!(fragment_ipv4(&pkt, 20, 0x4242).is_none());
     }
 
     #[test]
