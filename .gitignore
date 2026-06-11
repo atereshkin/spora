@@ -4,3 +4,7 @@ target
 .aider*
 
 deploy/deploy_key
+
+# Unused legacy relay TLS material — the dumb relay holds no keys (see
+# relay/src/lib.rs). Kept out of the repo to avoid shipping a private key.
+certs/
