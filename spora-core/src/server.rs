@@ -404,17 +404,16 @@ async fn handle_inbound_datagram(udp_socket: netstack_smoltcp::UdpSocket, protec
 /// destination tuples; live flows refresh `last_activity` so a flood sheds idle
 /// entries rather than active ones.
 fn insert_bounded(entries: &mut HashMap<NATKey, NATEntry>, key: NATKey, entry: NATEntry, cap: usize) {
-    if !entries.contains_key(&key) && entries.len() >= cap {
-        if let Some(oldest) = entries
+    if !entries.contains_key(&key)
+        && entries.len() >= cap
+        && let Some(oldest) = entries
             .iter()
             .min_by_key(|(_, e)| e.last_activity)
             .map(|(k, _)| *k)
-        {
-            if let Some(evicted) = entries.remove(&oldest) {
-                evicted.task.abort();
-                trace!("UDP NAT table full, evicted {:?} => {:?}", oldest.0, oldest.1);
-            }
-        }
+        && let Some(evicted) = entries.remove(&oldest)
+    {
+        evicted.task.abort();
+        trace!("UDP NAT table full, evicted {:?} => {:?}", oldest.0, oldest.1);
     }
     entries.insert(key, entry);
 }
