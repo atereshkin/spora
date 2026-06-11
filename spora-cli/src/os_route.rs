@@ -293,13 +293,14 @@ impl Shared {
             peers.insert(ip);
         }
         // Even within private space, refuse to shadow an address the host can
-        // already reach over a real, directly-connected interface (e.g. the
-        // client's chosen source collides with the sharer's own LAN). A /32 on
-        // the TUN would override that connected route and break host reach to
-        // it. Fail open: if we can't tell, install.
-        if host_has_connected_route(ip, &self.tun_name).await {
+        // already reach over a real route — whether directly-connected (the
+        // sharer's own LAN) or via a gateway (a downstream router, nested VPN, or
+        // corporate subnet behind the default route). A /32 on the TUN would
+        // override that route and divert the sharer's own egress to it into the
+        // tunnel. Fail open: if we can't read the table, install.
+        if host_has_conflicting_route(ip, &self.tun_name).await {
             warn!(
-                "os-routing: client source {} collides with a local interface route; \
+                "os-routing: client source {} collides with an existing host route; \
                  refusing to install a return route",
                 ip
             );
@@ -318,50 +319,117 @@ impl Shared {
                 "-w", "-t", "nat", "-D", "POSTROUTING", "-s", &dst, "!", "-o", &self.tun_name,
                 "-j", "MASQUERADE",
             ]);
-            if run_cmd_async("iptables", add).await
-                && let Ok(mut undo) = self.undo.lock()
-            {
-                undo.push(Undo::Cmd("iptables", del));
+            if run_cmd_async("iptables", add).await {
+                // Race with cleanup(): it sets `shutting_down` *before* draining
+                // the undo stack under the same lock (see cleanup()), and the
+                // check below happens under that lock after the rule is added.
+                // So if cleanup already ran (shutting_down set, stack drained) we
+                // remove the rule ourselves; otherwise we record it for cleanup.
+                // Without this, a rule added after the drain would leak — the
+                // undo pushed onto an already-emptied stack is never run.
+                let delete_now = match self.undo.lock() {
+                    Ok(mut undo) => record_undo_or_signal_delete(
+                        self.shutting_down.load(Ordering::Relaxed),
+                        &mut undo,
+                        Undo::Cmd("iptables", del.clone()),
+                    ),
+                    Err(_) => true, // poisoned: remove defensively
+                };
+                if delete_now {
+                    warn!("os-routing: shutting down, removing just-added MASQUERADE for {}", ip);
+                    run_cmd_async("iptables", del).await;
+                }
             }
         }
     }
 }
 
-/// Ask the kernel how it would reach `ip` right now. Returns `true` only if the
-/// destination resolves to a directly-connected route (no gateway) on an
-/// interface other than our TUN — i.e. it sits on one of the host's own
-/// subnets and must not be shadowed by a `/32` on the TUN.
-async fn host_has_connected_route(ip: Ipv4Addr, tun: &str) -> bool {
+/// True if the host already has a real path to `ip` that a `/32` on the TUN
+/// would shadow. We must consult the whole route table, not just `ip route get`:
+/// a client-chosen private source can collide not only with a directly-connected
+/// subnet but with one the host reaches via a *gateway* (a downstream router, a
+/// nested VPN, a corporate subnet). `ip route get` can't distinguish such a
+/// specific gateway route from the default route, so we parse the table and look
+/// for any non-default route covering `ip` on an interface other than our TUN.
+async fn host_has_conflicting_route(ip: Ipv4Addr, tun: &str) -> bool {
     let tun = tun.to_string();
     let out = tokio::task::spawn_blocking(move || {
         std::process::Command::new("ip")
-            .args(["route", "get", &ip.to_string()])
+            .args(["-4", "route", "show"])
             .output()
     })
     .await;
     match out {
         Ok(Ok(o)) if o.status.success() => {
-            is_connected_local_route(&String::from_utf8_lossy(&o.stdout), &tun)
+            route_table_conflicts(&String::from_utf8_lossy(&o.stdout), ip, &tun)
         }
         _ => false, // fail open: don't block routing if we can't tell
     }
 }
 
-/// Parse the first line of `ip route get` output. A line with " via " is
-/// reached through a gateway (not directly connected); otherwise the `dev`
-/// token names the egress interface — a collision only if it isn't our TUN.
-fn is_connected_local_route(out: &str, tun: &str) -> bool {
-    let first = out.lines().next().unwrap_or("");
-    if first.contains(" via ") {
-        return false;
-    }
-    let mut toks = first.split_whitespace();
-    while let Some(t) = toks.next() {
-        if t == "dev" {
-            return toks.next().is_some_and(|dev| dev != tun);
+/// Does `routes` (the output of `ip -4 route show`) contain a non-default route
+/// covering `ip` via an interface other than `tun`? The default route is
+/// ignored: a private destination "reached via default" has no real path back
+/// (the default gateway won't route private space), so a `/32` for it is safe.
+fn route_table_conflicts(routes: &str, ip: Ipv4Addr, tun: &str) -> bool {
+    for line in routes.lines() {
+        let mut toks = line.split_whitespace();
+        let Some(prefix) = toks.next() else { continue };
+        if prefix == "default" {
+            continue;
+        }
+        let Some((net, plen)) = parse_ipv4_prefix(prefix) else { continue };
+        if plen == 0 || !ipv4_in_prefix(ip, net, plen) {
+            continue;
+        }
+        // A route on our own TUN (the client subnet) isn't a conflict.
+        let mut dev = None;
+        while let Some(t) = toks.next() {
+            if t == "dev" {
+                dev = toks.next();
+                break;
+            }
+        }
+        if dev != Some(tun) {
+            return true;
         }
     }
     false
+}
+
+/// Decide what to do with a just-added rule's undo. If we're shutting down,
+/// `cleanup()` has already drained the undo stack (it sets `shutting_down`
+/// before draining, under the same lock held by the caller here), so pushing
+/// would leak the rule — signal the caller to remove it now (`true`). Otherwise
+/// record the undo for `cleanup()` to run later (`false`).
+fn record_undo_or_signal_delete(shutting_down: bool, undo: &mut Vec<Undo>, undo_cmd: Undo) -> bool {
+    if shutting_down {
+        true
+    } else {
+        undo.push(undo_cmd);
+        false
+    }
+}
+
+/// Parse an IPv4 route prefix like `192.168.1.0/24`, or a bare host `10.0.0.5`
+/// (treated as `/32`).
+fn parse_ipv4_prefix(s: &str) -> Option<(Ipv4Addr, u8)> {
+    let (addr, plen) = match s.split_once('/') {
+        Some((a, p)) => (a, p.parse::<u8>().ok()?),
+        None => (s, 32),
+    };
+    if plen > 32 {
+        return None;
+    }
+    Some((addr.parse::<Ipv4Addr>().ok()?, plen))
+}
+
+fn ipv4_in_prefix(ip: Ipv4Addr, net: Ipv4Addr, plen: u8) -> bool {
+    if plen == 0 {
+        return true;
+    }
+    let mask = u32::MAX << (32 - plen as u32);
+    (u32::from(ip) & mask) == (u32::from(net) & mask)
 }
 
 /// Minimal async device interface so the pump can be tested without a real
@@ -708,24 +776,52 @@ mod tests {
     }
 
     #[test]
-    fn connected_local_route_detection() {
-        // Directly connected on a non-TUN device → collision.
-        assert!(is_connected_local_route(
-            "192.168.1.50 dev eth0 src 192.168.1.10 uid 1000",
-            "tun0"
+    fn masquerade_undo_recorded_or_deleted_on_shutdown() {
+        let cmd = || Undo::Cmd("iptables", svec(&["-w", "-t", "nat", "-D", "POSTROUTING"]));
+        // Normal: record the undo for cleanup, don't delete now.
+        let mut undo = Vec::new();
+        assert!(!record_undo_or_signal_delete(false, &mut undo, cmd()));
+        assert_eq!(undo.len(), 1, "undo recorded for cleanup");
+        // Shutting down (stack already drained): signal delete, push nothing —
+        // otherwise the rule would leak past shutdown.
+        let mut undo = Vec::new();
+        assert!(record_undo_or_signal_delete(true, &mut undo, cmd()));
+        assert!(undo.is_empty(), "must not push onto an already-drained stack");
+    }
+
+    #[test]
+    fn route_table_conflict_detection() {
+        let tun = "tun0";
+        let ip = |s: &str| s.parse::<Ipv4Addr>().unwrap();
+        let table = "\
+            192.168.1.0/24 dev eth0 proto kernel scope link src 192.168.1.10\n\
+            10.5.0.0/16 via 192.168.1.1 dev eth0\n\
+            10.0.0.0/8 dev wg0 scope link\n\
+            10.213.0.0/24 dev tun0 scope link\n\
+            default via 192.168.1.1 dev eth0\n";
+
+        // Directly-connected LAN on another device → conflict.
+        assert!(route_table_conflicts(table, ip("192.168.1.50"), tun));
+        // Private subnet reached via a gateway (the #5 fix; the old
+        // directly-connected check treated this as safe).
+        assert!(route_table_conflicts(table, ip("10.5.0.7"), tun));
+        // Covered only by our own TUN route (10.213.0.0/24 dev tun0) — but note
+        // 10.0.0.0/8 dev wg0 also covers it and is checked first in this table.
+        assert!(route_table_conflicts(table, ip("10.0.0.1"), tun));
+        // A private source covered by NO non-default, non-tun route → allowed.
+        assert!(!route_table_conflicts(
+            "192.168.1.0/24 dev eth0\ndefault via 192.168.1.1 dev eth0",
+            ip("172.31.5.9"),
+            tun
         ));
-        // Reached via a gateway → not directly connected, no collision.
-        assert!(!is_connected_local_route(
-            "10.0.0.1 via 192.168.1.1 dev eth0 src 192.168.1.10 uid 1000",
-            "tun0"
+        // Covered only by our own TUN route → not a conflict.
+        assert!(!route_table_conflicts(
+            "10.213.0.0/24 dev tun0\ndefault via 192.168.1.1 dev eth0",
+            ip("10.213.0.5"),
+            tun
         ));
-        // Connected, but the egress device is our own TUN → not a collision.
-        assert!(!is_connected_local_route(
-            "10.213.0.5 dev tun0 src 10.213.0.1 uid 1000",
-            "tun0"
-        ));
-        // Unparseable / empty → treated as no collision (fail open).
-        assert!(!is_connected_local_route("", "tun0"));
+        // Empty table → fail open (no conflict).
+        assert!(!route_table_conflicts("", ip("10.0.0.1"), tun));
     }
 
     // ---- pump tests with a mock transport + mock device ----
