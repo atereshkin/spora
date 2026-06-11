@@ -19,11 +19,12 @@
 //! Packets to private/local destinations are dropped (parity with the
 //! netstack's `block_local`), so a client can't reach the sharer's LAN.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, trace, warn};
@@ -83,7 +84,9 @@ enum Undo {
 struct Shared {
     tun_name: String,
     configure_nat: bool,
-    peers: Mutex<HashSet<Ipv4Addr>>,
+    /// Learned client source addresses with their last-seen time, so the table
+    /// can evict the least-recently-active peer instead of bricking once full.
+    peers: Mutex<HashMap<Ipv4Addr, Instant>>,
     undo: Mutex<Vec<Undo>>,
     /// Set by `cleanup()` so an in-flight session pump doesn't install a fresh
     /// MASQUERADE rule after we've already drained the undo list.
@@ -125,7 +128,7 @@ impl OsRoute {
         let shared = Arc::new(Shared {
             tun_name: tun.name().to_string(),
             configure_nat: opts.configure_nat,
-            peers: Mutex::new(HashSet::new()),
+            peers: Mutex::new(HashMap::new()),
             undo: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
         });
@@ -278,19 +281,15 @@ impl Shared {
         if self.shutting_down.load(Ordering::Relaxed) {
             return;
         }
+        // Already learned? Refresh its activity so it isn't the eviction victim,
+        // and we're done — no slot is consumed by a repeat, and the table only
+        // holds peers whose routes we actually installed.
         {
             let mut peers = self.peers.lock().unwrap();
-            if peers.contains(&ip) {
+            if let Some(ts) = peers.get_mut(&ip) {
+                *ts = Instant::now();
                 return;
             }
-            if peers.len() >= MAX_PEERS {
-                warn!(
-                    "os-routing: peer table full ({}), not installing return route for {}",
-                    MAX_PEERS, ip
-                );
-                return;
-            }
-            peers.insert(ip);
         }
         // Even within private space, refuse to shadow an address the host can
         // already reach over a real route — whether directly-connected (the
@@ -341,7 +340,53 @@ impl Shared {
                 }
             }
         }
+
+        // Reserve the slot now that the route is actually installed (so refused
+        // peers never consumed one), evicting the least-recently-active peer if
+        // the table is full — otherwise one client spraying 64 distinct sources
+        // would permanently brick return routing for every later client.
+        let evicted = {
+            let mut peers = self.peers.lock().unwrap();
+            reserve_peer_slot(&mut peers, ip, Instant::now(), MAX_PEERS)
+        };
+        if let Some(victim) = evicted {
+            info!("os-routing: peer table full, evicting least-recently-active {}", victim);
+            let vdst = format!("{}/32", victim);
+            run_cmd_async("ip", svec(&["route", "del", &vdst, "dev", &self.tun_name])).await;
+            if self.configure_nat {
+                run_cmd_async(
+                    "iptables",
+                    svec(&[
+                        "-w", "-t", "nat", "-D", "POSTROUTING", "-s", &vdst, "!", "-o",
+                        &self.tun_name, "-j", "MASQUERADE",
+                    ]),
+                )
+                .await;
+            }
+        }
     }
+}
+
+/// (Re)insert `ip` into the peer table with timestamp `now`, evicting the
+/// least-recently-active peer if the table is at `cap`. Returns the evicted
+/// address (whose `/32` route and MASQUERADE the caller must remove), or None.
+fn reserve_peer_slot(
+    peers: &mut HashMap<Ipv4Addr, Instant>,
+    ip: Ipv4Addr,
+    now: Instant,
+    cap: usize,
+) -> Option<Ipv4Addr> {
+    let evicted = if !peers.contains_key(&ip) && peers.len() >= cap {
+        let victim = peers.iter().min_by_key(|(_, t)| **t).map(|(k, _)| *k);
+        if let Some(v) = victim {
+            peers.remove(&v);
+        }
+        victim
+    } else {
+        None
+    };
+    peers.insert(ip, now);
+    evicted
 }
 
 /// True if the host already has a real path to `ip` that a `/32` on the TUN
@@ -787,6 +832,36 @@ mod tests {
         let mut undo = Vec::new();
         assert!(record_undo_or_signal_delete(true, &mut undo, cmd()));
         assert!(undo.is_empty(), "must not push onto an already-drained stack");
+    }
+
+    #[test]
+    fn peer_table_evicts_least_recently_active() {
+        use std::time::Duration;
+        let mut peers: HashMap<Ipv4Addr, Instant> = HashMap::new();
+        let t0 = Instant::now();
+        let ip = |a: u8| Ipv4Addr::new(10, 0, 0, a);
+
+        // Fill to cap=3 with increasing timestamps; ip(1) is least recent.
+        assert_eq!(reserve_peer_slot(&mut peers, ip(1), t0, 3), None);
+        assert_eq!(reserve_peer_slot(&mut peers, ip(2), t0 + Duration::from_secs(1), 3), None);
+        assert_eq!(reserve_peer_slot(&mut peers, ip(3), t0 + Duration::from_secs(2), 3), None);
+        assert_eq!(peers.len(), 3);
+
+        // A new peer at the cap evicts the least-recently-active (ip(1)).
+        assert_eq!(
+            reserve_peer_slot(&mut peers, ip(4), t0 + Duration::from_secs(3), 3),
+            Some(ip(1))
+        );
+        assert_eq!(peers.len(), 3, "table stays bounded");
+        assert!(!peers.contains_key(&ip(1)));
+        assert!(peers.contains_key(&ip(4)));
+
+        // Refreshing an existing peer never evicts.
+        assert_eq!(
+            reserve_peer_slot(&mut peers, ip(2), t0 + Duration::from_secs(4), 3),
+            None
+        );
+        assert_eq!(peers.len(), 3);
     }
 
     #[test]
