@@ -243,13 +243,53 @@ fn load_or_create_identity(
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(path, identity.to_bytes())?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
+    write_identity_atomically(path, &identity.to_bytes())?;
     Ok(identity)
+}
+
+/// Persist the identity (private key + secret) durably and privately.
+///
+/// `std::fs::write` truncates-then-writes in place: a crash or power loss
+/// mid-write leaves a torn file, and `Identity::from_bytes` then fails on every
+/// later launch — bricking `spora share` and the user's stable URL. It also
+/// creates the file with the umask (typically world-/group-readable) and only
+/// chmods afterward, leaving a window where the private key is exposed.
+///
+/// Instead, write to a sibling temp file created `0600` from the start, fsync
+/// it, then atomically rename over the target: a reader (and a crash) sees
+/// either the old file or the complete new one, never a truncated mix, and the
+/// key bytes are never group/world-readable.
+#[cfg(unix)]
+fn write_identity_atomically(
+    path: &std::path::Path,
+    bytes: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("identity.bin");
+    // Per-process temp name so a concurrent writer can't clobber our partial
+    // file before the rename.
+    let tmp = dir.join(format!(".{}.{}.tmp", stem, std::process::id()));
+
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&tmp)?;
+    let res = f
+        .write_all(bytes)
+        .and_then(|()| f.sync_all())
+        .and_then(|()| std::fs::rename(&tmp, path));
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 #[cfg(windows)]
@@ -258,4 +298,66 @@ fn load_or_create_identity(
     _fresh: bool,
 ) -> Result<Identity, Box<dyn std::error::Error>> {
     unreachable!("Share mode is not supported on Windows in the CLI")
+}
+
+#[cfg(all(test, unix))]
+mod identity_persistence_tests {
+    use super::*;
+    use std::os::unix::fs::PermissionsExt;
+
+    /// A unique scratch dir under the temp dir (no tempfile dependency).
+    fn scratch(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "spora-cli-test-{}-{}",
+            std::process::id(),
+            tag
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn created_identity_is_private_and_round_trips() {
+        let dir = scratch("create");
+        let path = dir.join("identity.bin");
+
+        let id = load_or_create_identity(&path, false).unwrap();
+
+        // The private key must never be group/world readable, even briefly.
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "identity file must be 0600");
+
+        // Loading again (fresh=false) returns the SAME identity, not a new one.
+        let again = load_or_create_identity(&path, false).unwrap();
+        assert_eq!(
+            id.to_bytes(),
+            again.to_bytes(),
+            "persisted identity must be stable across launches"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn atomic_write_replaces_without_leaving_a_temp() {
+        let dir = scratch("atomic");
+        let path = dir.join("identity.bin");
+
+        write_identity_atomically(&path, b"first-version").unwrap();
+        write_identity_atomically(&path, b"second-version-which-is-longer").unwrap();
+
+        // The final file holds the complete new content (never a torn mix)...
+        assert_eq!(std::fs::read(&path).unwrap(), b"second-version-which-is-longer");
+        // ...and the rename consumed the temp — no `.identity.bin.<pid>.tmp` litter.
+        let leftover: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.ends_with(".tmp"))
+            .collect();
+        assert!(leftover.is_empty(), "temp file leaked: {:?}", leftover);
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
 }
