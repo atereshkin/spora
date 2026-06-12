@@ -98,9 +98,15 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
                 match Pin::new(&mut stack).poll_next(cx) {
                     Poll::Ready(Some(Ok(pkt))) => {
                         egress_produced += 1;
-                        if egress_tx.try_send(pkt.to_vec()).is_err() {
+                        // `pkt` is already an owned Vec<u8>; move it into the
+                        // channel instead of cloning (this is the highest-rate
+                        // copy on the share side — every download-direction
+                        // datagram). On a full channel try_send hands the Vec
+                        // back inside the error and we drop it, exactly as before.
+                        let len = pkt.len();
+                        if egress_tx.try_send(pkt).is_err() {
                             egress_dropped += 1;
-                            warn!("Egress channel full, dropping packet ({} bytes)", pkt.len());
+                            warn!("Egress channel full, dropping packet ({} bytes)", len);
                         }
                     }
                     Poll::Ready(Some(Err(e))) => {
