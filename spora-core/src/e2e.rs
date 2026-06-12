@@ -28,6 +28,11 @@ const E2E_ALPN: &[u8] = b"spora-e2e/1";
 const SERVER_NAME: &str = "spora.peer";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
+/// Byte the sharer writes back on the auth stream once it has accepted the
+/// client's secret. The client waits for it so a wrong/expired secret surfaces
+/// as a connect error instead of an `Ok` that silently reconnect-loops. See
+/// `client_connect` / `authenticate_incoming`.
+const AUTH_ACK: u8 = 0x01;
 
 /// An authenticated, established end-to-end QUIC session.
 pub struct E2eSession {
@@ -79,9 +84,10 @@ pub fn server_endpoint(
 pub async fn accept_one(
     endpoint: &quinn::Endpoint,
     expected_secret: &[u8; SECRET_LEN],
+    send_ack: bool,
 ) -> Option<Result<E2eSession, String>> {
     let incoming = endpoint.accept().await?;
-    Some(authenticate_incoming(incoming, expected_secret).await)
+    Some(authenticate_incoming(incoming, expected_secret, send_ack).await)
 }
 
 /// Drive one already-accepted `Incoming` through the QUIC handshake and the
@@ -90,9 +96,17 @@ pub async fn accept_one(
 /// the secret read (an attacker who knows the routing key but not the secret)
 /// only ties up its own task until `AUTH_TIMEOUT`, instead of blocking the
 /// serial accept loop and starving legitimate peers.
+///
+/// `send_ack` writes the [`AUTH_ACK`] byte back once the secret verifies, so the
+/// initiator can tell acceptance from a silent close. Used on the relay-via path
+/// (where a bad/expired token must surface as a connect error). It is left off
+/// for the direct-upgrade path: the secret is already proven good there, the ack
+/// would add nothing, and waiting on a post-handshake reverse-direction byte over
+/// a freshly-punched NAT only makes the best-effort upgrade fail more often.
 pub async fn authenticate_incoming(
     incoming: quinn::Incoming,
     expected_secret: &[u8; SECRET_LEN],
+    send_ack: bool,
 ) -> Result<E2eSession, String> {
     let conn = match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
         Ok(Ok(c)) => c,
@@ -115,7 +129,7 @@ pub async fn authenticate_incoming(
     })
     .await;
 
-    let (send, recv, presented) = match auth_result {
+    let (mut send, recv, presented) = match auth_result {
         Ok(Ok(x)) => x,
         Ok(Err(e)) => {
             conn.close(1u32.into(), b"auth-error");
@@ -131,6 +145,16 @@ pub async fn authenticate_incoming(
     if !bool::from(presented.ct_eq(expected_secret)) {
         conn.close(1u32.into(), b"bad-secret");
         return Err(format!("auth from {}: bad secret", peer));
+    }
+    // Acknowledge so the client knows the secret was accepted. A rejected
+    // client gets the connection closed above instead of this byte, which is
+    // how the client distinguishes a bad token from a healthy session. Only on
+    // the relay path (see `send_ack`).
+    if send_ack
+        && let Err(e) = send.write_all(&[AUTH_ACK]).await
+    {
+        conn.close(1u32.into(), b"ack-failed");
+        return Err(format!("auth ack to {}: {}", peer, e));
     }
     info!("e2e accept: authenticated peer {}", peer);
 
@@ -196,6 +220,7 @@ pub async fn client_connect(
     endpoint: &quinn::Endpoint,
     peer_addr: SocketAddr,
     secret: &[u8; SECRET_LEN],
+    expect_ack: bool,
 ) -> Result<E2eSession, String> {
     let connecting = endpoint
         .connect(peer_addr, SERVER_NAME)
@@ -211,13 +236,28 @@ pub async fn client_connect(
     );
 
     let auth = tokio::time::timeout(AUTH_TIMEOUT, async {
-        let (mut send, recv) = conn
+        let (mut send, mut recv) = conn
             .open_bi()
             .await
             .map_err(|e| format!("open_bi: {}", e))?;
         send.write_all(secret)
             .await
             .map_err(|e| format!("write secret: {}", e))?;
+        // On the relay path, wait for the sharer's accept ack. A wrong/expired
+        // secret makes the sharer close the connection instead of acking, so
+        // this fails fast and the auth failure propagates to the caller —
+        // without it a bad token returns Ok and the tunnel silently
+        // reconnect-loops forever. The direct-upgrade path skips this (see
+        // `expect_ack` / `authenticate_incoming`).
+        if expect_ack {
+            let mut ack = [0u8; 1];
+            recv.read_exact(&mut ack)
+                .await
+                .map_err(|e| format!("auth not acked (bad/expired secret?): {}", e))?;
+            if ack[0] != AUTH_ACK {
+                return Err(format!("unexpected auth ack byte {:#x}", ack[0]));
+            }
+        }
         Ok::<_, String>((send, recv))
     })
     .await;
@@ -310,9 +350,11 @@ mod tests {
 
         // Drive A's accept and B's connect concurrently.
         let accept_task = tokio::spawn(async move {
-            accept_one(&a_endpoint, &secret).await.unwrap().unwrap()
+            accept_one(&a_endpoint, &secret, true).await.unwrap().unwrap()
         });
-        let mut b_session = client_connect(&b_endpoint, relay_addr, &secret).await.unwrap();
+        let mut b_session = client_connect(&b_endpoint, relay_addr, &secret, true)
+            .await
+            .unwrap();
         let mut a_session = accept_task.await.unwrap();
 
         // Verify IP datagrams round-trip via QuicPeerTransport.
@@ -365,7 +407,7 @@ mod tests {
         b_std.set_nonblocking(true).unwrap();
         let b_endpoint = client_endpoint(b_std, identity.routing_key, &Timings::default()).unwrap();
 
-        let result = client_connect(&b_endpoint, relay_addr, &identity.secret).await;
+        let result = client_connect(&b_endpoint, relay_addr, &identity.secret, true).await;
         assert!(result.is_err(), "should fail when no A is registered");
     }
 
@@ -393,11 +435,17 @@ mod tests {
         let b_endpoint = client_endpoint(b_std, routing_key, &Timings::default()).unwrap();
 
         let accept_task =
-            tokio::spawn(async move { accept_one(&a_endpoint, &secret).await.unwrap() });
-        // B's handshake succeeds; sending the bad secret over the stream
-        // succeeds too (it's a one-way write). The auth failure happens on
-        // A's side. So client_connect may succeed; A's accept returns Err.
-        let _b_result = client_connect(&b_endpoint, relay_addr, &bad_secret).await;
+            tokio::spawn(async move { accept_one(&a_endpoint, &secret, true).await.unwrap() });
+        // B's handshake succeeds and the bad-secret write goes through, but A
+        // rejects it and closes the connection without the accept ack. B waits
+        // for that ack, so client_connect now returns Err instead of an Ok that
+        // would hand the caller a tunnel which silently reconnect-loops forever.
+        let b_result = client_connect(&b_endpoint, relay_addr, &bad_secret, true).await;
+        assert!(
+            b_result.is_err(),
+            "B must surface a bad secret as an error, not Ok"
+        );
+
         let a_result = tokio::time::timeout(Duration::from_secs(3), accept_task)
             .await
             .expect("accept_one should finish")
@@ -484,7 +532,7 @@ mod tests {
 
         let r = tokio::time::timeout(
             Duration::from_millis(200),
-            accept_one(&server_ep, &identity.secret),
+            accept_one(&server_ep, &identity.secret, false),
         )
         .await;
         assert!(
@@ -517,7 +565,7 @@ mod tests {
             while let Some(incoming) = accept_ep.accept().await {
                 let tx = tx.clone();
                 tokio::spawn(async move {
-                    if let Ok(s) = authenticate_incoming(incoming, &secret).await {
+                    if let Ok(s) = authenticate_incoming(incoming, &secret, false).await {
                         let _ = tx.send(s);
                     }
                 });
@@ -535,7 +583,7 @@ mod tests {
             let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
             b_std.set_nonblocking(true).unwrap();
             let b_ep = client_endpoint(b_std, rk, &Timings::default()).unwrap();
-            let _b = client_connect(&b_ep, s_addr, &secret)
+            let _b = client_connect(&b_ep, s_addr, &secret, false)
                 .await
                 .expect("legit client should authenticate");
             rx.recv().await

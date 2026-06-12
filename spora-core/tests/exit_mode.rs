@@ -65,7 +65,7 @@ async fn custom_exit_mode_pumps_packets() {
         conn: _conn,
         transport,
         signal: _signal,
-    } = client_connect(endpoint, relay_addr, &token.secret)
+    } = client_connect(endpoint, relay_addr, &token.secret, true)
         .await
         .expect("client_connect");
     let (mut sink, mut stream) = transport.split();

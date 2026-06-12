@@ -325,7 +325,7 @@ async fn run_share_loop(
                         tokio::spawn(async move {
                             tokio::select! {
                                 _ = cancel.cancelled() => {}
-                                res = authenticate_incoming(incoming, &secret) => match res {
+                                res = authenticate_incoming(incoming, &secret, true) => match res {
                                     Ok(session) => { let _ = tx.send(session); }
                                     Err(e) => warn!("[share] accept failed: {}", e),
                                 }
@@ -508,7 +508,9 @@ async fn dial_initiator(
     let std_socket = bind_local_udp(&config.protector).map_err(std::io::Error::other)?;
     let endpoint = client_endpoint(std_socket, token.routing_key, &config.timings)
         .map_err(std::io::Error::other)?;
-    let session = client_connect(&endpoint, relay_addr, &token.secret)
+    // Relay path: require the sharer's accept ack so a bad/expired token fails
+    // here instead of silently reconnect-looping.
+    let session = client_connect(&endpoint, relay_addr, &token.secret, true)
         .await
         .map_err(std::io::Error::other)?;
     let E2eSession {
@@ -820,7 +822,9 @@ async fn try_direct_as_initiator(
         client_endpoint(std_sock, routing_key, timings).map_err(DirectError::Transient)?;
     // Dial the address the peer's packets actually came from — our NAT has a
     // mapping open toward it, which may not be true of the signaled address.
-    let session = client_connect(&endpoint, learned_peer, &secret)
+    // No accept ack on the direct path: the secret is already proven good, and
+    // waiting on a reverse-direction byte over a fresh punch only adds failures.
+    let session = client_connect(&endpoint, learned_peer, &secret, false)
         .await
         .map_err(DirectError::Transient)?;
     // Reuse the session's transport: its reader task is already attached to
@@ -890,7 +894,8 @@ async fn try_direct_as_responder(
             ));
         }
     };
-    let session = authenticate_incoming(incoming, &identity.secret)
+    // No accept ack on the direct path (see the initiator-side note).
+    let session = authenticate_incoming(incoming, &identity.secret, false)
         .await
         .map_err(DirectError::Transient)?;
     // Reuse the session's transport (see the initiator-side note): a second
@@ -1138,9 +1143,12 @@ mod tests {
         b_std.set_nonblocking(true).unwrap();
         let b_endpoint = client_endpoint(b_std, identity.routing_key, &timings).unwrap();
 
-        let accept_task =
-            tokio::spawn(async move { accept_one(&a_endpoint, &secret).await.unwrap().unwrap() });
-        let b_session = client_connect(&b_endpoint, a_addr, &secret).await.unwrap();
+        let accept_task = tokio::spawn(async move {
+            accept_one(&a_endpoint, &secret, false).await.unwrap().unwrap()
+        });
+        let b_session = client_connect(&b_endpoint, a_addr, &secret, false)
+            .await
+            .unwrap();
         let a_session = accept_task.await.unwrap();
 
         // Keep B's connection alive but drop ONLY its signal half, so A's

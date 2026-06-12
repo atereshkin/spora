@@ -62,7 +62,7 @@ async fn open_client(relay_addr: std::net::SocketAddr, token: &Token) -> E2eSess
     // Endpoint must outlive the connection; we leak it deliberately for the
     // lifetime of the test process (tests are short-lived).
     let endpoint = Box::leak(Box::new(b_endpoint));
-    client_connect(endpoint, relay_addr, &token.secret)
+    client_connect(endpoint, relay_addr, &token.secret, true)
         .await
         .expect("client_connect")
 }
