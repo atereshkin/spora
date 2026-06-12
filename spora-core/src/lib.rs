@@ -7,6 +7,7 @@ pub mod signal;
 pub mod transport;
 pub mod tun_util;
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
@@ -927,6 +928,30 @@ fn bind_local_udp(protector: &SocketProtector) -> Result<std::net::UdpSocket, St
 const PUNCH_PKT: &[u8] = b"sporaHP1P"; // "I'm trying to reach you"
 const VERIFY_PKT: &[u8] = b"sporaHP1V"; // "I received your packet"
 
+/// Cap on peer-reflexive sources learned during a single punch exchange. A
+/// spoofed-source punch flood would otherwise grow the learned/targets lists
+/// without bound — and we send to every entry each tick, so the per-tick send
+/// fan-out (and an O(n) membership scan per packet) would blow up. The signaled
+/// address is always punched regardless, so a flood that fills this cap only
+/// costs the peer-reflexive optimization, not the punch itself.
+const MAX_PUNCH_SOURCES: usize = 64;
+
+/// Record a peer-reflexive `src` heard during punching. Returns `true` if it was
+/// newly added (so the caller starts punching it). Deduped via the set (O(1))
+/// and bounded by `MAX_PUNCH_SOURCES`.
+fn record_punch_source(
+    learned: &mut HashSet<SocketAddr>,
+    targets: &mut HashSet<SocketAddr>,
+    src: SocketAddr,
+) -> bool {
+    if learned.contains(&src) || learned.len() >= MAX_PUNCH_SOURCES {
+        return false;
+    }
+    learned.insert(src);
+    targets.insert(src);
+    true
+}
+
 /// Punch through NAT and verify *bidirectional* connectivity, learning the
 /// peer's **observed** source address (ICE peer-reflexive style) rather than
 /// trusting only the signaled one.
@@ -964,8 +989,8 @@ async fn punch_and_verify(
         // Always punch the signaled address; add learned sources as we hear
         // from them (and verify those — sending to a source opens our NAT
         // toward it).
-        let mut targets: Vec<SocketAddr> = vec![signaled];
-        let mut learned: Vec<SocketAddr> = Vec::new();
+        let mut targets: HashSet<SocketAddr> = HashSet::from([signaled]);
+        let mut learned: HashSet<SocketAddr> = HashSet::new();
         loop {
             tokio::select! {
                 _ = interval.tick() => {
@@ -985,12 +1010,8 @@ async fn punch_and_verify(
                     if msg != PUNCH_PKT && msg != VERIFY_PKT {
                         continue;
                     }
-                    if !learned.contains(&src) {
+                    if record_punch_source(&mut learned, &mut targets, src) {
                         debug!("Direct connection: learned peer source {}", src);
-                        learned.push(src);
-                        if !targets.contains(&src) {
-                            targets.push(src);
-                        }
                     }
                     // Open our NAT toward this source and tell it we heard it.
                     let _ = socket.send_to(VERIFY_PKT, src).await;
@@ -1070,6 +1091,29 @@ pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), Strin
 mod tests {
     use super::*;
     use crate::e2e::accept_one;
+
+    #[test]
+    fn punch_source_recording_is_deduped_and_bounded() {
+        let mut learned = HashSet::new();
+        let mut targets = HashSet::new();
+        let a: SocketAddr = "1.2.3.4:5".parse().unwrap();
+
+        // New source recorded into both sets.
+        assert!(record_punch_source(&mut learned, &mut targets, a));
+        assert!(learned.contains(&a) && targets.contains(&a));
+        // Duplicate is not re-recorded.
+        assert!(!record_punch_source(&mut learned, &mut targets, a));
+
+        // Fill to the cap with distinct sources, then a flood source is refused.
+        for i in 0..MAX_PUNCH_SOURCES as u32 {
+            let s = SocketAddr::from(([10, 0, (i >> 8) as u8, i as u8], 9));
+            record_punch_source(&mut learned, &mut targets, s);
+        }
+        assert_eq!(learned.len(), MAX_PUNCH_SOURCES, "learned is bounded by the cap");
+        let flood: SocketAddr = "9.9.9.9:9".parse().unwrap();
+        assert!(!record_punch_source(&mut learned, &mut targets, flood));
+        assert_eq!(learned.len(), MAX_PUNCH_SOURCES);
+    }
     use crate::transport::upgradable::upgradable_transport;
 
     /// Regression test: a CLOSED signal channel must be terminal for
