@@ -128,7 +128,10 @@ impl Sink<UdpMsg> for WriteHalf {
             .write(&mut ip_packet_writer, &data)
             .map_err(|err| Error::other(format!("PacketBuilder::write: {err}")))?;
 
-        match self.stack_tx.start_send_unpin(ip_packet_writer.clone()) {
+        // Locally built, written once, never read after — move it into the
+        // stack channel instead of cloning (one alloc + full-frame memcpy saved
+        // per inbound UDP datagram).
+        match self.stack_tx.start_send_unpin(ip_packet_writer) {
             Ok(()) => Ok(()),
             Err(err) => Err(Error::other(format!("send error: {err}"))),
         }
