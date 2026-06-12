@@ -353,6 +353,11 @@ fn ipv4_header_checksum(header: &[u8]) -> u16 {
     !(sum as u16)
 }
 
+/// QUIC datagram send-buffer size — roughly one bandwidth-delay product, so the
+/// BBR-paced FIFO doesn't become a multi-second standing queue (see the note in
+/// [`build_transport_config`]).
+const DATAGRAM_SEND_BUFFER: usize = 512 * 1024;
+
 /// Build the shared QUIC transport config. `idle_timeout` / `keep_alive`
 /// come from [`crate::Timings`] (defaults: 30s / 10s).
 pub fn build_transport_config(idle_timeout: Duration, keep_alive: Duration) -> quinn::TransportConfig {
@@ -360,7 +365,16 @@ pub fn build_transport_config(idle_timeout: Duration, keep_alive: Duration) -> q
     transport.max_idle_timeout(Some(idle_timeout.try_into().unwrap()));
     transport.keep_alive_interval(Some(keep_alive));
     transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
-    transport.datagram_send_buffer_size(8 * 1024 * 1024);
+    // Size the datagram *send* buffer to about one bandwidth-delay product. The
+    // 8 MiB it used to be was sized for NoopCc (infinite window — the buffer just
+    // absorbed an immediately-sent burst). Under BBR the buffer is paced-drained
+    // at the bottleneck rate, so a large drop-oldest FIFO becomes a *standing*
+    // queue: multi-second bufferbloat for any interactive traffic sharing the
+    // tunnel, and (on overflow) drop-oldest discards the oldest in-flight inner-
+    // TCP segments — head-loss bursts that force the carried TCP into RTO. One
+    // BDP (~50 Mbit/s x ~80 ms here) is enough to keep BBR fed without standing
+    // delay. The receive buffer above is not the bufferbloat source, so it stays.
+    transport.datagram_send_buffer_size(DATAGRAM_SEND_BUFFER);
     transport.initial_mtu(1200);
     transport.min_mtu(1200);
     let mut mtud = quinn::MtuDiscoveryConfig::default();
