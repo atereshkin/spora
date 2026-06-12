@@ -452,29 +452,43 @@ impl TcpListenerRunner {
                 socket_set.remove(socket_handle);
             }
 
-            let next_duration = if iface_ingress_tx_avail.load(Ordering::Acquire) {
-                Duration::ZERO
+            let next_delay = if iface_ingress_tx_avail.load(Ordering::Acquire) {
+                Some(Duration::ZERO)
             } else {
-                iface
-                    .poll_delay(before_poll, &socket_set)
-                    .unwrap_or(Duration::from_millis(5))
+                iface.poll_delay(before_poll, &socket_set)
             };
-            if next_duration != Duration::ZERO {
-                let _ = tokio::time::timeout(
-                    tokio::time::Duration::from(next_duration),
-                    notify.notified(),
-                )
-                .await;
-            } else {
-                // poll_delay == 0 (or ingress is waiting) means smoltcp wants
-                // to run again immediately — most importantly when it has data
-                // to send but device.transmit() returned None because the
-                // egress channel is full. Busy-spinning here starves the very
-                // tasks that drain that channel (the egress writer and the
-                // QUIC driver), which deadlocks the share side at 100% CPU,
-                // stops all forwarding, and makes the process ignore SIGINT.
-                // Yield cooperatively so those tasks run and egress drains.
-                tokio::task::yield_now().await;
+            match next_delay {
+                Some(d) if d == Duration::ZERO => {
+                    // poll_delay == 0 (or ingress is waiting) means smoltcp wants
+                    // to run again immediately — most importantly when it has data
+                    // to send but device.transmit() returned None because the
+                    // egress channel is full. Busy-spinning here starves the very
+                    // tasks that drain that channel (the egress writer and the
+                    // QUIC driver), which deadlocks the share side at 100% CPU,
+                    // stops all forwarding, and makes the process ignore SIGINT
+                    // (fixed in 63a87f8). Yield cooperatively so egress drains.
+                    tokio::task::yield_now().await;
+                }
+                Some(d) => {
+                    // Wait until the next smoltcp timer (retransmit/keepalive/
+                    // timeout), or until a notify wakes us earlier.
+                    let _ = tokio::time::timeout(
+                        tokio::time::Duration::from(d),
+                        notify.notified(),
+                    )
+                    .await;
+                }
+                None => {
+                    // No pending timer at all (idle connected session). Park on
+                    // the wake source instead of busy-ticking at ~200 Hz (the old
+                    // unwrap_or(5ms)), which woke every 5 ms to re-scan all
+                    // sockets under the spin lock — pure idle CPU/battery cost.
+                    // notify.notify_one() fires on every rerun-triggering event
+                    // (inbound packet, stream read/write, socket create/close),
+                    // and tokio Notify is permit-based, so a notify racing this
+                    // await is not lost.
+                    notify.notified().await;
+                }
             }
         }
     }
