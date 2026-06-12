@@ -100,6 +100,16 @@ async fn route_one(
                         }
                     }
                     None => {
+                        // The inner stream ended. But the select! is unbiased,
+                        // so if a direct upgrade arrived in the *same* poll (e.g.
+                        // the relay-via connection dropped just as the direct
+                        // path came up) the upgrade branch may not have won.
+                        // Take a pending upgrade rather than exiting, so a
+                        // simultaneous relay-via death doesn't lose the upgrade.
+                        if let Ok(new_transport) = upgrade_rx.try_recv() {
+                            debug!("Inner stream ended but an upgrade is pending; switching");
+                            return RouteResult::Upgraded(new_transport);
+                        }
                         debug!("Inner transport stream ended, router exiting");
                         return RouteResult::Done;
                     }
@@ -208,6 +218,35 @@ mod tests {
     use super::*;
     use crate::transport::mock::mock_transport;
     use futures_util::{SinkExt, StreamExt};
+    use std::time::Duration;
+
+    #[tokio::test]
+    async fn upgrade_survives_simultaneous_inner_close() {
+        // Stage an inner-close and a pending upgrade so the router sees both in
+        // the same poll. The select! is unbiased, so without the None-arm
+        // try_recv the upgrade is lost ~half the time (router exits on the
+        // stream-None branch). Repeat to make the regression reliable; with the
+        // fix every iteration must deliver data on the upgraded transport.
+        for _ in 0..16 {
+            let (local, handle) = mock_transport();
+            let (mut transport, upgrade_tx, _router) = upgradable_transport(Box::new(local));
+            let (local2, handle2) = mock_transport();
+
+            // Both staged before the router can run (current-thread runtime).
+            handle.close();
+            upgrade_tx.send(Box::new(local2)).unwrap();
+            // Let the router process the (stream=None, upgrade-pending) poll.
+            tokio::time::sleep(Duration::from_millis(5)).await;
+
+            // The upgrade must have been taken: data flows on the new transport.
+            handle2.send(vec![1, 2, 3]).unwrap();
+            let got = tokio::time::timeout(Duration::from_millis(200), transport.next()).await;
+            assert!(
+                matches!(got, Ok(Some(Ok(ref p))) if p == &vec![1, 2, 3]),
+                "upgrade was lost to a simultaneous inner close: {got:?}"
+            );
+        }
+    }
 
     #[tokio::test]
     async fn upgradable_passes_through() {
