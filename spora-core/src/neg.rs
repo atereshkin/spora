@@ -38,22 +38,27 @@ impl<'a> NegChannel for SignalNegChannel<'a> {
             error!("signal channel closed while receiving endpoint");
             TunnelError::NegChannelClosed
         })?;
-        let line = std::str::from_utf8(&data).map_err(|e| {
-            ProtocolError(format!("invalid UTF-8 in endpoint: {}", e))
-        })?;
-        let addr = SocketAddr::from_str(line.trim()).map_err(|e| {
-            ProtocolError(format!("invalid peer address: {}", e))
-        })?;
-        // The peer controls this address and it becomes a send_to target during
-        // hole punching. Refuse targets that could turn a punch into a
-        // reflection at the sharer's own loopback services or a multicast group.
-        // (A legitimate STUN-derived endpoint is a unicast address; same-LAN
-        // peers with private reflexive addresses are still allowed.)
-        if !is_valid_punch_target(&addr) {
-            return Err(ProtocolError(format!("refusing punch target {}", addr)));
-        }
-        Ok(addr)
+        parse_endpoint(&data)
     }
+}
+
+/// Parse and validate a peer-supplied endpoint blob (the untrusted payload of a
+/// signal-channel endpoint message). Factored out of `recv_endpoint` so the
+/// parsing/validation can be unit-tested without a real signal channel.
+fn parse_endpoint(data: &[u8]) -> Result<SocketAddr, TunnelError> {
+    let line = std::str::from_utf8(data)
+        .map_err(|e| ProtocolError(format!("invalid UTF-8 in endpoint: {}", e)))?;
+    let addr = SocketAddr::from_str(line.trim())
+        .map_err(|e| ProtocolError(format!("invalid peer address: {}", e)))?;
+    // The peer controls this address and it becomes a send_to target during
+    // hole punching. Refuse targets that could turn a punch into a reflection at
+    // the sharer's own loopback services or a multicast group. (A legitimate
+    // STUN-derived endpoint is a unicast address; same-LAN peers with private
+    // reflexive addresses are still allowed.)
+    if !is_valid_punch_target(&addr) {
+        return Err(ProtocolError(format!("refusing punch target {}", addr)));
+    }
+    Ok(addr)
 }
 
 /// Whether `addr` is acceptable as a hole-punch target. Rejects loopback,
@@ -73,6 +78,24 @@ fn is_valid_punch_target(addr: &SocketAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_endpoint_accepts_valid_and_trims() {
+        let addr = parse_endpoint(b" 203.0.113.5:54321 \n").expect("valid endpoint");
+        assert_eq!(addr, "203.0.113.5:54321".parse().unwrap());
+    }
+
+    #[test]
+    fn parse_endpoint_rejects_malformed_input() {
+        // Non-UTF-8 bytes.
+        assert!(parse_endpoint(&[0xff, 0xfe, 0xfd]).is_err());
+        // Not a socket address.
+        assert!(parse_endpoint(b"not-an-address").is_err());
+        // Missing port.
+        assert!(parse_endpoint(b"203.0.113.5").is_err());
+        // A syntactically valid but dangerous target (the validation path).
+        assert!(parse_endpoint(b"127.0.0.1:443").is_err());
+    }
 
     #[test]
     fn rejects_dangerous_punch_targets() {
