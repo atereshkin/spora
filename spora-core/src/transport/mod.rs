@@ -331,6 +331,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn reconnect_redials_on_stream_error() {
+        // The inner stream yielding Some(Err) (a transport error, not a clean
+        // close) must also trigger a paced reconnect. Exercises the
+        // Poll::Ready(Some(Err)) arm, which the close()/None tests don't cover.
+        tokio::time::pause();
+        let (local, handle) = mock_transport();
+        handle.inject_error(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "inner transport error",
+        ));
+
+        let dial_count = Arc::new(AtomicUsize::new(0));
+        let dc = dial_count.clone();
+        let dialer: Dialer = Box::new(move || {
+            let dc = dc.clone();
+            Box::pin(async move {
+                dc.fetch_add(1, Ordering::SeqCst);
+                let (new_local, _new_handle) = mock_transport();
+                Ok(Box::new(new_local) as IpTransport)
+            })
+        });
+
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
+
+        // The stream error enters the paced sleep — no immediate redial.
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+        assert_eq!(
+            dial_count.load(Ordering::SeqCst),
+            0,
+            "a stream error must pace the reconnect, not dial immediately"
+        );
+
+        // After the delay, it redials.
+        tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_millis(100)).await;
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+        assert!(
+            dial_count.load(Ordering::SeqCst) >= 1,
+            "dialer should have been called after a stream error"
+        );
+        drop(handle);
+    }
+
+    #[tokio::test]
     async fn reconnect_retries_after_dial_failure() {
         tokio::time::pause();
 

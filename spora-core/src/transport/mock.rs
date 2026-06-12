@@ -21,7 +21,6 @@ pub struct MockTransport {
 pub struct MockTransportHandle {
     tx: mpsc::UnboundedSender<Vec<u8>>,
     rx: mpsc::UnboundedReceiver<Vec<u8>>,
-    #[allow(dead_code)]
     error_tx: mpsc::UnboundedSender<io::Error>,
 }
 
@@ -37,7 +36,6 @@ impl MockTransportHandle {
     }
 
     /// Inject an error so the next `Stream::poll_next` on the transport yields `Some(Err(...))`.
-    #[allow(dead_code)]
     pub fn inject_error(&self, err: io::Error) {
         let _ = self.error_tx.send(err);
     }
