@@ -37,9 +37,10 @@ use crate::netns::Netns;
 /// a DPI box matches on the first bytes of any UDP payload to flag a sharer.
 pub const SIG_REGISTER_MAGIC: &str = "8073705201";
 
-/// Hole-punch marker prefix shared by `sporaHP1P` (PUNCH) and `sporaHP1V`
-/// (VERIFY) (spora-core/src/lib.rs:1229) — one signature catches both the
-/// punch and the verify packets of the direct-upgrade probe.
+/// The OLD fixed hole-punch marker prefix once shared by `sporaHP1P`/`sporaHP1V`
+/// (now removed — the markers are per-session keyed nonces, spora-core
+/// `punch_markers`). Kept so the suite can regression-guard that dropping this
+/// literal no longer blocks the punch.
 pub const SIG_PUNCH_MARKER: &str = "73706f7261485031";
 
 /// The STUN `SOFTWARE` attribute the stunclient crate sends by default,

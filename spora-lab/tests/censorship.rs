@@ -89,13 +89,6 @@ fn is_upgrade_success(e: &TunnelEvent) -> bool {
     matches!(e, TunnelEvent::DirectUpgradeSucceeded { .. })
 }
 
-fn is_upgrade_outcome(e: &TunnelEvent) -> bool {
-    matches!(
-        e,
-        TunnelEvent::DirectUpgradeSucceeded { .. } | TunnelEvent::DirectUpgradeFailed { .. }
-    )
-}
-
 const ECHO_COUNT: usize = 10;
 
 /// UDP-echo through the tunnel and require zero loss (the quiet lab veth path
@@ -251,23 +244,21 @@ fn quic_v1_wholesale() -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// 3. punch_marker_signature
+// 3 & 4. Direct-leg fingerprints that have been REMOVED — regression guards.
 //
-// Fingerprint: the hole-punch probe sends literal `sporaHP1P`/`sporaHP1V`
-// markers (spora-core/src/lib.rs:1229). Threat: magic-prefix DPI on the DIRECT
-// leg. Open/Open is trivially punchable (mirrors nat_matrix::open_open_direct),
-// so a clean direct upgrade is the baseline. With the markers dropped on the
-// wan router (they transit FORWARD), the punch fails — while the relay path
-// keeps working (path independence). Clear the signature and the next upgrade
-// retry punches and succeeds, proving the marker literal was the only thing
-// blocking the direct path.
+// The hole-punch markers (`sporaHP1P`/`sporaHP1V`) are now per-session nonces
+// keyed off the off-wire secret (spora-core `punch_markers`), and the STUN
+// SOFTWARE attribute ("SimpleRustStunClient") is suppressed. So a censor that
+// drops the OLD literal is now a NO-OP: the direct upgrade still completes. If
+// a fixed marker / SOFTWARE string is reintroduced, the matching drop rule
+// would block the punch / STUN and these guards would fail.
+//
+// (The two-packet ~300ms punch *timing* pattern is a separate behavioral
+// signature, out of scope for a byte-signature censor; see the DPI effort.)
 
-/// Client deadline for `DirectUpgradeSucceeded` after the censor lifts: a clean
-/// punch is ~2s, plus one scaled `upgrade_retry_delay` (3s) and CI slack.
+/// Deadline for the direct upgrade to succeed on Open/Open: a clean punch is
+/// ~2s; the margin absorbs a retry under CI contention.
 const UPGRADE_TIMEOUT: Duration = Duration::from_secs(30);
-/// Deadline for one full FAILED attempt: endpoint exchange (instant on Open/
-/// Open) + punch phase (5s, run twice) + slack.
-const FAIL_TIMEOUT: Duration = Duration::from_secs(25);
 
 /// Production punch geometry (per nat_matrix) but a short `upgrade_retry_delay`
 /// so the post-clear retry fires quickly.
@@ -278,105 +269,47 @@ fn fast_retry_timings() -> Timings {
     }
 }
 
-fn punch_marker_signature() -> Result<(), String> {
+/// Shared regression guard: with a censor dropping `sig_hex` (a now-removed
+/// literal) installed up front, the direct upgrade must still complete, because
+/// those bytes no longer appear on the wire.
+fn upgrade_survives_drop(sig_hex: &str, what: &str) -> Result<(), String> {
     let topo = Topology::build(&TopologySpec::new(NatKind::Open, NatKind::Open))?;
     if !censor_available(&topo.wan)? {
         return Ok(());
     }
-    // Production relay timeouts (registration 120s): this scenario runs long
-    // enough that a scaled 6s registration would expire under it.
+    // Production relay timeouts (registration 120s) so nothing expires mid-run.
     let wan = services::start_wan(&topo.wan, relay::State::default)?;
     let mut opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
     opts.timings = fast_retry_timings();
     opts.enable_direct_upgrade = true;
 
-    // Censor the punch markers BEFORE the peers come up, so the very first
-    // upgrade attempt is already blocked.
-    censor::drop_signature(&topo.wan, censor::SIG_PUNCH_MARKER)?;
+    censor::drop_signature(&topo.wan, sig_hex)?;
 
-    let mut sharer = peers::start_sharer(&topo.sharer, &opts)?;
+    let sharer = peers::start_sharer(&topo.sharer, &opts)?;
     let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)?;
     client
         .wait_event(is_relay_established, Duration::from_secs(15))
-        .map_err(|e| format!("client relay session: {e}"))?;
-    sharer
-        .wait_event(is_relay_established, Duration::from_secs(15))
-        .map_err(|e| format!("sharer relay session: {e}"))?;
-
-    // Path independence: the relay path is unaffected by the punch censor...
-    expect_clean_echo(&client, "relay echo under punch censor")?;
-
-    // ...and the direct upgrade attempt fails (markers dropped in FORWARD).
-    match client.wait_event(is_upgrade_outcome, FAIL_TIMEOUT) {
-        Ok(TunnelEvent::DirectUpgradeFailed { reason }) => {
-            log::info!("punch-marker block: upgrade failed as expected: {reason}");
-        }
-        Ok(TunnelEvent::DirectUpgradeSucceeded { local, peer }) => {
-            return Err(format!(
-                "direct upgrade SUCCEEDED while punch markers were dropped \
-                 (local={local}, peer={peer}) — the censor did not bite"
-            ));
-        }
-        Ok(other) => return Err(format!("unexpected event waiting for upgrade outcome: {other:?}")),
-        Err(e) => return Err(format!("no direct-upgrade attempt under the punch censor: {e}")),
-    }
-
-    // Lift the censor: the next retry punches and succeeds.
-    censor::clear_signature(&topo.wan, censor::SIG_PUNCH_MARKER)?;
+        .map_err(|e| format!("{what}: client relay session: {e}"))?;
     client
         .wait_event(is_upgrade_success, UPGRADE_TIMEOUT)
-        .map_err(|e| format!("direct upgrade never succeeded after clearing the markers: {e}"))?;
-    expect_clean_echo(&client, "post-upgrade echo")?;
+        .map_err(|e| {
+            format!("{what}: direct upgrade never succeeded under the drop — reintroduced literal? {e}")
+        })?;
+    expect_clean_echo(&client, &format!("{what}: post-upgrade echo"))?;
 
     client.stop();
     sharer.stop();
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// 4. stun_software_signature
-//
-// Fingerprint: the STUN binding request carried a default SOFTWARE attribute
-// "SimpleRustStunClient" (the stunclient crate default) — a near-unique
-// cleartext string. spora-core now suppresses it (`set_software(None)`). This
-// is the regression guard: with a censor dropping that literal in place, the
-// direct upgrade must STILL succeed, because the string is gone so STUN binding
-// requests are never matched. If the SOFTWARE attribute is ever reintroduced,
-// the rule would drop the binding requests, STUN would fail, and the upgrade
-// would never complete — failing this scenario.
+/// Hole-punch markers are keyed per session; dropping the OLD `sporaHP1*`
+/// literal must not block the punch.
+fn punch_marker_signature() -> Result<(), String> {
+    upgrade_survives_drop(censor::SIG_PUNCH_MARKER, "punch-marker")
+}
 
+/// The STUN SOFTWARE attribute is suppressed; dropping the old
+/// "SimpleRustStunClient" literal must not block STUN (and thus the upgrade).
 fn stun_software_signature() -> Result<(), String> {
-    let topo = Topology::build(&TopologySpec::new(NatKind::Open, NatKind::Open))?;
-    if !censor_available(&topo.wan)? {
-        return Ok(());
-    }
-    let wan = services::start_wan(&topo.wan, relay::State::default)?;
-    let mut opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
-    opts.timings = fast_retry_timings();
-    opts.enable_direct_upgrade = true;
-
-    // A censor dropping the (now-removed) STUN SOFTWARE literal must be a no-op.
-    censor::drop_signature(&topo.wan, censor::SIG_STUN_SOFTWARE)?;
-
-    let sharer = peers::start_sharer(&topo.sharer, &opts)?;
-    let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)?;
-    client
-        .wait_event(is_relay_established, Duration::from_secs(15))
-        .map_err(|e| format!("client relay session: {e}"))?;
-
-    // STUN — and thus the punch and direct upgrade — must succeed despite the
-    // rule, because the SimpleRustStunClient string is no longer emitted.
-    client
-        .wait_event(is_upgrade_success, UPGRADE_TIMEOUT)
-        .map_err(|e| {
-            format!(
-                "direct upgrade never succeeded under the STUN-SOFTWARE drop — \
-                 has the SOFTWARE attribute been reintroduced? {e}"
-            )
-        })?;
-    expect_clean_echo(&client, "post-upgrade echo")?;
-
-    client.stop();
-    sharer.stop();
-    Ok(())
+    upgrade_survives_drop(censor::SIG_STUN_SOFTWARE, "stun-software")
 }

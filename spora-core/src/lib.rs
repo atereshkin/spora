@@ -991,9 +991,12 @@ async fn try_direct_as_initiator(
         )));
     }
 
+    let (punch_pkt, verify_pkt) = punch_markers(&secret);
     let (socket, learned_peer) = punch_and_verify(
         socket,
         peer_addr,
+        &punch_pkt,
+        &verify_pkt,
         timings.punch_phase_timeout,
         timings.punch_send_interval,
     )
@@ -1068,9 +1071,12 @@ async fn try_direct_as_responder(
     // the learned peer address is informational for the punch — but it is
     // address-validated (learned from packets the peer actually sourced), so
     // the connection log records it even when the QUIC build below fails.
+    let (punch_pkt, verify_pkt) = punch_markers(&identity.secret);
     let (socket, learned_peer) = punch_and_verify(
         socket,
         peer_addr,
+        &punch_pkt,
+        &verify_pkt,
         timings.punch_phase_timeout,
         timings.punch_send_interval,
     )
@@ -1223,11 +1229,29 @@ fn bind_local_udp(protector: &SocketProtector, peer: SocketAddr) -> Result<std::
     Ok(std)
 }
 
-// Hole-punch markers, sharing an 8-byte magic so a stray internet packet
-// can't be mistaken for one (security still comes from the QUIC handshake
-// that follows — these only steer where we point it).
-const PUNCH_PKT: &[u8] = b"sporaHP1P"; // "I'm trying to reach you"
-const VERIFY_PKT: &[u8] = b"sporaHP1V"; // "I received your packet"
+/// Length of the per-session hole-punch markers.
+const PUNCH_MARKER_LEN: usize = 16;
+
+/// Per-session hole-punch markers `(probe, verify)`, derived from the shared
+/// secret so they are unpredictable to an on-path observer — the secret travels
+/// out of band in the share URL, never on the wire — instead of the old fixed
+/// `sporaHP1P`/`sporaHP1V` literals a DPI box could byte-match. Both peers
+/// derive identical values from the same 16-byte secret; the two markers differ
+/// (distinct derivation labels) so a received VERIFY still proves the path is
+/// bidirectional. Security still comes from the QUIC handshake that follows —
+/// these only steer where we point it.
+fn punch_markers(secret: &[u8; SECRET_LEN]) -> ([u8; PUNCH_MARKER_LEN], [u8; PUNCH_MARKER_LEN]) {
+    let derive = |label: &[u8]| {
+        let mut input = Vec::with_capacity(label.len() + SECRET_LEN);
+        input.extend_from_slice(label);
+        input.extend_from_slice(secret);
+        let digest = ring::digest::digest(&ring::digest::SHA256, &input);
+        let mut marker = [0u8; PUNCH_MARKER_LEN];
+        marker.copy_from_slice(&digest.as_ref()[..PUNCH_MARKER_LEN]);
+        marker
+    };
+    (derive(b"spora-punch-v1-probe"), derive(b"spora-punch-v1-verify"))
+}
 
 /// Cap on peer-reflexive sources learned during a single punch exchange. A
 /// spoofed-source punch flood would otherwise grow the learned/targets lists
@@ -1279,6 +1303,8 @@ fn record_punch_source(
 async fn punch_and_verify(
     socket: UdpSocket,
     signaled: SocketAddr,
+    punch_pkt: &[u8],
+    verify_pkt: &[u8],
     phase_timeout: Duration,
     send_interval: Duration,
 ) -> Result<(UdpSocket, SocketAddr), String> {
@@ -1296,10 +1322,10 @@ async fn punch_and_verify(
             tokio::select! {
                 _ = interval.tick() => {
                     for t in &targets {
-                        let _ = socket.send_to(PUNCH_PKT, *t).await;
+                        let _ = socket.send_to(punch_pkt, *t).await;
                     }
                     for l in &learned {
-                        let _ = socket.send_to(VERIFY_PKT, *l).await;
+                        let _ = socket.send_to(verify_pkt, *l).await;
                     }
                 }
                 result = socket.recv_from(&mut buf) => {
@@ -1308,19 +1334,19 @@ async fn punch_and_verify(
                         Err(e) => return Err(format!("recv error: {}", e)),
                     };
                     let msg = &buf[..n];
-                    if msg != PUNCH_PKT && msg != VERIFY_PKT {
+                    if msg != punch_pkt && msg != verify_pkt {
                         continue;
                     }
                     if record_punch_source(&mut learned, &mut targets, src) {
                         debug!("Direct connection: learned peer source {}", src);
                     }
                     // Open our NAT toward this source and tell it we heard it.
-                    let _ = socket.send_to(VERIFY_PKT, src).await;
-                    if msg == VERIFY_PKT {
+                    let _ = socket.send_to(verify_pkt, src).await;
+                    if msg == verify_pkt {
                         // Bidirectional confirmed. A few extra VERIFYs so the
                         // peer reaches the same conclusion before we settle.
                         for _ in 0..3 {
-                            let _ = socket.send_to(VERIFY_PKT, src).await;
+                            let _ = socket.send_to(verify_pkt, src).await;
                         }
                         return Ok::<_, String>(src);
                     }
