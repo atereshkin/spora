@@ -26,12 +26,30 @@ struct Args {
     /// counts) — the operator's accountability record (see sessionlog).
     #[arg(long)]
     no_session_log: bool,
-    /// Session-log database path.
-    #[arg(long, default_value = "relay-sessions.sqlite", conflicts_with = "no_session_log")]
-    session_log: PathBuf,
+    /// Session-log database path. Default: `$STATE_DIRECTORY/relay-sessions.sqlite`
+    /// when run under systemd with `StateDirectory=` set (the recommended
+    /// deployment), otherwise `relay-sessions.sqlite` in the working directory.
+    #[arg(long, conflicts_with = "no_session_log")]
+    session_log: Option<PathBuf>,
     /// Session-log retention in days; older sessions are swept.
     #[arg(long, default_value_t = 90, conflicts_with = "no_session_log")]
     session_log_retention_days: u32,
+}
+
+/// Where the session log lives when `--session-log` is not given. Prefers
+/// systemd's `$STATE_DIRECTORY` (an absolute, service-owned, writable path
+/// that systemd creates from `StateDirectory=`), so the on-by-default log
+/// works under a hardened unit without a writable working directory. Falls
+/// back to a cwd-relative file for non-systemd / development runs.
+fn default_session_log_path() -> PathBuf {
+    if let Some(state) = std::env::var_os("STATE_DIRECTORY") {
+        // systemd may list several dirs colon-separated; use the first.
+        let lossy = state.to_string_lossy();
+        if let Some(first) = lossy.split(':').find(|s| !s.is_empty()) {
+            return PathBuf::from(first).join("relay-sessions.sqlite");
+        }
+    }
+    PathBuf::from("relay-sessions.sqlite")
 }
 
 #[tokio::main]
@@ -48,20 +66,26 @@ async fn main() {
     // fails the operator loudly at startup rather than leaving a silent gap.
     let mut state = State::default();
     if !args.no_session_log {
-        let mut cfg = SessionLogConfig::at(&args.session_log);
+        let path = args.session_log.unwrap_or_else(default_session_log_path);
+        let mut cfg = SessionLogConfig::at(&path);
         cfg.retention = Duration::from_secs(u64::from(args.session_log_retention_days) * 86_400);
         match SessionLog::open(cfg) {
             Ok(log) => {
                 info!(
                     "session log at {} (retention {} days)",
-                    args.session_log.display(),
+                    path.display(),
                     args.session_log_retention_days
                 );
                 state = state.with_session_log(log);
             }
             Err(e) => {
                 eprintln!("relay: {e}");
-                eprintln!("relay: pass --no-session-log to run without it");
+                eprintln!(
+                    "relay: the session log path is not writable. Under systemd, set \
+                     `StateDirectory=spora-relay` in the unit (the relay then writes to \
+                     $STATE_DIRECTORY automatically), or pass --session-log <writable path>, \
+                     or --no-session-log to run without it."
+                );
                 std::process::exit(1);
             }
         }
