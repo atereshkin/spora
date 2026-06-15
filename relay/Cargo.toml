@@ -10,6 +10,9 @@ clap = { version = "4.5.52", features = ["derive"] }
 log = "0.4.29"
 env_logger = "0.11.8"
 relay-client = { path = "../relay-client" }
+rusqlite = { version = "0.32", features = ["bundled"] }
+rand = "0.8"
 
 [dev-dependencies]
 rcgen = "0.13"
+tempfile = "3"

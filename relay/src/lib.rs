@@ -16,12 +16,16 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use log::{debug, info, warn};
 use tokio::net::UdpSocket;
 
 use relay_client::protocol::{self, Classified, ROUTING_KEY_LEN};
+
+pub mod sessionlog;
+use sessionlog::{SessionLog, SessionState};
 
 pub const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(120);
 pub const FLOW_TIMEOUT: Duration = Duration::from_secs(60);
@@ -38,7 +42,7 @@ pub const REVERSE_ACTIVITY_GRACE: Duration = Duration::from_secs(20);
 pub type RoutingKey = [u8; ROUTING_KEY_LEN];
 
 /// A forwarding-table entry. Stored under both endpoints of a flow.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct Flow {
     /// Where to forward packets arriving from this entry's key address.
     dst: SocketAddr,
@@ -52,6 +56,10 @@ struct Flow {
     /// client. `None` until the sharer responds. Drives the "actively serving"
     /// check that protects an established client from being displaced.
     reverse: Option<Instant>,
+    /// Shared session accounting for the connection log, present on BOTH of a
+    /// flow's entries (so either direction's bytes land in the same totals).
+    /// `None` when session logging is disabled — keeps the no-log path free.
+    session: Option<Arc<SessionState>>,
 }
 
 pub struct State {
@@ -65,6 +73,10 @@ pub struct State {
     registration_timeout: Duration,
     flow_timeout: Duration,
     sweep_interval: Duration,
+    /// Optional persistent session log (off by default; the deployed binary
+    /// attaches one). Records each matched flow for operator accountability —
+    /// see [`sessionlog`].
+    session_log: Option<SessionLog>,
 }
 
 impl Default for State {
@@ -117,7 +129,16 @@ impl State {
             registration_timeout,
             flow_timeout,
             sweep_interval,
+            session_log: None,
         }
+    }
+
+    /// Attach a persistent session log (the deployed binary does this; tests
+    /// and the lab leave it off). Builder-style so `State::default()` stays
+    /// the logging-free path.
+    pub fn with_session_log(mut self, log: SessionLog) -> State {
+        self.session_log = Some(log);
+        self
     }
 
     /// Decide what to do with a packet from `src`. Updates internal state
@@ -135,10 +156,19 @@ impl State {
         // long- and short-header packets after the first match.
         if let Some(flow) = self.flows.get_mut(&src) {
             flow.ts = now;
+            let from_sharer = flow.from_sharer;
             // Record sharer→client return traffic so we can tell an actively
             // served client (protected) from an idle/abandoned flow.
-            if flow.from_sharer {
+            if from_sharer {
                 flow.reverse = Some(now);
+            }
+            // Session accounting (hot path: one atomic add per direction).
+            if let Some(s) = &flow.session {
+                if from_sharer {
+                    s.add_s2c(pkt.len() as u64);
+                } else {
+                    s.add_c2s(pkt.len() as u64);
+                }
             }
             return Action::Forward(flow.dst);
         }
@@ -188,11 +218,14 @@ impl State {
                 // this, a single Initial-shaped packet refreshed every <60s would
                 // hold the slot and lock out every real client.
                 let mut preserved_reverse = None;
-                if let Some(existing) = self.flows.get(&sharer_addr).copied() {
+                let mut reused_session: Option<Arc<SessionState>> = None;
+                if let Some(existing) = self.flows.get(&sharer_addr).cloned() {
                     if existing.dst == src {
                         // Same client re-sending (e.g. an Initial retransmit):
-                        // keep its established serving state, just refresh below.
+                        // keep its established serving state AND its session, so
+                        // a retransmit refreshes rather than opening a duplicate.
                         preserved_reverse = existing.reverse;
+                        reused_session = existing.session.clone();
                     } else {
                         let serving = existing
                             .reverse
@@ -204,17 +237,44 @@ impl State {
                             );
                             return Action::Drop;
                         }
-                        // Idle/abandoned incumbent — displace it for this client.
+                        // Idle/abandoned incumbent — close its session and
+                        // displace it for this client.
+                        if let (Some(log), Some(s)) = (&self.session_log, &existing.session) {
+                            log.close_session(s, "displaced");
+                        }
                         self.flows.remove(&existing.dst);
                     }
                 }
+                // Open (or reuse, on retransmit) the session for this flow. Only
+                // allocated when logging is on, so the no-log path stays free.
+                let session = match (reused_session, &self.session_log) {
+                    (Some(s), _) => Some(s),
+                    (None, Some(log)) => Some(log.open_session(&rk, src, sharer_addr)),
+                    (None, None) => None,
+                };
+                if let Some(s) = &session {
+                    // Count the client Initial that installed the flow.
+                    s.add_c2s(pkt.len() as u64);
+                }
                 self.flows.insert(
                     src,
-                    Flow { dst: sharer_addr, ts: now, from_sharer: false, reverse: None },
+                    Flow {
+                        dst: sharer_addr,
+                        ts: now,
+                        from_sharer: false,
+                        reverse: None,
+                        session: session.clone(),
+                    },
                 );
                 self.flows.insert(
                     sharer_addr,
-                    Flow { dst: src, ts: now, from_sharer: true, reverse: preserved_reverse },
+                    Flow {
+                        dst: src,
+                        ts: now,
+                        from_sharer: true,
+                        reverse: preserved_reverse,
+                        session,
+                    },
                 );
                 info!(
                     "matched client {} <-> sharer {} on rk {:x?}",
@@ -281,8 +341,20 @@ impl State {
         let flow_timeout = self.flow_timeout;
         self.registrations
             .retain(|_, (_, ts, _)| now.duration_since(*ts) < registration_timeout);
-        self.flows
-            .retain(|_, flow| now.duration_since(flow.ts) < flow_timeout);
+        // Close the session log entry for each expired flow before dropping it.
+        // The shared `SessionState` makes the close idempotent, so the flow's
+        // two entries (which may expire in different sweeps) emit exactly one
+        // close. Borrow the log separately from `flows` (disjoint fields).
+        let log = self.session_log.as_ref();
+        self.flows.retain(|_, flow| {
+            let alive = now.duration_since(flow.ts) < flow_timeout;
+            if !alive
+                && let (Some(log), Some(s)) = (log, &flow.session)
+            {
+                log.close_session(s, "idle");
+            }
+            alive
+        });
         let reg_removed = before_reg - self.registrations.len();
         let flow_removed = before_flows - self.flows.len();
         if reg_removed + flow_removed > 0 {
@@ -769,5 +841,126 @@ mod tests {
             .unwrap();
         assert_eq!(&buf[..recv.0], &reply[..]);
         assert_eq!(recv.1, relay_addr);
+    }
+
+    // --- Session logging ---
+
+    use crate::sessionlog::{SessionLog, SessionLogConfig};
+
+    fn fast_log(path: &std::path::Path) -> SessionLog {
+        let mut cfg = SessionLogConfig::at(path);
+        cfg.flush_interval = Duration::from_millis(20);
+        SessionLog::open(cfg).unwrap()
+    }
+
+    /// Poll the (async-written) session DB until `pred` passes or 5s elapse.
+    fn wait_session<F>(path: &std::path::Path, pred: F)
+    where
+        F: Fn(&rusqlite::Connection) -> bool,
+    {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Ok(db) = rusqlite::Connection::open_with_flags(
+                path,
+                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+            ) && pred(&db)
+            {
+                return;
+            }
+            assert!(Instant::now() < deadline, "session log condition not met within 5s");
+            std::thread::sleep(Duration::from_millis(25));
+        }
+    }
+
+    #[test]
+    fn session_log_records_matched_flow_with_counts() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.sqlite");
+        let mut s = State::default().with_session_log(fast_log(&path));
+
+        let now = Instant::now();
+        let a = addr("10.0.0.1:1111"); // sharer
+        let b = addr("10.0.0.2:2222"); // client
+        let mut reg = registrar();
+        let key = reg.routing_key();
+
+        s.handle_packet(a, &reg.next_register_packet(), now);
+        // Client Initial installs the flow (counted as the first c2s packet).
+        assert_eq!(s.handle_packet(b, &initial_with_dcid(&key), now), Action::Forward(a));
+        // One sharer→client packet (s2c) and one more client→sharer (c2s).
+        s.handle_packet(a, &short_header(), now);
+        s.handle_packet(b, &short_header(), now);
+        // Idle past the flow timeout → session closed as 'idle' on sweep.
+        s.sweep(now + FLOW_TIMEOUT + Duration::from_secs(1));
+        // Dropping State drops the SessionLog → writer flushes and exits.
+        drop(s);
+
+        let key_hex: String = key.iter().map(|x| format!("{:02x}", x)).collect();
+        wait_session(&path, |db| {
+            db.query_row(
+                "SELECT client_addr, sharer_addr, pkts_c2s, pkts_s2c, end_reason
+                 FROM sessions WHERE routing_key=?1",
+                [&key_hex],
+                |r| {
+                    Ok((
+                        r.get::<_, String>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, i64>(2)?,
+                        r.get::<_, i64>(3)?,
+                        r.get::<_, Option<String>>(4)?,
+                    ))
+                },
+            )
+            .map(|(client, sharer, c2s, s2c, reason)| {
+                client == "10.0.0.2:2222"
+                    && sharer == "10.0.0.1:1111"
+                    && c2s == 2 // Initial + one short-header
+                    && s2c == 1
+                    && reason.as_deref() == Some("idle")
+            })
+            .unwrap_or(false)
+        });
+    }
+
+    #[test]
+    fn session_log_records_displacement() {
+        // An idle incumbent (a peer that installed a flow but the sharer never
+        // returned traffic to) is closed as 'displaced' when a real client
+        // takes the slot.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.sqlite");
+        let mut s = State::default().with_session_log(fast_log(&path));
+
+        let now = Instant::now();
+        let a = addr("10.0.0.1:1111");
+        let attacker = addr("10.9.9.9:9999");
+        let client = addr("10.0.0.2:2222");
+        let mut reg = registrar();
+        let key = reg.routing_key();
+
+        s.handle_packet(a, &reg.next_register_packet(), now);
+        // Attacker installs a flow; the sharer never serves it (stays idle).
+        assert_eq!(s.handle_packet(attacker, &initial_with_dcid(&key), now), Action::Forward(a));
+        // A genuine client displaces the idle incumbent.
+        assert_eq!(s.handle_packet(client, &initial_with_dcid(&key), now), Action::Forward(a));
+        drop(s);
+
+        wait_session(&path, |db| {
+            let displaced: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE client_addr='10.9.9.9:9999' AND end_reason='displaced'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            let client_open: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM sessions WHERE client_addr='10.0.0.2:2222' AND end_ms IS NULL",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap_or(0);
+            displaced == 1 && client_open == 1
+        });
     }
 }

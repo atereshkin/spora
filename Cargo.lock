@@ -4600,9 +4600,12 @@ dependencies = [
  "clap",
  "env_logger",
  "log",
+ "rand 0.8.5",
  "rcgen",
  "relay-client",
+ "rusqlite",
  "socket2 0.5.10",
+ "tempfile",
  "tokio",
 ]
 
