@@ -62,3 +62,11 @@ harness = false
 # loopback relay so it can run on any platform/CI without userns.
 [[test]]
 name = "peers_loopback"
+
+# DPI-censorship (Tier 0): a signature-matching middlebox in the wan namespace
+# drops Spora's on-wire fingerprints (REGISTER magic, QUIC v1 version word,
+# punch markers); asserts each is blockable today and that removing it restores
+# connectivity. Needs the iptables `string` match (self-skips without it).
+[[test]]
+name = "censorship"
+harness = false
