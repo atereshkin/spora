@@ -42,9 +42,15 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(40);
 pub struct LabPeerOpts {
     pub timings: spora_core::Timings,
     pub enable_direct_upgrade: bool,
-    pub relay_host: String,
-    pub relay_port: u16,
+    /// Relays in preference order (the sharer registers with all; the client
+    /// tries them IPv6-first then by this order). [`LabPeerOpts::new`] sets a
+    /// single relay; multi-relay scenarios push more.
+    pub relays: Vec<spora_core::identity::RelayEndpoint>,
     pub stun_server: String,
+    /// Share side only: enable the sharer's connection log
+    /// (`Config::conn_log`). The connlog suite points this at a per-scenario
+    /// temp dir and asserts on the resulting database.
+    pub conn_log: Option<spora_core::connlog::ConnLogConfig>,
 }
 
 impl LabPeerOpts {
@@ -54,10 +60,17 @@ impl LabPeerOpts {
         Self {
             timings: spora_core::Timings::default(),
             enable_direct_upgrade: true,
-            relay_host: relay.ip().to_string(),
-            relay_port: relay.port(),
+            relays: vec![relay_endpoint(relay)],
             stun_server: stun_server.into(),
+            conn_log: None,
         }
+    }
+
+    /// Replace the relay list (preference order). Convenience for
+    /// multi-relay/failover scenarios.
+    pub fn with_relays(mut self, relays: impl IntoIterator<Item = SocketAddr>) -> Self {
+        self.relays = relays.into_iter().map(relay_endpoint).collect();
+        self
     }
 
     /// Build a `spora_core::Config` from these options, with the event hook
@@ -67,15 +80,21 @@ impl LabPeerOpts {
         let (hook, events) = event_channel();
         let config = Config {
             stun_server: self.stun_server.clone(),
-            relay_host: self.relay_host.clone(),
-            relay_port: self.relay_port,
+            relays: self.relays.clone(),
             timings: self.timings.clone(),
             enable_direct_upgrade: self.enable_direct_upgrade,
             event_hook: Some(hook),
+            conn_log: self.conn_log.clone(),
             ..Config::default()
         };
         (config, events)
     }
+}
+
+/// A lab relay address as a `RelayEndpoint`: IP literal host (bracketing of
+/// v6 is the URL layer's job) + port.
+fn relay_endpoint(addr: SocketAddr) -> spora_core::identity::RelayEndpoint {
+    spora_core::identity::RelayEndpoint::new(addr.ip().to_string(), addr.port())
 }
 
 /// A non-blocking `event_hook` (pushes into an unbounded std channel) plus
@@ -277,15 +296,17 @@ impl ClientHandle {
     }
 
     /// UDP-echo `count` datagrams of `payload_len` bytes against `server`
-    /// through the tunnel; blocks up to `timeout` for the stats. On timeout
-    /// the pump keeps running the command to completion in the background.
+    /// (v4 or v6 — the inner family follows the server address) through the
+    /// tunnel; blocks up to `timeout` for the stats. On timeout the pump
+    /// keeps running the command to completion in the background.
     pub fn udp_echo(
         &self,
-        server: std::net::SocketAddrV4,
+        server: impl Into<SocketAddr>,
         count: usize,
         payload_len: usize,
         timeout: Duration,
     ) -> Result<EchoStats, String> {
+        let server = server.into();
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmds
             .send(TrafficCmd::UdpEcho {
@@ -299,13 +320,15 @@ impl ClientHandle {
     }
 
     /// Round-trip `bytes` of data over a real TCP connection to `server`
-    /// (the wan TCP echo) through the tunnel; blocks up to `timeout`.
+    /// (the wan TCP echo, v4 or v6) through the tunnel; blocks up to
+    /// `timeout`.
     pub fn tcp_bulk(
         &self,
-        server: std::net::SocketAddrV4,
+        server: impl Into<SocketAddr>,
         bytes: usize,
         timeout: Duration,
     ) -> Result<BulkStats, String> {
+        let server = server.into();
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmds
             .send(TrafficCmd::TcpBulk {
@@ -317,16 +340,18 @@ impl ClientHandle {
         recv_result(rx, timeout, "tcp bulk")
     }
 
-    /// Download `bytes` over TCP from `server` (the wan SOURCE service)
-    /// through the tunnel; blocks up to `timeout`. `BulkStats::elapsed` runs
-    /// from connection establishment to the last byte.
+    /// Download `bytes` over TCP from `server` (the wan SOURCE service, v4
+    /// or v6) through the tunnel; blocks up to `timeout`.
+    /// `BulkStats::elapsed` runs from connection establishment to the last
+    /// byte.
     pub fn tcp_download(
         &self,
-        server: std::net::SocketAddrV4,
+        server: impl Into<SocketAddr>,
         bytes: usize,
         opts: TcpOpts,
         timeout: Duration,
     ) -> Result<BulkStats, String> {
+        let server = server.into();
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmds
             .send(TrafficCmd::TcpDownload {
@@ -339,16 +364,17 @@ impl ClientHandle {
         recv_result(rx, timeout, "tcp download")
     }
 
-    /// Upload `bytes` over TCP to `server` (the wan SINK service) through
-    /// the tunnel; blocks up to `timeout`. `BulkStats::elapsed` runs from
-    /// the first send to the sink's verified byte-count ack.
+    /// Upload `bytes` over TCP to `server` (the wan SINK service, v4 or v6)
+    /// through the tunnel; blocks up to `timeout`. `BulkStats::elapsed` runs
+    /// from the first send to the sink's verified byte-count ack.
     pub fn tcp_upload(
         &self,
-        server: std::net::SocketAddrV4,
+        server: impl Into<SocketAddr>,
         bytes: usize,
         opts: TcpOpts,
         timeout: Duration,
     ) -> Result<BulkStats, String> {
+        let server = server.into();
         let (tx, rx) = tokio::sync::oneshot::channel();
         self.cmds
             .send(TrafficCmd::TcpUpload {

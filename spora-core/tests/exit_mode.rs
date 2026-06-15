@@ -47,8 +47,7 @@ async fn custom_exit_mode_pumps_packets() {
     });
 
     let config = Config {
-        relay_host: "127.0.0.1".into(),
-        relay_port: relay_addr.port(),
+        relays: vec![spora_core::identity::RelayEndpoint::new("127.0.0.1", relay_addr.port())],
         exit_mode: ExitMode::Custom(handler),
         ..Config::default()
     };

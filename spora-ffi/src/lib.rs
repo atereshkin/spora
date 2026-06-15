@@ -113,15 +113,39 @@ pub fn make_identity() -> Vec<u8> {
     spora_core::identity::Identity::generate().to_bytes()
 }
 
+/// Starts sharing this device's connection.
+///
+/// Connection logging (the sharer-side per-flow record, see spora-core's
+/// `connlog`): pass `conn_log_dir` to enable it. The app should pass a
+/// directory under its files dir (e.g. `filesDir/connlog`) and exclude it
+/// from Android auto-backup. `conn_log_dir = None` disables logging.
+/// `conn_log_retention_days = None` uses the core default (90 days).
+/// `conn_log_sessions_only = true` records who was connected and when, but
+/// no per-flow destination records.
+///
+/// Fails if `conn_log_dir` is set but not writable — a default-on liability
+/// log must not silently degrade at startup.
 #[uniffi::export]
 pub fn share(
     identity_bytes: Vec<u8>,
     protector: Option<Box<dyn SocketProtectorCallback>>,
+    conn_log_dir: Option<String>,
+    conn_log_retention_days: Option<u32>,
+    conn_log_sessions_only: bool,
 ) -> Result<ShareResult, ShareError> {
     let identity = spora_core::identity::Identity::from_bytes(&identity_bytes)
         .map_err(ShareError::Generic)?;
+    let conn_log = conn_log_dir.map(|dir| {
+        let mut cfg = spora_core::connlog::ConnLogConfig::in_dir(dir);
+        if let Some(days) = conn_log_retention_days {
+            cfg.retention = std::time::Duration::from_secs(u64::from(days) * 24 * 60 * 60);
+        }
+        cfg.log_destinations = !conn_log_sessions_only;
+        cfg
+    });
     let config = spora_core::Config {
         protector: protector.and_then(wrap_protector),
+        conn_log,
         ..spora_core::Config::default()
     };
     let session = RUNTIME

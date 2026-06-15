@@ -41,6 +41,14 @@ pub fn block_on<T>(fut: impl std::future::Future<Output = T>) -> T {
 /// would certify nothing while staying green.
 #[must_use = "exit non-zero when this returns false"]
 pub fn lab_main(suite: &str, scenarios: &[Scenario]) -> bool {
+    lab_main_with_tools(suite, scenarios, &[])
+}
+
+/// [`lab_main`] for suites needing tools beyond the baseline ip/tc/iptables
+/// (e.g. the ipv6 suite's `ip6tables`); a missing extra tool skips the suite
+/// the same way a missing baseline tool does.
+#[must_use = "exit non-zero when this returns false"]
+pub fn lab_main_with_tools(suite: &str, scenarios: &[Scenario], extra_tools: &[&str]) -> bool {
     let require = std::env::var("SPORA_LAB").as_deref() == Ok("require");
     let skip = |reason: &str| {
         if require {
@@ -77,7 +85,7 @@ pub fn lab_main(suite: &str, scenarios: &[Scenario]) -> bool {
             return true;
         }
     }
-    for tool in ["ip", "tc", "iptables"] {
+    for tool in ["ip", "tc", "iptables"].iter().chain(extra_tools) {
         if !tool_exists(tool) {
             skip(&format!("missing required tool: {tool}"));
             return true;

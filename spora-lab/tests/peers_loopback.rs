@@ -60,7 +60,7 @@ async fn udp_echo_over_loopback_relay() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     cmd_tx
         .send(TrafficCmd::UdpEcho {
-            server: FAKE_SERVER,
+            server: FAKE_SERVER.into(),
             count: 20,
             payload_len: 64,
             respond: tx,
@@ -145,6 +145,191 @@ async fn udp_echo_over_loopback_relay() {
     session.abort();
 }
 
+/// Outer-v6 twin of the test above on `[::1]`: the cheapest regression test
+/// for the v6 socket path — share URL with a bracketed v6 relay literal,
+/// family-matched binds, relay forwarding between v6 peers — that runs on
+/// any platform, no namespaces or ip6tables (the netns `ipv6` suite covers
+/// the rest: NAT66, STUN, punch, inner v6).
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_echo_over_v6_loopback_relay() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let relay_sock = tokio::net::UdpSocket::bind("[::1]:0")
+        .await
+        .expect("bind v6 relay socket");
+    let relay_addr = relay_sock.local_addr().unwrap();
+    let _relay_task = tokio::spawn(relay::serve(relay_sock, relay::State::default()));
+
+    let mut opts = LabPeerOpts::new(relay_addr, "[::1]:3478");
+    opts.enable_direct_upgrade = false;
+
+    let (mut share_cfg, _share_events) = opts.config();
+    share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
+    let session = spora_core::share(Identity::generate(), share_cfg)
+        .await
+        .expect("share() starts against a v6 relay");
+    assert!(
+        session.url.as_str().contains("?r=[::1]:"),
+        "share URL must bracket the v6 relay literal, got {}",
+        session.url
+    );
+
+    let (client_cfg, _client_events) = opts.config();
+    let connected = spora_core::connect(session.url.clone(), &client_cfg)
+        .await
+        .expect("connect() establishes the relay-via session over v6");
+
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pump = tokio::spawn(peers::drive_client(connected, cmd_rx));
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(TrafficCmd::UdpEcho {
+            server: FAKE_SERVER.into(),
+            count: 20,
+            payload_len: 64,
+            respond: tx,
+        })
+        .expect("pump is alive");
+    let stats = tokio::time::timeout(Duration::from_secs(30), rx)
+        .await
+        .expect("echo finishes within the deadline")
+        .expect("pump answers the command")
+        .expect("echo run succeeds");
+    assert_eq!(stats.received, 20, "echo lost packets over the v6 relay: {stats:?}");
+
+    drop(cmd_tx);
+    tokio::time::timeout(Duration::from_secs(5), pump)
+        .await
+        .expect("pump exits when the command channel closes")
+        .unwrap();
+    session.abort();
+}
+
+/// Spawn a bare dumb relay on `bind` (loopback), returning its bound address.
+async fn spawn_relay(bind: &str) -> std::net::SocketAddr {
+    let sock = tokio::net::UdpSocket::bind(bind)
+        .await
+        .unwrap_or_else(|e| panic!("bind relay {bind}: {e}"));
+    let addr = sock.local_addr().unwrap();
+    tokio::spawn(relay::serve(sock, relay::State::default()));
+    addr
+}
+
+/// Multi-relay: with a v6 and a v4 relay both live, the sharer registers with
+/// BOTH and the client prefers IPv6 — so the relay-via session rides the v6
+/// relay (the lever that later drives a v6 hole punch). Exercises
+/// `resolve_relays_preferring_v6` + register-with-all over the real
+/// `share()`/`connect()`.
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_relay_prefers_ipv6() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let v4_relay = spawn_relay("127.0.0.1:0").await;
+    let v6_relay = spawn_relay("[::1]:0").await;
+
+    // URL order is v4-then-v6 on purpose: preference must come from the
+    // family sort, not the listed order.
+    let opts = LabPeerOpts::new(v4_relay, "127.0.0.1:3478").with_relays([v4_relay, v6_relay]);
+    let (mut share_cfg, _se) = opts.config();
+    share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
+    let session = spora_core::share(Identity::generate(), share_cfg)
+        .await
+        .expect("share() starts with two relays");
+
+    let (client_cfg, mut client_events) = opts.config();
+    let connected = spora_core::connect(session.url.clone(), &client_cfg)
+        .await
+        .expect("connect() establishes via a relay");
+    let cancel = connected.cancel.clone();
+    let _pump = tokio::spawn(peers::drive_client(connected, {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        rx
+    }));
+
+    let ev = tokio::task::spawn_blocking(move || {
+        client_events.wait_event(
+            |e| matches!(e, TunnelEvent::RelaySessionEstablished { .. }),
+            Duration::from_secs(10),
+        )
+    })
+    .await
+    .unwrap()
+    .expect("relay-via session established");
+    match ev {
+        TunnelEvent::RelaySessionEstablished { peer } => {
+            assert_eq!(
+                peer, v6_relay,
+                "client must prefer the IPv6 relay, connected via {peer}"
+            );
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
+    cancel.cancel();
+    session.abort();
+}
+
+/// Multi-relay failover: the preferred (IPv6) relay is DEAD (nothing listening
+/// at its address), so the client must fail over to the live v4 relay within
+/// `relay_dial_timeout` and still connect — the sharer registered with both,
+/// so the v4 relay can route. This is also exactly the family-mismatch path
+/// (a v6 relay the sharer couldn't register with looks identical: the Initial
+/// is silently dropped).
+#[tokio::test(flavor = "multi_thread")]
+async fn multi_relay_fails_over_when_preferred_is_dead() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // A v6 relay address with nothing listening: bind then drop the socket.
+    let dead_v6 = {
+        let sock = tokio::net::UdpSocket::bind("[::1]:0").await.unwrap();
+        sock.local_addr().unwrap()
+    };
+    let v4_relay = spawn_relay("127.0.0.1:0").await;
+
+    let mut opts =
+        LabPeerOpts::new(v4_relay, "127.0.0.1:3478").with_relays([dead_v6, v4_relay]);
+    // Snappy failover so the dead-relay attempt doesn't stretch the test.
+    opts.timings.relay_dial_timeout = Duration::from_secs(2);
+
+    let (mut share_cfg, _se) = opts.config();
+    share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
+    let session = spora_core::share(Identity::generate(), share_cfg)
+        .await
+        .expect("share() starts");
+
+    let (client_cfg, mut client_events) = opts.config();
+    let connected = tokio::time::timeout(
+        Duration::from_secs(20),
+        spora_core::connect(session.url.clone(), &client_cfg),
+    )
+    .await
+    .expect("connect must not hang past the failover budget")
+    .expect("connect() fails over to the live v4 relay");
+    let cancel = connected.cancel.clone();
+    let _pump = tokio::spawn(peers::drive_client(connected, {
+        let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+        rx
+    }));
+
+    let ev = tokio::task::spawn_blocking(move || {
+        client_events.wait_event(
+            |e| matches!(e, TunnelEvent::RelaySessionEstablished { .. }),
+            Duration::from_secs(10),
+        )
+    })
+    .await
+    .unwrap()
+    .expect("relay-via session established after failover");
+    match ev {
+        TunnelEvent::RelaySessionEstablished { peer } => {
+            assert_eq!(peer, v4_relay, "must have failed over to the v4 relay, got {peer}");
+        }
+        other => panic!("unexpected event {other:?}"),
+    }
+    cancel.cancel();
+    session.abort();
+}
+
 /// `TrafficCmd::CpuTime` must return a growing value as the pump does work.
 ///
 /// Uses the default current-thread flavor deliberately: the pump task is
@@ -188,7 +373,7 @@ async fn pump_cpu_time_grows_with_work() {
     let (tx, rx) = tokio::sync::oneshot::channel();
     cmd_tx
         .send(TrafficCmd::UdpEcho {
-            server: FAKE_SERVER,
+            server: FAKE_SERVER.into(),
             count: 30,
             payload_len: 64,
             respond: tx,

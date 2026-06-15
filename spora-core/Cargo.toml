@@ -22,9 +22,12 @@ rcgen = "0.13"
 ring = "0.17"
 subtle = "2"
 base64 = "0.22"
+rusqlite = { version = "0.32", features = ["bundled"] }
+lru = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1.40.0", features = ["full", "test-util"] }
 relay = { path = "../relay" }
 env_logger = "0.11"
 etherparse = "0.16.0"
+tempfile = "3"

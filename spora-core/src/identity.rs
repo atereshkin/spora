@@ -84,13 +84,13 @@ impl Identity {
     }
 
     /// Build the `Token` to give the client, for this identity reached via the
-    /// given relay.
-    pub fn token(&self, relay_host: impl Into<String>, relay_port: u16) -> Token {
+    /// given relays (in preference order; the client tries IPv6 first
+    /// regardless, the order only breaks family ties).
+    pub fn token(&self, relays: Vec<RelayEndpoint>) -> Token {
         Token {
             routing_key: self.routing_key,
             secret: self.secret,
-            relay_host: relay_host.into(),
-            relay_port,
+            relays,
         }
     }
 
@@ -190,30 +190,98 @@ fn read_lp_field(bytes: &[u8], cur: &mut usize, name: &str) -> Result<Vec<u8>, S
     Ok(field)
 }
 
-/// What the client gets out of a share URL.
+/// One relay's address as a host (hostname or IP literal) and port. The host
+/// is stored bare — an IPv6 literal carries NO brackets here; bracketing is a
+/// URL-encoding concern handled by [`RelayEndpoint::to_url_param`] /
+/// `from_url_param`. A hostname is resolved (and may expand to several
+/// addresses, both families) at connect/register time, not here.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelayEndpoint {
+    pub host: String,
+    pub port: u16,
+}
+
+impl RelayEndpoint {
+    pub fn new(host: impl Into<String>, port: u16) -> Self {
+        Self { host: host.into(), port }
+    }
+
+    /// Render for a URL `?r=` value: `host:port`, bracketing an IPv6 literal.
+    fn to_url_param(&self) -> String {
+        if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        }
+    }
+
+    /// Parse one `?r=` value: `[v6literal]:port` or `host:port`. The brackets
+    /// are stripped so `host` is always a bare hostname / IP literal.
+    fn from_url_param(value: &str) -> Result<Self, String> {
+        let (host, port_str) = if let Some(rest) = value.strip_prefix('[') {
+            let (host, port) = rest
+                .split_once("]:")
+                .ok_or_else(|| format!("?r= value must be [v6]:port, got {}", value))?;
+            if host.parse::<std::net::Ipv6Addr>().is_err() {
+                return Err(format!("invalid IPv6 literal in ?r= value: {}", host));
+            }
+            (host, port)
+        } else {
+            let (host, port) = value
+                .rsplit_once(':')
+                .ok_or_else(|| format!("?r= value must be host:port, got {}", value))?;
+            // An unbracketed v6 literal would mis-split at its last group;
+            // refuse it instead of resolving a mangled host later.
+            if host.contains(':') {
+                return Err(format!(
+                    "IPv6 relay literal must be bracketed ([addr]:port), got {}",
+                    value
+                ));
+            }
+            (host, port)
+        };
+        let port: u16 = port_str
+            .parse()
+            .map_err(|_| format!("invalid port in ?r= value: {}", port_str))?;
+        Ok(RelayEndpoint { host: host.to_string(), port })
+    }
+}
+
+/// What the client gets out of a share URL. Carries one or more relay
+/// endpoints — the client tries them (IPv6 first) until one bootstraps the
+/// session, and the sharer registers with all of them. A hostname that
+/// resolves to both A and AAAA records behaves as two separate endpoints
+/// (the expansion happens at resolve time, on each side independently).
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Token {
     pub routing_key: [u8; ROUTING_KEY_LEN],
     pub secret: [u8; SECRET_LEN],
-    pub relay_host: String,
-    pub relay_port: u16,
+    pub relays: Vec<RelayEndpoint>,
 }
 
 impl Token {
-    /// Render as `https://spora.to/s/<base64url>?r=<host>:<port>`.
+    /// Render as `https://spora.to/s/<base64url>?r=<host>:<port>` with one
+    /// `?r=` per relay (IPv6 literals bracketed), order preserved. Built by
+    /// string formatting so the `:` stays literal (a human-shareable URL),
+    /// rather than `query_pairs_mut`, which would percent-encode it.
     pub fn to_url(&self) -> Url {
         let mut blob = [0u8; TOKEN_BLOB_LEN];
         blob[..ROUTING_KEY_LEN].copy_from_slice(&self.routing_key);
         blob[ROUTING_KEY_LEN..].copy_from_slice(&self.secret);
         let encoded = URL_SAFE_NO_PAD.encode(blob);
-        let url_str = format!(
-            "https://{}{}{}?r={}:{}",
-            URL_HOST, URL_PATH_PREFIX, encoded, self.relay_host, self.relay_port
-        );
+        let query = self
+            .relays
+            .iter()
+            .map(|r| format!("r={}", r.to_url_param()))
+            .collect::<Vec<_>>()
+            .join("&");
+        let url_str = format!("https://{}{}{}?{}", URL_HOST, URL_PATH_PREFIX, encoded, query);
         Url::parse(&url_str).expect("constructed Token URL must parse")
     }
 
-    /// Parse a share URL back into a token.
+    /// Parse a share URL back into a token. Collects every `?r=` value (a
+    /// single-relay URL is the back-compatible degenerate case); at least one
+    /// is required.
     pub fn from_url(url: &Url) -> Result<Self, String> {
         let blob_b64 = url
             .path()
@@ -244,23 +312,19 @@ impl Token {
         let mut secret = [0u8; SECRET_LEN];
         secret.copy_from_slice(&blob[ROUTING_KEY_LEN..]);
 
-        let relay = url
+        let relays = url
             .query_pairs()
-            .find(|(k, _)| k == "r")
-            .map(|(_, v)| v.into_owned())
-            .ok_or("URL is missing required ?r= query parameter")?;
-        let (host, port_str) = relay
-            .rsplit_once(':')
-            .ok_or_else(|| format!("?r= value must be host:port, got {}", relay))?;
-        let relay_port: u16 = port_str
-            .parse()
-            .map_err(|_| format!("invalid port in ?r= value: {}", port_str))?;
+            .filter(|(k, _)| k == "r")
+            .map(|(_, v)| RelayEndpoint::from_url_param(&v))
+            .collect::<Result<Vec<_>, _>>()?;
+        if relays.is_empty() {
+            return Err("URL is missing required ?r= query parameter".into());
+        }
 
         Ok(Token {
             routing_key,
             secret,
-            relay_host: host.to_string(),
-            relay_port,
+            relays,
         })
     }
 }
@@ -343,6 +407,10 @@ impl rustls::client::danger::ServerCertVerifier for RoutingKeyVerifier {
 mod tests {
     use super::*;
 
+    fn relay(host: &str, port: u16) -> RelayEndpoint {
+        RelayEndpoint::new(host, port)
+    }
+
     #[test]
     fn token_url_round_trip() {
         let routing_key = [0x42u8; ROUTING_KEY_LEN];
@@ -350,8 +418,7 @@ mod tests {
         let token = Token {
             routing_key,
             secret,
-            relay_host: "relay.spora.dev".into(),
-            relay_port: 443,
+            relays: vec![relay("relay.spora.dev", 443)],
         };
 
         let url = token.to_url();
@@ -359,7 +426,25 @@ mod tests {
 
         assert_eq!(parsed, token);
         assert!(url.as_str().starts_with("https://spora.to/s/"));
-        assert!(url.as_str().ends_with("?r=relay.spora.dev:443"));
+        assert!(url.as_str().ends_with("?r=relay.spora.dev:443"), "got {url}");
+    }
+
+    #[test]
+    fn token_url_round_trips_multiple_relays() {
+        let token = Token {
+            routing_key: [0x42u8; ROUTING_KEY_LEN],
+            secret: [0x99u8; SECRET_LEN],
+            relays: vec![
+                relay("2001:db8::1", 443),
+                relay("relay.spora.dev", 443),
+                relay("167.71.66.250", 8443),
+            ],
+        };
+        let url = token.to_url();
+        let parsed = Token::from_url(&url).unwrap();
+        assert_eq!(parsed, token, "order and every endpoint must round-trip");
+        // Three ?r= values present.
+        assert_eq!(url.query_pairs().filter(|(k, _)| k == "r").count(), 3);
     }
 
     #[test]
@@ -384,13 +469,55 @@ mod tests {
     #[test]
     fn token_from_identity_round_trip() {
         let id = Identity::generate();
-        let token = id.token("relay.example.com", 4242);
+        let token = id.token(vec![relay("relay.example.com", 4242)]);
         let url = token.to_url();
         let parsed = Token::from_url(&url).unwrap();
         assert_eq!(parsed.routing_key, id.routing_key);
         assert_eq!(parsed.secret, id.secret);
-        assert_eq!(parsed.relay_host, "relay.example.com");
-        assert_eq!(parsed.relay_port, 4242);
+        assert_eq!(parsed.relays, vec![relay("relay.example.com", 4242)]);
+    }
+
+    #[test]
+    fn token_url_round_trips_ipv6_relay_literal() {
+        let token = Token {
+            routing_key: [0x42u8; ROUTING_KEY_LEN],
+            secret: [0x99u8; SECRET_LEN],
+            relays: vec![relay("2001:db8::1", 443)],
+        };
+        let url = token.to_url();
+        assert!(
+            url.as_str().ends_with("?r=[2001:db8::1]:443"),
+            "v6 literal must be bracketed, got {}",
+            url
+        );
+        let parsed = Token::from_url(&url).unwrap();
+        assert_eq!(parsed, token, "relay host must come back bare (no brackets)");
+
+        // A caller that already bracketed the literal round-trips to the
+        // bare form too (no double-bracketing).
+        let pre_bracketed = Token {
+            relays: vec![relay("[2001:db8::1]", 443)],
+            ..token.clone()
+        };
+        let parsed = Token::from_url(&pre_bracketed.to_url()).unwrap();
+        assert_eq!(parsed.relays, vec![relay("2001:db8::1", 443)]);
+    }
+
+    #[test]
+    fn from_url_rejects_unbracketed_ipv6_literal() {
+        let blob = URL_SAFE_NO_PAD.encode([0u8; TOKEN_BLOB_LEN]);
+        let bad = Url::parse(&format!("https://spora.to/s/{}?r=2001:db8::1:443", blob)).unwrap();
+        let err = Token::from_url(&bad).unwrap_err();
+        assert!(err.contains("bracketed"), "got: {}", err);
+    }
+
+    #[test]
+    fn from_url_rejects_malformed_bracketed_literal() {
+        let blob = URL_SAFE_NO_PAD.encode([0u8; TOKEN_BLOB_LEN]);
+        for r in ["[2001:db8::1]443", "[not-v6]:443", "[2001:db8::1]"] {
+            let bad = Url::parse(&format!("https://spora.to/s/{}?r={}", blob, r)).unwrap();
+            assert!(Token::from_url(&bad).is_err(), "should reject ?r={}", r);
+        }
     }
 
     #[test]

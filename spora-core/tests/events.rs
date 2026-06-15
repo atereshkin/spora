@@ -40,8 +40,7 @@ async fn relay_session_events_and_disabled_direct_upgrade() {
 
     let (share_tx, mut share_rx) = mpsc::unbounded_channel();
     let share_config = Config {
-        relay_host: "127.0.0.1".into(),
-        relay_port: relay_addr.port(),
+        relays: vec![spora_core::identity::RelayEndpoint::new("127.0.0.1", relay_addr.port())],
         exit_mode: ExitMode::Custom(handler),
         event_hook: Some(Arc::new(move |ev| {
             let _ = share_tx.send(ev);

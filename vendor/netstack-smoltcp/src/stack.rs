@@ -244,6 +244,11 @@ impl Sink<AnyIpPktFrame> for Stack {
             IpProtocol::Tcp | IpProtocol::Udp | IpProtocol::Icmp | IpProtocol::Icmpv6
         ) {
             self.sink_buf.replace((item, protocol));
+        } else if protocol == IpProtocol::Ipv6Frag {
+            // IPv6 fragments carry no (complete) transport header; the
+            // consumer must reassemble them before handing packets to the
+            // stack, so one arriving here is dropped by design.
+            debug!("tun IPv6 fragment ignored (needs upstream reassembly)");
         } else {
             debug!("tun IP packet ignored (protocol: {:?})", protocol);
         }
@@ -269,4 +274,48 @@ where
     E: Into<Box<dyn std::error::Error + Send + Sync>>,
 {
     std::io::Error::new(std::io::ErrorKind::BrokenPipe, err)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use futures::task::noop_waker_ref;
+
+    /// An IPv6 packet with a Fragment header (next_header=TCP inside).
+    fn ipv6_fragment_frame() -> AnyIpPktFrame {
+        let payload: &[u8] = &[6, 0, 0, 1, 0, 0, 0, 1]; // fragment header
+        let mut pkt = vec![0u8; 40 + payload.len()];
+        pkt[0] = 0x60; // version 6
+        pkt[4..6].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        pkt[6] = 44; // next header: Fragment
+        pkt[7] = 64; // hop limit
+        pkt[8] = 0xfd; // src fd00::1
+        pkt[23] = 1;
+        pkt[24] = 0xfd; // dst fd00::2
+        pkt[39] = 2;
+        pkt[40..].copy_from_slice(payload);
+        pkt
+    }
+
+    // An IPv6 fragment reaching the stack must be ignored — accepted without
+    // error, never buffered toward the TCP/UDP channels, never a panic.
+    #[test]
+    fn ipv6_fragment_is_ignored() {
+        let (mut stack, _runner, _udp, _tcp) = StackBuilder::default()
+            .enable_tcp(true)
+            .enable_udp(true)
+            .build()
+            .unwrap();
+
+        let mut cx = Context::from_waker(noop_waker_ref());
+        Pin::new(&mut stack)
+            .start_send(ipv6_fragment_frame())
+            .unwrap();
+        // Nothing buffered: the sink stays ready and flush is a no-op.
+        assert!(Pin::new(&mut stack).poll_ready(&mut cx).is_ready());
+        assert!(matches!(
+            Pin::new(&mut stack).poll_flush(&mut cx),
+            Poll::Ready(Ok(()))
+        ));
+    }
 }

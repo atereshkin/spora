@@ -1,5 +1,6 @@
 mod neg;
 mod reassembly;
+pub mod connlog;
 pub mod e2e;
 pub mod identity;
 pub mod server;
@@ -23,10 +24,11 @@ use tokio::task::JoinHandle;
 pub use tokio_util::sync::CancellationToken;
 use url::Url;
 
+use crate::connlog::{AddrKind, ConnLog, ConnLogConfig, SessionLog};
 use crate::e2e::{
     authenticate_incoming, client_connect, client_endpoint, server_endpoint, E2eSession,
 };
-use crate::identity::{Identity, Token, ROUTING_KEY_LEN, SECRET_LEN};
+use crate::identity::{Identity, RelayEndpoint, Token, ROUTING_KEY_LEN, SECRET_LEN};
 use crate::neg::{NegChannel, SignalNegChannel};
 use crate::server::TunnelError;
 use crate::signal::SignalChannel;
@@ -113,6 +115,10 @@ pub struct Timings {
     /// Initiator timeout waiting for the responder's endpoint over the
     /// signal channel.
     pub endpoint_exchange_timeout: Duration,
+    /// Per-relay budget for the client's relay-via dial (handshake + accept
+    /// ack). When it elapses the client fails over to the next relay, so a
+    /// dead/censored relay doesn't stall the whole connect on one endpoint.
+    pub relay_dial_timeout: Duration,
     /// Adaptive keepalive: send-silence gap that re-activates probing.
     pub keepalive_idle_threshold: Duration,
     /// Adaptive keepalive: how long to wait for a ping response.
@@ -132,6 +138,7 @@ impl Default for Timings {
             punch_phase_timeout: Duration::from_secs(5),
             punch_send_interval: Duration::from_millis(300),
             endpoint_exchange_timeout: Duration::from_secs(10),
+            relay_dial_timeout: Duration::from_secs(8),
             keepalive_idle_threshold: Duration::from_secs(20),
             keepalive_response_timeout: Duration::from_secs(3),
             keepalive_inbound_grace: Duration::from_secs(5),
@@ -156,6 +163,13 @@ pub enum TunnelEvent {
     Reconnecting,
     /// Client only: the re-dial succeeded.
     Reconnected,
+    /// Share side: the active session ended (replaced by a new peer,
+    /// cancelled, or its transport closed).
+    SessionEnded { reason: String },
+    /// Share side: the connection log could not be written (disk full, IO
+    /// error). The tunnel is unaffected; the gap is recorded in the log
+    /// itself once writing recovers.
+    ConnLogDegraded { detail: String },
 }
 
 /// Hook invoked inline from the tunnel's async tasks for every
@@ -173,8 +187,11 @@ fn emit(hook: &EventHook, event: TunnelEvent) {
 #[derive(Clone)]
 pub struct Config {
     pub stun_server: String,
-    pub relay_host: String,
-    pub relay_port: u16,
+    /// Relays to use, in preference order. The sharer registers with ALL of
+    /// them; the client tries them IPv6-first until one bootstraps a session
+    /// (so a censored/dead relay fails over to the next). A hostname that has
+    /// both A and AAAA records expands to two endpoints at resolve time.
+    pub relays: Vec<crate::identity::RelayEndpoint>,
     pub protector: SocketProtector,
     pub mtu_callback: MtuCallback,
     /// Share side only: what consumes the tunneled IP packets.
@@ -188,20 +205,25 @@ pub struct Config {
     /// signal channel is kept open so the peer's upgrade attempts time out
     /// instead of seeing EOF.
     pub enable_direct_upgrade: bool,
+    /// Share side only: per-flow connection logging (see [`connlog`]).
+    /// `None` disables it at the core level; platforms are expected to
+    /// enable it by default with a platform-appropriate directory. When set
+    /// but unwritable, `share()` fails loudly rather than running unlogged.
+    pub conn_log: Option<ConnLogConfig>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             stun_server: "stun.l.google.com:19302".into(),
-            relay_host: "167.71.66.250".into(),
-            relay_port: 443,
+            relays: vec![crate::identity::RelayEndpoint::new("167.71.66.250", 443)],
             protector: None,
             mtu_callback: None,
             exit_mode: ExitMode::Netstack,
             timings: Timings::default(),
             event_hook: None,
             enable_direct_upgrade: true,
+            conn_log: None,
         }
     }
 }
@@ -236,12 +258,21 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     let identity = Arc::new(identity);
     let routing_key = identity.routing_key;
 
-    let relay_addr = resolve_relay(&config.relay_host, config.relay_port)?;
-    let url = identity
-        .token(config.relay_host.clone(), config.relay_port)
-        .to_url();
+    if config.relays.is_empty() {
+        return Err("share: Config.relays is empty".into());
+    }
+    // Resolve every configured relay (a hostname may expand to v4+v6); the
+    // sharer registers with all of them so a client can reach it via any.
+    let relay_addrs = resolve_relays(&config.relays)?;
+    let url = identity.token(config.relays.clone()).to_url();
 
-    let std_socket = bind_local_udp(&config.protector)?;
+    // One socket serves quinn (accepting clients forwarded by ANY relay) and
+    // registration with all of them. It must be dual-stack when the relay set
+    // spans families, so a single socket can send to both v4 and v6 relays
+    // (v4 as v4-mapped) and receive forwarded Initials from either; a pure-v4
+    // relay set keeps a plain v4 socket (unchanged behavior).
+    let want_v6 = relay_addrs.iter().any(|a| a.is_ipv6());
+    let std_socket = bind_share_udp(&config.protector, want_v6)?;
     let std_clone = std_socket
         .try_clone()
         .map_err(|e| format!("socket try_clone: {}", e))?;
@@ -255,9 +286,9 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
 
     let endpoint = server_endpoint(std_socket, &identity, &config.timings)?;
     info!(
-        "share: e2e endpoint up, rk {:x?}, relay {}",
+        "share: e2e endpoint up, rk {:x?}, relays {:?}",
         &routing_key[..4],
-        relay_addr
+        relay_addrs
     );
 
     // Sign each relay registration with the identity's certificate key, so the
@@ -266,6 +297,17 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     let signer =
         relay_client::protocol::RegisterSigner::new(&identity.cert_der_bytes, &identity.key_der_bytes)
             .map_err(|e| format!("build register signer: {}", e))?;
+
+    // Connection log: opened before the share goes live, so a default-on log
+    // that cannot be written fails here loudly instead of running unlogged.
+    let conn_log = match &config.conn_log {
+        Some(cfg) => Some(ConnLog::open(
+            cfg.clone(),
+            &identity,
+            config.event_hook.clone(),
+        )?),
+        None => None,
+    };
 
     let cancel = CancellationToken::new();
     let cancel_child = cancel.clone();
@@ -282,8 +324,8 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
         // `JoinHandle` is a local here, and dropping a `JoinHandle` does not abort
         // the task, so the registrar would keep flapping the relay binding forever.
         tokio::select! {
-            _ = relay_client::register_loop(registrar, relay_addr, register_interval, signer) => {}
-            _ = run_share_loop(endpoint, identity_for_loop, cancel_child, config_for_loop) => {}
+            _ = relay_client::register_loop(registrar, relay_addrs, register_interval, signer) => {}
+            _ = run_share_loop(endpoint, identity_for_loop, cancel_child, config_for_loop, conn_log) => {}
         }
     });
 
@@ -295,6 +337,7 @@ async fn run_share_loop(
     identity: Arc<Identity>,
     cancel: CancellationToken,
     config: Config,
+    conn_log: Option<ConnLog>,
 ) {
     let secret = identity.secret;
     let mut tunnel_cancel: Option<CancellationToken> = None;
@@ -348,9 +391,15 @@ async fn run_share_loop(
                     tc.cancel();
                 }
 
+                // Sessions accepted here always bootstrap relay-via, so the
+                // connection's remote address is the relay's, recorded as such.
+                let slog = conn_log
+                    .as_ref()
+                    .map(|cl| cl.session(session.conn.remote_address()));
+
                 let child_cancel = cancel.child_token();
                 tunnel_cancel = Some(child_cancel.clone());
-                spawn_responder_tunnel(session, identity.clone(), &config, child_cancel);
+                spawn_responder_tunnel(session, identity.clone(), &config, child_cancel, slog);
             }
         }
     }
@@ -361,6 +410,7 @@ fn spawn_responder_tunnel(
     identity: Arc<Identity>,
     config: &Config,
     tunnel_cancel: CancellationToken,
+    slog: Option<Arc<SessionLog>>,
 ) {
     let E2eSession {
         conn,
@@ -369,9 +419,13 @@ fn spawn_responder_tunnel(
     } = session;
 
     let (upgradable, upgrade_sender, router_handle) = upgradable_transport(Box::new(transport));
+    let keepalive_cfg = KeepAliveConfig::default();
+    // The meter (Custom exit mode) must ignore the synthetic keepalive pings
+    // riding the tunnel; tell it which inner address pair they use.
+    let keepalive_pair = (keepalive_cfg.src_ip, keepalive_cfg.dst_ip);
     let transport: IpTransport = Box::new(KeepAliveTransport::new(
         Box::new(upgradable),
-        KeepAliveConfig::default(),
+        keepalive_cfg,
     ));
 
     let protector_for_tunnel = config.protector.clone();
@@ -385,18 +439,22 @@ fn spawn_responder_tunnel(
         let timings = config.timings.clone();
         let event_hook = config.event_hook.clone();
         let role = DirectRole::Responder { identity };
+        let path_ipv6 = conn.remote_address().is_ipv6();
+        let upgrade_slog = slog.clone();
         tokio::spawn(async move {
             try_direct_upgrade(
                 signal,
                 upgrade_sender,
                 &stun_server,
                 role,
+                path_ipv6,
                 &protector,
                 upgrade_cancel,
                 None,
                 mtu_cb,
                 timings,
                 event_hook,
+                upgrade_slog,
             )
             .await;
         })
@@ -422,16 +480,57 @@ fn spawn_responder_tunnel(
         });
     }
 
+    let exit_slog = slog.clone();
+    let end_cancel = tunnel_cancel.clone();
     let session_fut: SessionFuture = match &config.exit_mode {
         ExitMode::Netstack => Box::pin(async move {
-            let _ = server::start_tunnel(transport, protector_for_tunnel, tunnel_cancel, true).await;
+            let _ = server::start_tunnel(
+                transport,
+                protector_for_tunnel,
+                tunnel_cancel,
+                true,
+                exit_slog,
+            )
+            .await;
         }),
-        ExitMode::Custom(handler) => handler(transport, tunnel_cancel),
+        ExitMode::Custom(handler) => {
+            // The handler only moves packets; flow accounting happens in a
+            // passive meter wrapped around the transport it receives, so any
+            // custom exit (e.g. the CLI's --os-routing) is logged without
+            // its own instrumentation.
+            let transport = match &exit_slog {
+                Some(sl) => Box::new(transport::meter::MeteredTransport::new(
+                    transport,
+                    sl.clone(),
+                    keepalive_pair,
+                )) as IpTransport,
+                None => transport,
+            };
+            handler(transport, tunnel_cancel)
+        }
     };
+    let event_hook = config.event_hook.clone();
     tokio::spawn(async move {
         session_fut.await;
         upgrade_task.abort();
+        // Await the aborted task so its SessionLog writes (address records)
+        // cannot land after the SessionEnd record below.
+        let _ = upgrade_task.await;
         drop(router_handle);
+        let reason = if end_cancel.is_cancelled() {
+            "cancelled"
+        } else {
+            "transport_closed"
+        };
+        if let Some(sl) = &slog {
+            sl.end(reason);
+        }
+        emit(
+            &event_hook,
+            TunnelEvent::SessionEnded {
+                reason: reason.to_string(),
+            },
+        );
     });
 }
 
@@ -439,10 +538,15 @@ fn spawn_responder_tunnel(
 /// keepalive controls so the caller (CLI/FFI) can toggle dormant mode.
 pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String> {
     let token = Arc::new(Token::from_url(&url)?);
-    let relay_addr = resolve_relay(&token.relay_host, token.relay_port)?;
+    // Resolve every relay in the URL (a hostname may expand to v4+v6) and try
+    // them IPv6 first: a v6 relay path drives a v6 hole punch, which succeeds
+    // far more often (no NAT, just a stateful firewall) than a v4 one. The
+    // order is re-derived on each (re)dial, so DNS changes and censorship
+    // failover both take effect on reconnect.
+    let relay_addrs = Arc::new(resolve_relays_preferring_v6(&token.relays)?);
     info!(
-        "connect: relay {} for rk {:x?}",
-        relay_addr,
+        "connect: relays {:?} for rk {:x?}",
+        relay_addrs,
         &token.routing_key[..4]
     );
 
@@ -451,8 +555,8 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     let keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>> =
         Arc::new(std::sync::Mutex::new(None));
 
-    let initial = dial_initiator(
-        relay_addr,
+    let initial = dial_relays(
+        &relay_addrs,
         &token,
         config,
         cancel.clone(),
@@ -467,16 +571,17 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     let dialer_cancel = cancel.clone();
     let dialer_knob = keepalive_knob.clone();
     let dialer_waker = keepalive_waker.clone();
+    let dialer_relays = relay_addrs.clone();
     let dialer: Box<dyn FnMut() -> DialFuture + Send> = Box::new(move || {
         let token = dialer_token.clone();
         let config = dialer_config.clone();
         let cancel = dialer_cancel.clone();
         let knob = dialer_knob.clone();
         let waker = dialer_waker.clone();
+        let relays = dialer_relays.clone();
         Box::pin(async move {
             emit(&config.event_hook, TunnelEvent::Reconnecting);
-            let result =
-                dial_initiator(relay_addr, &token, &config, cancel, knob, waker).await;
+            let result = dial_relays(&relays, &token, &config, cancel, knob, waker).await;
             if result.is_ok() {
                 emit(&config.event_hook, TunnelEvent::Reconnected);
             }
@@ -497,6 +602,52 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     })
 }
 
+/// Try each relay (already ordered IPv6-first) until one bootstraps a
+/// relay-via session, time-boxing each attempt by `relay_dial_timeout` so a
+/// dead/censored relay — or one the sharer never registered with (a family
+/// mismatch looks identical: the Initial is silently dropped) — fails over to
+/// the next instead of stalling. Returns the last error if all fail.
+async fn dial_relays(
+    relay_addrs: &[SocketAddr],
+    token: &Token,
+    config: &Config,
+    cancel: CancellationToken,
+    keepalive_knob: Arc<AtomicU64>,
+    keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+) -> std::io::Result<IpTransport> {
+    let mut last_err: Option<std::io::Error> = None;
+    for &relay_addr in relay_addrs {
+        let attempt = dial_initiator(
+            relay_addr,
+            token,
+            config,
+            cancel.clone(),
+            keepalive_knob.clone(),
+            keepalive_waker.clone(),
+        );
+        match tokio::time::timeout(config.timings.relay_dial_timeout, attempt).await {
+            Ok(Ok(transport)) => return Ok(transport),
+            Ok(Err(e)) => {
+                warn!("relay {} dial failed: {}", relay_addr, e);
+                last_err = Some(e);
+            }
+            Err(_) => {
+                warn!(
+                    "relay {} dial timed out after {:?}",
+                    relay_addr, config.timings.relay_dial_timeout
+                );
+                last_err = Some(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    format!("relay {} dial timed out", relay_addr),
+                ));
+            }
+        }
+    }
+    Err(last_err.unwrap_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::NotFound, "no relays to dial")
+    }))
+}
+
 async fn dial_initiator(
     relay_addr: SocketAddr,
     token: &Token,
@@ -505,7 +656,8 @@ async fn dial_initiator(
     keepalive_knob: Arc<AtomicU64>,
     keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
 ) -> std::io::Result<IpTransport> {
-    let std_socket = bind_local_udp(&config.protector).map_err(std::io::Error::other)?;
+    let std_socket =
+        bind_local_udp(&config.protector, relay_addr).map_err(std::io::Error::other)?;
     let endpoint = client_endpoint(std_socket, token.routing_key, &config.timings)
         .map_err(std::io::Error::other)?;
     // Relay path: require the sharer's accept ack so a bad/expired token fails
@@ -552,18 +704,21 @@ async fn dial_initiator(
         let mtu_cb = config.mtu_callback.clone();
         let timings = config.timings.clone();
         let event_hook = config.event_hook.clone();
+        let path_ipv6 = relay_addr.is_ipv6();
         tokio::spawn(async move {
             try_direct_upgrade(
                 signal,
                 upgrade_sender,
                 &stun_server,
                 role,
+                path_ipv6,
                 &protector,
                 upgrade_cancel,
                 Some(upgrade_knob),
                 mtu_cb,
                 timings,
                 event_hook,
+                None, // client side: no connection log
             )
             .await;
             drop(router_handle);
@@ -648,18 +803,28 @@ fn neg_err(e: TunnelError) -> DirectError {
 
 /// Background task: repeatedly try to establish a direct UDP connection.
 /// On success, send the new transport via `upgrade_sender`.
+///
+/// `path_ipv6` is the relay-via session's address family; the initiator
+/// STUNs (and therefore punches) in that family first, since it is the one
+/// family both peers are known to have. The responder follows the family of
+/// the endpoint the initiator signals.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn try_direct_upgrade(
     mut signal: SignalChannel,
     upgrade_sender: UpgradeSender,
     stun_server: &str,
     role: DirectRole,
+    path_ipv6: bool,
     protector: &SocketProtector,
     cancel: CancellationToken,
     keepalive_knob: Option<Arc<AtomicU64>>,
     mtu_callback: MtuCallback,
     timings: Timings,
     event_hook: EventHook,
+    // Share side only: records what each upgrade round learns about the
+    // peer's outer address (self-reported endpoint, punch-validated source,
+    // verified direct address) and the sharer's own STUN result.
+    conn_log: Option<Arc<SessionLog>>,
 ) {
     const MAX_DORMANT_ATTEMPTS: u32 = 3;
     let mut dormant_attempts: u32 = 0;
@@ -713,6 +878,7 @@ pub(crate) async fn try_direct_upgrade(
                 try_direct_as_initiator(
                     &mut signal,
                     stun_server,
+                    path_ipv6,
                     protector,
                     *routing_key,
                     *secret,
@@ -721,8 +887,15 @@ pub(crate) async fn try_direct_upgrade(
                 .await
             }
             DirectRole::Responder { identity } => {
-                try_direct_as_responder(&mut signal, stun_server, protector, identity, &timings)
-                    .await
+                try_direct_as_responder(
+                    &mut signal,
+                    stun_server,
+                    protector,
+                    identity,
+                    &timings,
+                    conn_log.as_deref(),
+                )
+                .await
             }
         };
         match result {
@@ -731,6 +904,9 @@ pub(crate) async fn try_direct_upgrade(
                 if upgrade_sender.send(transport).is_err() {
                     warn!("Failed to send upgrade — tunnel already closed");
                     return;
+                }
+                if let Some(sl) = &conn_log {
+                    sl.addr(AddrKind::Verified, conn.remote_address());
                 }
                 emit(
                     &event_hook,
@@ -785,12 +961,13 @@ pub(crate) async fn try_direct_upgrade(
 async fn try_direct_as_initiator(
     signal: &mut SignalChannel,
     stun_server: &str,
+    path_ipv6: bool,
     protector: &SocketProtector,
     routing_key: [u8; ROUTING_KEY_LEN],
     secret: [u8; SECRET_LEN],
     timings: &Timings,
 ) -> Result<(IpTransport, Connection, SocketAddr), DirectError> {
-    let (socket, external_addr) = pierce_keep_socket(stun_server, protector)
+    let (socket, external_addr) = pierce_keep_socket(stun_server, protector, path_ipv6)
         .await
         .map_err(DirectError::Transient)?;
     let peer_addr = {
@@ -803,6 +980,16 @@ async fn try_direct_as_initiator(
             })?
             .map_err(neg_err)?
     };
+    // The punch socket's family is fixed by our STUN result; a peer endpoint
+    // in the other family is unreachable from it. Fail fast (the exchange is
+    // one candidate per side, no multi-family negotiation) instead of
+    // burning 2x punch_phase_timeout sending packets the OS refuses.
+    if peer_addr.is_ipv6() != external_addr.is_ipv6() {
+        return Err(DirectError::Transient(format!(
+            "address family mismatch: ours {}, peer {}",
+            external_addr, peer_addr
+        )));
+    }
 
     let (socket, learned_peer) = punch_and_verify(
         socket,
@@ -844,20 +1031,44 @@ async fn try_direct_as_responder(
     protector: &SocketProtector,
     identity: &Identity,
     timings: &Timings,
+    conn_log: Option<&SessionLog>,
 ) -> Result<(IpTransport, Connection, SocketAddr), DirectError> {
     let (peer_addr, socket) = {
         let mut neg = SignalNegChannel::new(signal);
         let peer_addr = neg.recv_endpoint().await.map_err(neg_err)?;
-        let (socket, external_addr) = pierce_keep_socket(stun_server, protector)
-            .await
-            .map_err(DirectError::Transient)?;
+        // Client-asserted, not observed: logged as `reported` and never to
+        // be read as anything stronger (a malicious client can put any
+        // address here).
+        if let Some(sl) = conn_log {
+            sl.addr(AddrKind::Reported, peer_addr);
+        }
+        // Follow the initiator's family: it signaled first, so STUN (and
+        // punch) in the family its endpoint lives in.
+        let (socket, external_addr) =
+            pierce_keep_socket(stun_server, protector, peer_addr.is_ipv6())
+                .await
+                .map_err(DirectError::Transient)?;
+        if let Some(sl) = conn_log {
+            sl.addr(AddrKind::SharerPublic, external_addr);
+        }
+        // Send our endpoint even when the families ended up mismatched (no
+        // matching-family STUN address resolved): the initiator then detects
+        // the mismatch immediately instead of timing out on the exchange.
         neg.send_endpoint(external_addr).await.map_err(neg_err)?;
+        if peer_addr.is_ipv6() != external_addr.is_ipv6() {
+            return Err(DirectError::Transient(format!(
+                "address family mismatch: ours {}, peer {}",
+                external_addr, peer_addr
+            )));
+        }
         (peer_addr, socket)
     };
 
     // Responder accepts from whatever source the QUIC Initial arrives on, so
-    // the learned peer address is informational here.
-    let (socket, _learned_peer) = punch_and_verify(
+    // the learned peer address is informational for the punch — but it is
+    // address-validated (learned from packets the peer actually sourced), so
+    // the connection log records it even when the QUIC build below fails.
+    let (socket, learned_peer) = punch_and_verify(
         socket,
         peer_addr,
         timings.punch_phase_timeout,
@@ -865,6 +1076,9 @@ async fn try_direct_as_responder(
     )
     .await
     .map_err(DirectError::Transient)?;
+    if let Some(sl) = conn_log {
+        sl.addr(AddrKind::PunchVerified, learned_peer);
+    }
     let local_addr = socket
         .local_addr()
         .map_err(|e| DirectError::Transient(format!("local_addr: {}", e)))?;
@@ -908,19 +1122,101 @@ async fn try_direct_as_responder(
 
 // ---------- Helpers ----------
 
-fn resolve_relay(host: &str, port: u16) -> Result<SocketAddr, String> {
-    format!("{}:{}", host, port)
+/// Resolve the relay to a single address. IP literals (v4, and v6 with or
+/// without brackets — `Token::from_url` strips them, but a caller-supplied
+/// `Config.relay_host` may not) short-circuit DNS. For hostnames, IPv4 is
+/// preferred when both families resolve (the deployed relay is v4-first);
+/// an AAAA-only host resolves to its IPv6 address(es).
+///
+/// A bare/bracketed IP literal short-circuits DNS (one address). A hostname
+/// expands to EVERY resolved address — both families — so a dual-record
+/// `relay.example` behaves exactly as if its A and AAAA had been listed as
+/// separate relays.
+fn resolve_one_relay(relay: &RelayEndpoint) -> Result<Vec<SocketAddr>, String> {
+    let host = &relay.host;
+    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
+        return Ok(vec![SocketAddr::new(ip, relay.port)]);
+    }
+    let addrs: Vec<SocketAddr> = format!("{}:{}", host, relay.port)
         .to_socket_addrs()
-        .map_err(|e| format!("resolve relay {}:{} failed: {}", host, port, e))?
-        .find(|a| a.is_ipv4())
-        .ok_or_else(|| format!("no IPv4 for relay {}:{}", host, port))
+        .map_err(|e| format!("resolve relay {}:{} failed: {}", host, relay.port, e))?
+        .collect();
+    if addrs.is_empty() {
+        return Err(format!("no address for relay {}:{}", host, relay.port));
+    }
+    Ok(addrs)
 }
 
-/// Bind an ephemeral UDP socket on 0.0.0.0, apply the FD protector, and
-/// return it as a `std::net::UdpSocket` ready for handoff to quinn.
-fn bind_local_udp(protector: &SocketProtector) -> Result<std::net::UdpSocket, String> {
-    let std = std::net::UdpSocket::bind(("0.0.0.0", 0))
-        .map_err(|e| format!("bind UDP: {}", e))?;
+/// Resolve every configured relay into a flat, de-duplicated address list
+/// (URL/config order preserved). A per-relay resolution failure is logged and
+/// skipped — censorship that blocks one relay's DNS must not take down the
+/// rest — so this errors only when NOTHING resolves.
+fn resolve_relays(relays: &[RelayEndpoint]) -> Result<Vec<SocketAddr>, String> {
+    let mut out: Vec<SocketAddr> = Vec::new();
+    let mut seen: HashSet<SocketAddr> = HashSet::new();
+    for relay in relays {
+        match resolve_one_relay(relay) {
+            Ok(addrs) => {
+                for a in addrs {
+                    if seen.insert(a) {
+                        out.push(a);
+                    }
+                }
+            }
+            Err(e) => warn!("skipping unresolvable relay: {}", e),
+        }
+    }
+    if out.is_empty() {
+        return Err("no relay address resolved from the configured relays".into());
+    }
+    Ok(out)
+}
+
+/// Like [`resolve_relays`], but stable-sorted IPv6-first. The client uses
+/// this so a v6 relay path (and therefore a v6 hole punch) is tried before
+/// v4; within a family the configured order is preserved.
+fn resolve_relays_preferring_v6(relays: &[RelayEndpoint]) -> Result<Vec<SocketAddr>, String> {
+    let mut addrs = resolve_relays(relays)?;
+    addrs.sort_by_key(|a| !a.is_ipv6()); // false(0)=v6 first, true(1)=v4
+    Ok(addrs)
+}
+
+/// Bind the sharer's UDP socket. When the relay set spans IPv6 (or is mixed),
+/// bind `::` dual-stack (IPV6_V6ONLY off) so one socket reaches relays of both
+/// families and receives Initials forwarded by any of them; a pure-v4 relay
+/// set keeps a plain `0.0.0.0` socket. Applies the FD protector.
+fn bind_share_udp(protector: &SocketProtector, want_v6: bool) -> Result<std::net::UdpSocket, String> {
+    let std = if want_v6 {
+        let sock = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)
+            .map_err(|e| format!("create v6 socket: {}", e))?;
+        sock.set_only_v6(false)
+            .map_err(|e| format!("set_only_v6(false): {}", e))?;
+        sock.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into())
+            .map_err(|e| format!("bind [::]:0: {}", e))?;
+        std::net::UdpSocket::from(sock)
+    } else {
+        std::net::UdpSocket::bind(("0.0.0.0", 0)).map_err(|e| format!("bind 0.0.0.0:0: {}", e))?
+    };
+    std.set_nonblocking(true)
+        .map_err(|e| format!("set_nonblocking: {}", e))?;
+    apply_protector_to_std(protector, &std);
+    Ok(std)
+}
+
+/// Bind an ephemeral UDP wildcard socket in `peer`'s address family (so
+/// send_to toward it cannot fail with a family mismatch), apply the FD
+/// protector, and return it as a `std::net::UdpSocket` ready for handoff to
+/// quinn. The client uses this per relay-dial attempt, so the punch family
+/// matches the relay family unambiguously (no v4-mapped guessing).
+fn bind_local_udp(protector: &SocketProtector, peer: SocketAddr) -> Result<std::net::UdpSocket, String> {
+    let wildcard: SocketAddr = if peer.is_ipv6() {
+        (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
+    } else {
+        (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
+    };
+    let std = std::net::UdpSocket::bind(wildcard)
+        .map_err(|e| format!("bind UDP {}: {}", wildcard, e))?;
     std.set_nonblocking(true)
         .map_err(|e| format!("set_nonblocking: {}", e))?;
     apply_protector_to_std(protector, &std);
@@ -1046,46 +1342,63 @@ async fn punch_and_verify(
 
 /// Like `pierce()` but returns the UDP socket along with the addresses,
 /// so it can be reused for the direct connection (same port = same NAT mapping).
+///
+/// `prefer_ipv6` orders the resolved STUN addresses so the family matching
+/// the relay path is tried first (the punch socket is bound in the STUN
+/// address's family, and both peers must end up in the same family for the
+/// punch to work); the other family remains a fallback for STUN servers
+/// without an AAAA/A record.
 pub async fn pierce_keep_socket(
     stun_server: &str,
     protector: &SocketProtector,
+    prefer_ipv6: bool,
 ) -> Result<(UdpSocket, SocketAddr), String> {
-    let Some(stun_addr) = stun_server
+    let resolved: Vec<SocketAddr> = stun_server
         .to_socket_addrs()
         .map_err(|e| format!("failed to resolve stun address: {}", e))?
-        .find(|x| x.is_ipv4())
-    else {
-        return Err("stun address did not resolve into an IPv4".into());
-    };
+        .collect();
+    let mut candidates: Vec<SocketAddr> = Vec::with_capacity(resolved.len());
+    candidates.extend(resolved.iter().filter(|a| a.is_ipv6() == prefer_ipv6));
+    candidates.extend(resolved.iter().filter(|a| a.is_ipv6() != prefer_ipv6));
+    if candidates.is_empty() {
+        return Err("stun address did not resolve".into());
+    }
 
-    let mut local_port = server::BASE_PORT;
-    while local_port < server::BASE_PORT + 10 {
-        let local_addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], local_port));
-        let udp = match tokio::net::UdpSocket::bind(&local_addr).await {
-            Ok(udp) => udp,
-            Err(_) => {
-                local_port += 1;
-                continue;
-            }
+    for stun_addr in candidates {
+        let wildcard: std::net::IpAddr = if stun_addr.is_ipv6() {
+            std::net::Ipv6Addr::UNSPECIFIED.into()
+        } else {
+            std::net::Ipv4Addr::UNSPECIFIED.into()
         };
-        protect_socket(protector, &udp);
-        debug!("Local addr: {}", &local_addr);
+        let mut local_port = server::BASE_PORT;
+        while local_port < server::BASE_PORT + 10 {
+            let local_addr = SocketAddr::new(wildcard, local_port);
+            let udp = match tokio::net::UdpSocket::bind(&local_addr).await {
+                Ok(udp) => udp,
+                Err(_) => {
+                    local_port += 1;
+                    continue;
+                }
+            };
+            protect_socket(protector, &udp);
+            debug!("Local addr: {}", &local_addr);
 
-        let c = StunClient::new(stun_addr);
-        let f = c.query_external_address_async(&udp);
-        match f.await {
-            Ok(external_addr) => return Ok((udp, external_addr)),
-            Err(_) => {
-                local_port += 1;
-                continue;
-            }
-        };
+            let c = StunClient::new(stun_addr);
+            let f = c.query_external_address_async(&udp);
+            match f.await {
+                Ok(external_addr) => return Ok((udp, external_addr)),
+                Err(_) => {
+                    local_port += 1;
+                    continue;
+                }
+            };
+        }
     }
     Err("failed to pierce".into())
 }
 
 pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), String> {
-    let (socket, external_addr) = pierce_keep_socket(stun_server, &None).await?;
+    let (socket, external_addr) = pierce_keep_socket(stun_server, &None, false).await?;
     let local_addr = socket
         .local_addr()
         .map_err(|e| format!("failed to get local addr: {}", e))?;
@@ -1173,11 +1486,13 @@ mod tests {
                 upgrade_sender,
                 "127.0.0.1:1", // never reached: recv_endpoint fails first
                 DirectRole::Responder { identity },
+                false,
                 &None,
                 cancel,
                 None,
                 None,
                 Timings::default(),
+                None,
                 None,
             )
             .await;

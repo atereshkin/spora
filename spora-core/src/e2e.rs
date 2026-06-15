@@ -318,7 +318,7 @@ mod tests {
         .expect("register signer");
         let h = tokio::spawn(relay_client::register_loop(
             Arc::new(tokio_clone),
-            relay_addr,
+            vec![relay_addr],
             Duration::from_millis(50), // tight for tests
             signer,
         ));

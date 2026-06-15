@@ -47,8 +47,7 @@ async fn abort_stops_the_relay_registrar() {
 
     let interval = Duration::from_millis(50);
     let config = Config {
-        relay_host: "127.0.0.1".into(),
-        relay_port: relay_addr.port(),
+        relays: vec![spora_core::identity::RelayEndpoint::new("127.0.0.1", relay_addr.port())],
         timings: Timings {
             register_interval: interval,
             ..Timings::default()

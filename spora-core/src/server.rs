@@ -1,16 +1,24 @@
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
 use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
 use log::{error, info, trace, warn};
 use futures_util::{Sink, Stream, SinkExt, StreamExt};
+use crate::connlog::{FlowGuard, SessionLog};
 use crate::transport::IpTransport;
 use crate::SocketProtector;
+
+const PROTO_TCP: u8 = 6;
+const PROTO_UDP: u8 = 17;
 
 const EGRESS_CHANNEL_CAPACITY: usize = 4096;
 
@@ -240,10 +248,75 @@ pub fn is_local_address(addr: IpAddr) -> bool {
                 || (o[0] & 0xF0) == 240                         // 240.0.0.0/4 reserved + broadcast
         }
         IpAddr::V6(ip) => {
+            // A v4-mapped destination (::ffff:a.b.c.d) reaches the v4 network
+            // from a dual-stack socket, so it must be judged by the v4 rules —
+            // otherwise ::ffff:192.168.1.1 walks straight past block_local
+            // into the sharer's LAN.
+            if let Some(v4) = ip.to_ipv4_mapped() {
+                return is_local_address(IpAddr::V4(v4));
+            }
             ip == Ipv6Addr::LOCALHOST                            // ::1
+                || ip == Ipv6Addr::UNSPECIFIED                   // ::
                 || (ip.segments()[0] & 0xFE00) == 0xFC00        // fc00::/7  (ULA)
                 || (ip.segments()[0] & 0xFFC0) == 0xFE80        // fe80::/10 (link-local)
+                || (ip.segments()[0] & 0xFF00) == 0xFF00        // ff00::/8  multicast
         }
+    }
+}
+
+/// Counts bytes through the re-origination socket as they move, so flow byte
+/// counts survive error- and abort-terminated copies (`copy_bidirectional`
+/// returns its counts only on `Ok`, and teardown drops the copy future).
+///
+/// Vectored writes need no override: this wrapper's default
+/// `is_write_vectored()` is false and the default `poll_write_vectored`
+/// routes through the counted `poll_write`, so counts stay correct even for
+/// callers that try the vectored path (tokio's copy loop does not).
+struct CountedIo<T> {
+    inner: T,
+    /// Bytes written toward the destination (client → world).
+    up: Arc<AtomicU64>,
+    /// Bytes read from the destination (world → client).
+    down: Arc<AtomicU64>,
+}
+
+impl<T: AsyncRead + Unpin> AsyncRead for CountedIo<T> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let res = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if let Poll::Ready(Ok(())) = res {
+            this.down
+                .fetch_add((buf.filled().len() - before) as u64, Ordering::Relaxed);
+        }
+        res
+    }
+}
+
+impl<T: AsyncWrite + Unpin> AsyncWrite for CountedIo<T> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<io::Result<usize>> {
+        let this = self.get_mut();
+        let res = Pin::new(&mut this.inner).poll_write(cx, buf);
+        if let Poll::Ready(Ok(n)) = res {
+            this.up.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        res
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
     }
 }
 
@@ -252,29 +325,63 @@ async fn handle_tcp_streams(
     protector: SocketProtector,
     block_local: bool,
     cancel: CancellationToken,
+    slog: Option<Arc<SessionLog>>,
 ) {
     while let Some((mut stream, local, remote)) = tcp_listener.next().await {
         if block_local && is_local_address(remote.ip()) {
             warn!("blocked TCP connection to local address: {:?} => {:?}", local, remote);
+            if let Some(sl) = &slog {
+                sl.flow_blocked(PROTO_TCP, local, remote);
+            }
             continue;
         }
+        // The listener yields after the inner (client-side) handshake, so this
+        // records "the client opened a connection toward `remote`"; whether the
+        // outbound leg succeeded is the `established` flag set below.
+        let flow = slog
+            .as_ref()
+            .and_then(|sl| sl.flow_open(PROTO_TCP, local, remote, true));
         let protector = protector.clone();
         let cancel = cancel.clone();
         tokio::spawn(async move {
             info!("new tcp connection: {:?} => {:?}", local, remote);
             // Race the proxy against teardown so the connection (and its OS
             // socket) is dropped when the session ends, rather than leaking.
+            // On teardown the FlowGuard is dropped un-closed and records the
+            // flow as ended by "session_end" with the counts so far.
             tokio::select! {
                 _ = cancel.cancelled() => {}
                 r = async {
                     match new_tcp_stream(remote, &protector).await {
-                        Ok(mut remote_stream) => {
-                            // pipe between two tcp stream
-                            if let Err(e) = tokio::io::copy_bidirectional(&mut stream, &mut remote_stream).await {
-                                warn!("failed to copy tcp stream {:?}=>{:?}, err: {:?}", local, remote, e);
+                        Ok((remote_stream, egress)) => {
+                            if let Some(f) = &flow {
+                                f.established(Some(egress));
+                            }
+                            let (up, down) = flow
+                                .as_ref()
+                                .map(|f| (f.up.clone(), f.down.clone()))
+                                .unwrap_or_default();
+                            let mut counted = CountedIo { inner: remote_stream, up, down };
+                            match tokio::io::copy_bidirectional(&mut stream, &mut counted).await {
+                                Ok(_) => {
+                                    if let Some(f) = &flow {
+                                        f.close("closed", Duration::ZERO);
+                                    }
+                                }
+                                Err(e) => {
+                                    warn!("failed to copy tcp stream {:?}=>{:?}, err: {:?}", local, remote, e);
+                                    if let Some(f) = &flow {
+                                        f.close("error", Duration::ZERO);
+                                    }
+                                }
                             }
                         }
-                        Err(e) => warn!("failed to new tcp stream {:?}=>{:?}, err: {:?}", local, remote, e),
+                        Err(e) => {
+                            warn!("failed to new tcp stream {:?}=>{:?}, err: {:?}", local, remote, e);
+                            if let Some(f) = &flow {
+                                f.close("connect_failed", Duration::ZERO);
+                            }
+                        }
                     }
                 } => { let () = r; }
             }
@@ -282,8 +389,16 @@ async fn handle_tcp_streams(
     }
 }
 
-async fn new_tcp_stream(addr: SocketAddr, protector: &SocketProtector) -> std::io::Result<TcpStream> {
-    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)?;
+/// Connect toward `addr` from a fresh OS socket. Also returns the socket's
+/// local address — the egress source the destination actually saw from this
+/// host, which is the single most attribution-critical field in the
+/// connection log.
+async fn new_tcp_stream(
+    addr: SocketAddr,
+    protector: &SocketProtector,
+) -> std::io::Result<(TcpStream, SocketAddr)> {
+    let socket =
+        socket2::Socket::new(socket2::Domain::for_address(addr), socket2::Type::STREAM, None)?;
     socket.set_keepalive(true)?;
     socket.set_nodelay(true)?;
     socket.set_nonblocking(true)?;
@@ -299,8 +414,9 @@ async fn new_tcp_stream(addr: SocketAddr, protector: &SocketProtector) -> std::i
     let stream = TcpSocket::from_std_stream(socket.into())
         .connect(addr)
         .await?;
+    let egress = stream.local_addr()?;
 
-    Ok(stream)
+    Ok((stream, egress))
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -320,6 +436,17 @@ struct NATEntry {
     socket: Arc<UdpSocket>,
     task: JoinHandle<()>,
     last_activity: Instant,
+    /// Connection-log record for this flow; closed explicitly on idle/cap
+    /// eviction, or by Drop ("session_end") when the handler is torn down.
+    flow: Option<FlowGuard>,
+}
+
+impl NATEntry {
+    fn close_flow(&self, reason: &'static str) {
+        if let Some(f) = &self.flow {
+            f.close(reason, self.last_activity.elapsed());
+        }
+    }
 }
 
 async fn handle_inbound_datagram(
@@ -327,6 +454,7 @@ async fn handle_inbound_datagram(
     protector: SocketProtector,
     block_local: bool,
     cancel: CancellationToken,
+    slog: Option<Arc<SessionLog>>,
 ) {
     let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
     let (mut read_half, mut write_half) = udp_socket.split();
@@ -359,17 +487,35 @@ async fn handle_inbound_datagram(
                 let Some((data, local, remote)) = packet else { continue };
                 if block_local && is_local_address(remote.ip()) {
                     warn!("blocked UDP datagram to local address: {:?} => {:?}", local, remote);
+                    if let Some(sl) = &slog {
+                        sl.flow_blocked(PROTO_UDP, local, remote);
+                    }
                     continue;
                 }
                 let key = NATKey(local, remote);
 
                 if let Some(entry) = entries.get_mut(&key) {
                     entry.last_activity = Instant::now();
+                    if let Some(f) = &entry.flow {
+                        f.add_up(data.len() as u64);
+                    }
                     let _ = entry.socket.send(&data).await;
                 } else {
                     match new_udp_packet(remote, &protector).await {
                         Ok(socket) => {
                             let socket = Arc::new(socket);
+                            // A "UDP connection" is the tuple delimited by the
+                            // NAT entry's idle timeout — exactly a NetFlow-style
+                            // flow. The connected socket's local address is the
+                            // egress source the destination saw.
+                            let flow = slog
+                                .as_ref()
+                                .and_then(|sl| sl.flow_open(PROTO_UDP, local, remote, true));
+                            if let Some(f) = &flow {
+                                f.established(socket.local_addr().ok());
+                                f.add_up(data.len() as u64);
+                            }
+                            let down = flow.as_ref().map(|f| f.down.clone());
                             let recv_socket = socket.clone();
                             let tx = tx.clone();
                             let recv_cancel = cancel.clone();
@@ -383,6 +529,9 @@ async fn handle_inbound_datagram(
                                         loop {
                                             match recv_socket.recv_from(&mut buf).await {
                                                 Ok((len, _)) => {
+                                                    if let Some(d) = &down {
+                                                        d.fetch_add(len as u64, Ordering::Relaxed);
+                                                    }
                                                     let _ = tx.send((buf[..len].to_vec(), local, remote));
                                                 }
                                                 Err(e) => {
@@ -405,6 +554,7 @@ async fn handle_inbound_datagram(
                                     socket,
                                     task,
                                     last_activity: Instant::now(),
+                                    flow,
                                 },
                                 MAX_UDP_NAT_ENTRIES,
                             );
@@ -419,6 +569,7 @@ async fn handle_inbound_datagram(
                 entries.retain(|key, entry| {
                     if entry.last_activity.elapsed() > UDP_NAT_TIMEOUT {
                         trace!("UDP NAT entry expired: {:?} => {:?}", key.0, key.1);
+                        entry.close_flow("idle");
                         entry.task.abort();
                         false
                     } else {
@@ -443,6 +594,7 @@ fn insert_bounded(entries: &mut HashMap<NATKey, NATEntry>, key: NATKey, entry: N
             .map(|(k, _)| *k)
         && let Some(evicted) = entries.remove(&oldest)
     {
+        evicted.close_flow("evicted");
         evicted.task.abort();
         trace!("UDP NAT table full, evicted {:?} => {:?}", oldest.0, oldest.1);
     }
@@ -450,7 +602,8 @@ fn insert_bounded(entries: &mut HashMap<NATKey, NATEntry>, key: NATKey, entry: N
 }
 
 async fn new_udp_packet(addr: SocketAddr, protector: &SocketProtector) -> std::io::Result<tokio::net::UdpSocket> {
-    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::DGRAM, None)?;
+    let socket =
+        socket2::Socket::new(socket2::Domain::for_address(addr), socket2::Type::DGRAM, None)?;
     socket.set_nonblocking(true)?;
 
     #[cfg(unix)]
@@ -479,8 +632,16 @@ pub enum TunnelError {
 
 /// Start the virtual IP stack and tunnel with the given transport.
 ///
-/// Blocks until the tunnel ends or `cancel` is triggered.
-pub(crate) async fn start_tunnel(transport: IpTransport, protector: SocketProtector, cancel: CancellationToken, block_local: bool) -> io::Result<()> {
+/// Blocks until the tunnel ends or `cancel` is triggered. `slog`, when set,
+/// receives per-flow connection-log records (TCP at accept/close with byte
+/// counts and the egress source address; UDP per NAT-table flow).
+pub(crate) async fn start_tunnel(
+    transport: IpTransport,
+    protector: SocketProtector,
+    cancel: CancellationToken,
+    block_local: bool,
+    slog: Option<Arc<SessionLog>>,
+) -> io::Result<()> {
     info!("Starting tunnel (virtual IP stack)");
     let builder = StackBuilder::default()
         .stack_buffer_size(4096)
@@ -507,12 +668,14 @@ pub(crate) async fn start_tunnel(transport: IpTransport, protector: SocketProtec
         protector.clone(),
         block_local,
         flow_cancel.clone(),
+        slog.clone(),
     ));
     let w_udp = tokio::spawn(handle_inbound_datagram(
         udp_socket,
         protector,
         block_local,
         flow_cancel.clone(),
+        slog,
     ));
 
     // `run_tunnel` owns the tunnel's lifecycle. The TCP/UDP NAT handlers and
@@ -550,6 +713,26 @@ mod tests {
     use crate::transport::mock::{mock_transport, MockTransportHandle};
     use std::time::Duration;
 
+    #[test]
+    fn is_local_address_judges_ipv6_and_v4_mapped_forms() {
+        let local = |s: &str| is_local_address(s.parse().unwrap());
+        // Blocked v6 ranges.
+        assert!(local("::1"));
+        assert!(local("::"));
+        assert!(local("fd00:200::2")); // ULA
+        assert!(local("fe80::1")); // link-local
+        assert!(local("ff02::1")); // multicast
+        // v4-mapped destinations are judged by the v4 rules: a dual-stack
+        // socket reaches the v4 network through them.
+        assert!(local("::ffff:192.168.1.1"));
+        assert!(local("::ffff:10.0.0.2"));
+        assert!(local("::ffff:127.0.0.1"));
+        assert!(!local("::ffff:203.0.113.100"));
+        // Public v6 stays reachable.
+        assert!(!local("2001:db8::1"));
+        assert!(!local("2606:4700::1111"));
+    }
+
     #[tokio::test]
     async fn udp_nat_table_evicts_least_recently_active_at_cap() {
         async fn entry(ts: Instant) -> NATEntry {
@@ -558,6 +741,7 @@ mod tests {
                 socket,
                 task: tokio::spawn(std::future::pending::<()>()),
                 last_activity: ts,
+                flow: None,
             }
         }
         let key = |port: u16| {
@@ -656,7 +840,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_inner = cancel.clone();
         tokio::spawn(async move {
-            let _ = start_tunnel(transport, None, cancel_inner, false).await;
+            let _ = start_tunnel(transport, None, cancel_inner, false, None).await;
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
 

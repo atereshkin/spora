@@ -1,8 +1,9 @@
-//! Share-side IPv4 fragment reassembly.
+//! Share-side IP fragment reassembly.
 //!
-//! The tunnel ([`crate::transport::quic::QuicPeerTransport`]) IPv4-fragments
-//! any inner datagram larger than the QUIC `max_datagram_size`. On the
-//! share→client direction the client's *kernel* reassembles. On the
+//! The tunnel ([`crate::transport::quic::QuicPeerTransport`]) fragments any
+//! inner datagram larger than the QUIC `max_datagram_size` — IPv4 via classic
+//! header fragmentation, IPv6 via the RFC 8200 Fragment extension header. On
+//! the share→client direction the client's *kernel* reassembles. On the
 //! client→share direction there is no kernel: packets feed the userland
 //! smoltcp netstack, which parses each IP packet in isolation
 //! (`UdpPacket::new_checked` length-checks the leading fragment and drops it,
@@ -11,7 +12,7 @@
 //! silently blackholed.
 //!
 //! [`IpReassembler`] sits in front of the netstack and rebuilds whole
-//! datagrams from fragments. Unfragmented and non-IPv4 packets pass straight
+//! datagrams from fragments. Unfragmented and non-IP packets pass straight
 //! through. Incomplete groups are evicted by age and a hard group cap bounds
 //! memory against a peer that sends fragments and never completes them.
 
@@ -23,20 +24,31 @@ use std::time::{Duration, Instant};
 const REASSEMBLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// Cap on concurrently-tracked fragment groups (memory bound).
 const MAX_GROUPS: usize = 256;
-/// An IPv4 total length maxes out at 65535 bytes.
+/// An IP payload length field maxes out at 65535 bytes (both families).
 const MAX_DATAGRAM_LEN: usize = 65_535;
 
 #[derive(Hash, PartialEq, Eq, Clone, Copy)]
-struct FragKey {
-    src: [u8; 4],
-    dst: [u8; 4],
-    proto: u8,
-    id: u16,
+enum FragKey {
+    V4 {
+        src: [u8; 4],
+        dst: [u8; 4],
+        proto: u8,
+        id: u16,
+    },
+    /// RFC 8200 groups by (src, dst, identification); the protocol lives in
+    /// the Fragment header itself.
+    V6 {
+        src: [u8; 16],
+        dst: [u8; 16],
+        id: u32,
+    },
 }
 
 struct FragGroup {
-    /// IP header (ihl bytes) taken from the offset-0 fragment, or empty until
-    /// it arrives.
+    /// IP header taken from the offset-0 fragment, or empty until it arrives.
+    /// IPv4: the ihl bytes verbatim. IPv6: the 40-byte fixed header with
+    /// `next_header` already rewritten back to the Fragment header's
+    /// transport protocol (the Fragment header itself is stripped).
     header: Vec<u8>,
     /// offset-in-bytes -> payload chunk.
     chunks: BTreeMap<usize, Vec<u8>>,
@@ -78,11 +90,12 @@ impl FragGroup {
         covered_end >= total
     }
 
-    /// Rebuild the whole datagram: header (length fixed, fragment bits
-    /// cleared, checksum recomputed) followed by the assembled payload.
+    /// Rebuild the whole datagram: header (lengths fixed; for IPv4 the
+    /// fragment bits cleared and checksum recomputed) followed by the
+    /// assembled payload.
     fn assemble(&self) -> Vec<u8> {
         let total = self.total_len.expect("complete() checked total_len");
-        let ihl = self.header.len();
+        let hdr_len = self.header.len();
         let mut payload = vec![0u8; total];
         for (&off, chunk) in &self.chunks {
             let end = (off + chunk.len()).min(total);
@@ -90,11 +103,17 @@ impl FragGroup {
                 payload[off..end].copy_from_slice(&chunk[..end - off]);
             }
         }
-        let mut out = Vec::with_capacity(ihl + total);
+        let mut out = Vec::with_capacity(hdr_len + total);
         out.extend_from_slice(&self.header);
         out.extend_from_slice(&payload);
+        if (out[0] >> 4) == 6 {
+            // IPv6: only payload_length needs fixing (next_header was
+            // restored when the header was stored; there is no checksum).
+            out[4..6].copy_from_slice(&(total as u16).to_be_bytes());
+            return out;
+        }
         // Total length.
-        let total_len = (ihl + total) as u16;
+        let total_len = (hdr_len + total) as u16;
         out[2..4].copy_from_slice(&total_len.to_be_bytes());
         // Clear flags + fragment offset (MF, DF, offset all go to 0).
         out[6] = 0;
@@ -102,7 +121,7 @@ impl FragGroup {
         // Recompute the header checksum.
         out[10] = 0;
         out[11] = 0;
-        let csum = ipv4_header_checksum(&out[..ihl]);
+        let csum = ipv4_header_checksum(&out[..hdr_len]);
         out[10..12].copy_from_slice(&csum.to_be_bytes());
         out
     }
@@ -119,7 +138,7 @@ impl IpReassembler {
     }
 
     /// Feed one inbound IP packet; returns the packets to hand to the
-    /// netstack. A non-IPv4 or unfragmented packet passes straight through
+    /// netstack. A non-IP or unfragmented packet passes straight through
     /// (one out). A fragment yields nothing until its datagram completes,
     /// then the single reassembled packet.
     pub fn process(&mut self, pkt: Vec<u8>, now: Instant) -> Vec<Vec<u8>> {
@@ -130,29 +149,51 @@ impl IpReassembler {
             self.evict_expired(now);
         }
 
-        // Not IPv4, or too short to inspect fragmentation → pass through.
-        if pkt.len() < 20 || (pkt[0] >> 4) != 4 {
-            return vec![pkt];
-        }
-        let ihl = ((pkt[0] & 0x0f) as usize) * 4;
-        if ihl < 20 || pkt.len() < ihl {
-            return vec![pkt];
-        }
-        let flags_frag = u16::from_be_bytes([pkt[6], pkt[7]]);
-        let mf = (flags_frag & 0x2000) != 0;
-        let offset_bytes = ((flags_frag & 0x1fff) as usize) * 8;
-        // Unfragmented: no MF and zero offset → pass straight through.
-        if !mf && offset_bytes == 0 {
-            return vec![pkt];
-        }
-
-        let key = FragKey {
-            src: [pkt[12], pkt[13], pkt[14], pkt[15]],
-            dst: [pkt[16], pkt[17], pkt[18], pkt[19]],
-            proto: pkt[9],
-            id: u16::from_be_bytes([pkt[4], pkt[5]]),
+        // (key, header for the offset-0 fragment, offset, more-fragments,
+        // payload chunk range start) — or pass the packet through untouched.
+        let (key, header, offset_bytes, mf, data_start) = match pkt.first().map(|b| b >> 4) {
+            Some(4) if pkt.len() >= 20 => {
+                let ihl = ((pkt[0] & 0x0f) as usize) * 4;
+                if ihl < 20 || pkt.len() < ihl {
+                    return vec![pkt];
+                }
+                let flags_frag = u16::from_be_bytes([pkt[6], pkt[7]]);
+                let mf = (flags_frag & 0x2000) != 0;
+                let offset_bytes = ((flags_frag & 0x1fff) as usize) * 8;
+                // Unfragmented: no MF and zero offset → pass straight through.
+                if !mf && offset_bytes == 0 {
+                    return vec![pkt];
+                }
+                let key = FragKey::V4 {
+                    src: [pkt[12], pkt[13], pkt[14], pkt[15]],
+                    dst: [pkt[16], pkt[17], pkt[18], pkt[19]],
+                    proto: pkt[9],
+                    id: u16::from_be_bytes([pkt[4], pkt[5]]),
+                };
+                (key, pkt[..ihl].to_vec(), offset_bytes, mf, ihl)
+            }
+            // IPv6 with a leading Fragment header (the only ext header the
+            // tunnel's own fragmentation produces). Other v6 packets pass
+            // through whole.
+            Some(6) if pkt.len() >= 48 && pkt[6] == 44 => {
+                let off_flags = u16::from_be_bytes([pkt[42], pkt[43]]);
+                let mf = (off_flags & 1) != 0;
+                let offset_bytes = ((off_flags >> 3) as usize) * 8;
+                let key = FragKey::V6 {
+                    src: pkt[8..24].try_into().expect("16 bytes"),
+                    dst: pkt[24..40].try_into().expect("16 bytes"),
+                    id: u32::from_be_bytes([pkt[44], pkt[45], pkt[46], pkt[47]]),
+                };
+                // Store the fixed header with next_header restored to the
+                // transport protocol — the Fragment header is stripped here.
+                let mut header = pkt[..40].to_vec();
+                header[6] = pkt[40];
+                (key, header, offset_bytes, mf, 48)
+            }
+            _ => return vec![pkt],
         };
-        let payload_len = pkt.len() - ihl;
+
+        let payload_len = pkt.len() - data_start;
         // Reject implausible offsets (a malformed peer) rather than allocate.
         if offset_bytes + payload_len > MAX_DATAGRAM_LEN {
             return Vec::new();
@@ -164,7 +205,7 @@ impl IpReassembler {
 
         let group = self.groups.entry(key).or_insert_with(|| FragGroup::new(now));
         if offset_bytes == 0 {
-            group.header = pkt[..ihl].to_vec();
+            group.header = header;
         }
         if !mf {
             group.total_len = Some(offset_bytes + payload_len);
@@ -181,7 +222,7 @@ impl IpReassembler {
                 return Vec::new();
             }
             group.stored_bytes += payload_len;
-            group.chunks.insert(offset_bytes, pkt[ihl..].to_vec());
+            group.chunks.insert(offset_bytes, pkt[data_start..].to_vec());
         }
 
         if group.complete() {
@@ -434,6 +475,118 @@ mod tests {
             out.extend(r.process(fr.clone(), now));
         }
         assert_eq!(out, vec![normalize(&pkt)]);
+    }
+
+    /// Build an IPv6/UDP packet with `payload_len` bytes of UDP payload.
+    fn ipv6_udp(payload_len: usize) -> Vec<u8> {
+        let src = std::net::Ipv6Addr::new(0xfd00, 0x200, 0, 0, 0, 0, 0, 2);
+        let dst = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let mut pkt = Vec::new();
+        etherparse::PacketBuilder::ipv6(src.octets(), dst.octets(), 64)
+            .udp(40000, 5678)
+            .write(&mut pkt, &vec![0xABu8; payload_len])
+            .unwrap();
+        pkt
+    }
+
+    /// Fragment an IPv6 packet the way the tunnel does (RFC 8200 Fragment
+    /// extension header), `max_data` payload bytes per fragment (8-aligned).
+    fn fragment_v6(pkt: &[u8], max_data: usize, id: u32) -> Vec<Vec<u8>> {
+        let next_header = pkt[6];
+        let payload = &pkt[40..];
+        let max_data = max_data & !7;
+        let mut frags = Vec::new();
+        let mut off = 0;
+        while off < payload.len() {
+            let end = (off + max_data).min(payload.len());
+            let is_last = end >= payload.len();
+            let mut f = pkt[..40].to_vec();
+            f[6] = 44;
+            f[4..6].copy_from_slice(&((8 + end - off) as u16).to_be_bytes());
+            f.push(next_header);
+            f.push(0);
+            let off_flags = (((off / 8) as u16) << 3) | u16::from(!is_last);
+            f.extend_from_slice(&off_flags.to_be_bytes());
+            f.extend_from_slice(&id.to_be_bytes());
+            f.extend_from_slice(&payload[off..end]);
+            frags.push(f);
+            off = end;
+        }
+        frags
+    }
+
+    #[test]
+    fn ipv6_non_fragment_passes_through() {
+        let mut r = IpReassembler::new();
+        let pkt = ipv6_udp(100);
+        assert_eq!(r.process(pkt.clone(), Instant::now()), vec![pkt]);
+    }
+
+    #[test]
+    fn reassembles_ipv6_fragments_out_of_order() {
+        let mut r = IpReassembler::new();
+        let now = Instant::now();
+        let pkt = ipv6_udp(3000);
+        let mut frags = fragment_v6(&pkt, 1024, 0xDEAD_BEEF);
+        assert!(frags.len() >= 3);
+        frags.reverse();
+
+        let mut out = Vec::new();
+        for f in &frags {
+            out.extend(r.process(f.clone(), now));
+        }
+        // IPv6 reassembly is bit-exact: no checksum or flag fixups needed.
+        assert_eq!(out, vec![pkt]);
+    }
+
+    #[test]
+    fn interleaved_v4_and_v6_trains_reassemble_independently() {
+        let mut r = IpReassembler::new();
+        let now = Instant::now();
+        let a = ipv4_udp(11, 2000);
+        let b = ipv6_udp(2500);
+        let fa = fragment(&a, 1000);
+        let fb = fragment_v6(&b, 1000, 7);
+
+        let mut out = Vec::new();
+        for i in 0..fa.len().max(fb.len()) {
+            if let Some(f) = fa.get(i) {
+                out.extend(r.process(f.clone(), now));
+            }
+            if let Some(f) = fb.get(i) {
+                out.extend(r.process(f.clone(), now));
+            }
+        }
+        assert_eq!(out.len(), 2);
+        assert!(out.contains(&normalize(&a)));
+        assert!(out.contains(&b));
+    }
+
+    #[test]
+    fn ipv6_fragments_with_distinct_ids_do_not_mix() {
+        let mut r = IpReassembler::new();
+        let now = Instant::now();
+        let pkt = ipv6_udp(2000);
+        let fa = fragment_v6(&pkt, 1024, 1);
+        let fb = fragment_v6(&pkt, 1024, 2);
+        // First fragment of train A, then ALL of train B: only B completes.
+        assert!(r.process(fa[0].clone(), now).is_empty());
+        let mut out = Vec::new();
+        for f in &fb {
+            out.extend(r.process(f.clone(), now));
+        }
+        assert_eq!(out, vec![pkt]);
+        assert_eq!(r.groups.len(), 1, "train A still pending under its own id");
+    }
+
+    #[test]
+    fn truncated_ipv6_fragment_header_passes_through() {
+        // 6-in-the-version-nibble but too short for fixed+fragment headers:
+        // must not panic, must not be eaten.
+        let mut r = IpReassembler::new();
+        let mut junk = vec![0x60u8; 44];
+        junk[6] = 44;
+        assert_eq!(r.process(junk.clone(), Instant::now()), vec![junk]);
     }
 
     #[test]

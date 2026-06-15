@@ -84,8 +84,15 @@ pub enum Action {
 /// them turns the relay into a reflector/amplifier (one inbound packet → a
 /// multicast group, etc.). Loopback is intentionally allowed so the unit/lab
 /// tests and local development can run every peer on 127.0.0.1.
+///
+/// The IP is canonicalized for the *policy check only*: on a dual-stack
+/// socket v4 peers appear as v4-mapped (`::ffff:a.b.c.d`), and without
+/// canonicalization `::ffff:224.0.0.1` / `::ffff:255.255.255.255` /
+/// `::ffff:0.0.0.0` would walk past the v6 arm. The stored/forwarded
+/// `SocketAddr` keeps its kernel-reported (mapped) form — send_to with a
+/// plain V4 address on an AF_INET6 socket fails.
 fn is_relayable(addr: &SocketAddr) -> bool {
-    let ip = addr.ip();
+    let ip = addr.ip().to_canonical();
     if ip.is_unspecified() || ip.is_multicast() {
         return false;
     }
@@ -496,6 +503,63 @@ mod tests {
         assert_eq!(
             s.handle_packet(b, &initial_with_dcid(&key), now),
             Action::Forward(a)
+        );
+    }
+
+    #[test]
+    fn v6_and_mixed_family_flows_forward() {
+        // The state machine is family-agnostic: a v6 sharer serves a
+        // v4-mapped client (the dual-stack-socket shape) without any
+        // normalization of the stored addresses.
+        let mut s = State::default();
+        let now = Instant::now();
+        let a = addr("[2001:db8::1]:1111");
+        let b = addr("[::ffff:203.0.113.6]:2222");
+
+        let mut reg = registrar();
+        let key = reg.routing_key();
+        assert_eq!(s.handle_packet(a, &reg.next_register_packet(), now), Action::Drop);
+        assert_eq!(s.registration_count(), 1);
+
+        assert_eq!(s.handle_packet(b, &initial_with_dcid(&key), now), Action::Forward(a));
+        assert_eq!(s.handle_packet(a, &short_header(), now), Action::Forward(b));
+        assert_eq!(s.handle_packet(b, &short_header(), now), Action::Forward(a));
+    }
+
+    #[test]
+    fn v4_mapped_non_relayable_sources_are_refused() {
+        // On a dual-stack socket, v4 junk arrives in ::ffff: form — the
+        // policy must see through the mapping (multicast/broadcast/
+        // unspecified have no v6-arm equivalents).
+        let mut s = State::default();
+        let now = Instant::now();
+        let mut reg = registrar();
+        let key = reg.routing_key();
+        s.handle_packet(addr("[2001:db8::1]:1111"), &reg.next_register_packet(), now);
+
+        for src in [
+            "[::ffff:224.0.0.1]:9",
+            "[::ffff:255.255.255.255]:9",
+            "[::ffff:0.0.0.0]:9",
+            "[ff02::1]:9",
+        ] {
+            assert_eq!(
+                s.handle_packet(addr(src), &initial_with_dcid(&key), now),
+                Action::Drop,
+                "must refuse flow from {src}"
+            );
+            // A REGISTER (with a valid signature and fresh timestamp) from a
+            // non-relayable source must not rebind the key. Control packets
+            // always return Drop, so assert on the binding instead.
+            s.handle_packet(addr(src), &reg.next_register_packet(), now);
+        }
+        assert_eq!(s.flow_count(), 0);
+        // The genuine sharer still owns the binding: a real client is
+        // forwarded to it, not to any of the junk sources.
+        let b = addr("[2001:db8::b]:2222");
+        assert_eq!(
+            s.handle_packet(b, &initial_with_dcid(&key), now),
+            Action::Forward(addr("[2001:db8::1]:1111"))
         );
     }
 

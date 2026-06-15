@@ -44,8 +44,7 @@ async fn start_share() -> (std::net::SocketAddr, Token, spora_core::ShareSession
     let relay_addr = start_relay().await;
     let identity = Identity::generate();
     let config = Config {
-        relay_host: "127.0.0.1".into(),
-        relay_port: relay_addr.port(),
+        relays: vec![spora_core::identity::RelayEndpoint::new("127.0.0.1", relay_addr.port())],
         ..Config::default()
     };
     let session = share(identity, config).await.expect("share()");

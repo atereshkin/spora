@@ -106,9 +106,9 @@ How the share side turns tunneled IP packets into real traffic:
 The CLI implements OS routing on top of `Custom` (`spora share --os-routing`, plus `--tun-addr`, `--tun-mtu`, `--no-nat`; see `spora-cli/src/os_route.rs`). Requires root/CAP_NET_ADMIN, Linux only. It creates a TUN device and pumps packets transport↔TUN; the kernel forwards/NATs. Key invariants:
 
 - **Keepalive pings must be answered locally.** The client's keepalive layer pings a synthetic private address (10.0.0.2) and declares the tunnel dead without a response; smoltcp answers those in netstack mode, so the pump answers ICMP echo requests to blocked private destinations itself.
-- **Client source addresses are learned, not assumed — but must be private.** Each platform picks its own client TUN address (e.g. wincore uses 10.0.85.1), so the pump learns inner source IPs from forwarded packets and installs a `/32` route + scoped MASQUERADE rule per peer (cap 64). The source is client-controlled, so it is **restricted to RFC1918/CGNAT** (`is_private_client_source`); a public source would otherwise install a `/32` that hijacks the sharer's own egress to that address. A learned source that collides with a directly-connected host route (the sharer's own LAN) is also refused (`ip route get` check).
-- Destinations matching `is_local_address` are dropped (parity with the netstack's `block_local`); IPv6 is dropped in **both** directions (client→host in `classify`, host→client in the pump — the kernel's TUN link-local chatter would otherwise leak to the peer).
-- NAT setup at startup applies ip_forward, FORWARD accepts, and TCP MSS clamp to the TUN MTU; the per-peer scoped MASQUERADE is added lazily in `learn_peer` when each client source is first seen. All of it is undone on exit; `--no-nat` skips it. Cleanup runs from `OsRoute`'s `Drop`, so it fires on Ctrl+C (SIGINT), SIGTERM, error returns, and panics.
+- **Client source addresses are learned, not assumed — but must be private.** Each platform picks its own client TUN address (e.g. wincore uses 10.0.85.1), so the pump learns inner source IPs from forwarded packets and installs a `/32` (v6: `/128`) route + scoped MASQUERADE rule per peer (cap 64, shared across families). The source is client-controlled, so it is **restricted to RFC1918/CGNAT** (`is_private_client_source`) for v4 and **ULA fc00::/7 only** (`is_ula_client_source`) for v6; a public source would otherwise install a route that hijacks the sharer's own egress to that address. A learned source that collides with a directly-connected host route (the sharer's own LAN) is also refused (route-table check, per family).
+- Destinations matching `is_local_address` are dropped (parity with the netstack's `block_local`); ICMPv6 echoes to blocked v6 destinations are answered locally like the v4 ones (mandatory pseudo-header checksum). IPv6 is carried in **both** directions; the host→client pump filters frames whose v6 src/dst is link-local or multicast (the kernel's RS/NS/MLD/DAD chatter must not leak to the peer). The TUN gets a ULA from `--tun-addr6` (default `fd00:5350::1/64`).
+- NAT setup at startup applies v4+v6 forwarding sysctls, FORWARD accepts, and TCP MSS clamp to the TUN MTU (v6 clamp = MTU−60) via iptables AND ip6tables; the per-peer scoped MASQUERADE is added lazily in `learn_peer` when each client source is first seen. All of it is undone on exit; `--no-nat` skips it. Cleanup runs from `OsRoute`'s `Drop`, so it fires on Ctrl+C (SIGINT), SIGTERM, error returns, and panics.
 
 ### Wire protocol — relay control & QUIC routing (see `relay_client::protocol`)
 
@@ -119,10 +119,37 @@ The CLI implements OS routing on top of `Custom` (`spora share --os-routing`, pl
 ### Token / URL format
 
 ```
-https://spora.to/s/<base64url(routing_key || secret)>?r=<relay_host>:<relay_port>
+https://spora.to/s/<base64url(routing_key || secret)>?r=<host>:<port>[&r=<host>:<port>...]
 ```
 
-`routing_key` is 20 bytes (the QUIC v1 DCID maximum); `secret` is 16 bytes. The blob is 36 bytes → 48 base64url chars.
+`routing_key` is 20 bytes (the QUIC v1 DCID maximum); `secret` is 16 bytes. The blob is 36 bytes → 48 base64url chars. An IPv6 relay literal is bracketed (`?r=[2001:db8::1]:443`); `Token::from_url` strips the brackets, so each `RelayEndpoint::host` is a bare hostname/literal. One `?r=` per relay (`Token::relays: Vec<RelayEndpoint>`); a single-`?r=` URL is the back-compatible degenerate case.
+
+### Multiple relays
+
+`Config.relays` / `Token.relays` carry one or more relay endpoints (in preference order). The model is fully generic — used for dual-stack reachability AND censorship-fallback:
+
+- **Sharer registers with ALL relays** on one socket. The socket is dual-stack (`::`, `IPV6_V6ONLY` off) when the relay set includes any v6 endpoint, so it reaches both families and accepts client Initials forwarded by any relay (v4 relays appear v4-mapped); a pure-v4 relay set keeps a plain `0.0.0.0` socket. `register_loop` takes a `Vec<SocketAddr>` and tolerates per-relay send failures (a v4-only host silently skips a v6 relay).
+- **Client tries relays IPv6-first** (`resolve_relays_preferring_v6`), each with a family-matched socket, under `Timings.relay_dial_timeout` (default 8s), until one bootstraps a relay-via session. The order is re-derived on every (re)dial, so DNS changes and censorship failover take effect on reconnect. Preferring a v6 relay is the lever that drives a v6 hole punch (`path_ipv6` comes from the chosen relay's family), which succeeds far more often (firewall-only, no NAT). A dead relay, a censored one, and a relay the sharer never registered with (family mismatch) all look identical — a dropped Initial — and all fail over to the next.
+- **A hostname with A+AAAA records expands to two endpoints** at resolve time (`resolve_one_relay` returns every resolved address), independently on each side — so it behaves exactly as if both IPs were listed.
+- The relay itself is unchanged: each does its dumb DCID-routed forwarding; the sharer's registrations and the clients' flows are per-relay and independent.
+
+### IPv6
+
+Both axes are supported and lab-tested (`cargo test -p spora-lab --test ipv6`; needs ip6tables, skips cleanly without):
+
+- **Outer transport over v6**: relay endpoints are resolved per family (see "Multiple relays" — the client tries v6 first, the sharer registers with all). STUN is queried in the relay-path family first (`pierce_keep_socket(.., prefer_ipv6)`), so punch + direct QUIC run on v6 when the session does. The endpoint exchange is one candidate per side — a cross-family pairing fails fast (`address family mismatch`, transient) instead of burning the punch timeout. The relay binary binds `::` dual-stack by default (one socket, one flow table; v4 peers appear v4-mapped; `--bind 0.0.0.0` for v4-only hosts). The deployed default relay is still a v4 literal, so v6 outer paths need a v6-capable relay host in the URL (or a dual-stack hostname).
+- **Inner v6 in the tunnel**: the netstack terminates v6 TCP/UDP and re-originates from family-matched OS sockets (`Domain::for_address`); the vendored netstack walks v6 extension-header chains. Oversized inner packets fragment at the tunnel layer per family (IPv4 header fragmentation / RFC 8200 Fragment header, shared 32-bit id counter); `IpReassembler` (share side) and the lab pump reassemble both. The keepalive stays a v4 ICMP ping (10.0.0.2): injected below inner traffic, answered by every exit mode — works unchanged on v6-carrying tunnels.
+- **Address hygiene**: `is_local_address` judges v4-mapped destinations by the v4 rules (a dual-stack egress socket would otherwise reach the LAN via `::ffff:192.168.x.x`) and blocks `::`, ULA, link-local, `ff00::/8`; `neg::is_valid_punch_target` and `relay::is_relayable` canonicalize v4-mapped forms before their policy checks.
+
+### Connection log (`spora-core/src/connlog.rs`, see `docs/connection-logging.md`)
+
+The sharer keeps a local NetFlow-style per-flow record ("which client connected to destination IP X during [T1,T2]") — the sharer's egress accountability record for abuse/LE queries. `Config.conn_log: Option<ConnLogConfig>`; core defaults to off, **platforms enable by default** (CLI: `$XDG_STATE_HOME/spora/connlog/<routing-key>/`, `--no-conn-log` to disable; FFI: `conn_log_dir` param; wincore: proto fields, `%PROGRAMDATA%\Spora\connlog\<rk>`). Key facts:
+
+- Storage is SQLite (WAL) on a dedicated writer thread fed by a bounded channel — hooks never block the tunnel; overflow/IO trouble becomes visible `log_gap` marks (plus `clock_jump`, `share_start/stop`, `flow_throttle`), because an absence of records must be distinguishable from absence of traffic. `share()` fails loudly if the log dir is unwritable.
+- Two meters, one log: the netstack exit logs flows at its re-origination points (TCP/UDP, byte counts via `CountedIo`/NAT-entry counters, and `getsockname()` as the **egress source address** — the attribution-critical field); `ExitMode::Custom` gets a passive `MeteredTransport` wrapped around the handler's transport (records marked `confirmed=false`, "offered to tunnel"); `--os-routing` enriches those with the post-MASQUERADE port via a conntrack lookup. Flow records are rate-limited per session (token bucket; suppression summarized in marks). `FlowGuard` is a Drop-guard, so abort-driven teardown still closes records.
+- Session records carry four address kinds of different evidentiary weight: `reported` (client-asserted, never to be read as an observation), `punch_verified` (address-validated; captured even when the direct QUIC build fails), `verified` (direct connection), `sharer_public` (own STUN). A relay-via-only session never directly observes the client's IP — documented limitation.
+- Retention default 90 days, swept in the writer; `spora log hold` pins ranges (preservation requests); logs are deliberately NOT deleted with the identity. Query via `spora log query --ip ... --from ... --to ... [--json]`.
+- e2e coverage: `cargo test -p spora-lab --test connlog`.
 
 ### Transport Layer (`spora-core/src/transport/`)
 
@@ -132,6 +159,7 @@ The `Transport` trait = `Stream<Item=io::Result<Vec<u8>>> + Sink<Vec<u8>>`. Impl
 - `UpgradableTransport` (in `transport/upgradable.rs`) — wraps any transport; can be swapped to a new inner transport via `UpgradeSender`.
 - `KeepAliveTransport` (in `transport/keepalive.rs`) — injects ICMP Echo Requests at configurable intervals; supports an `Adaptive` mode driven by an atomic knob (used for Android battery-aware behavior).
 - `ReconnectTransport` (in `transport/mod.rs`) — wraps any transport; on error/close, re-dials via a closure.
+- `MeteredTransport` (in `transport/meter.rs`) — share side, `ExitMode::Custom` only: passive connection-log flow meter (see "Connection log").
 
 Composition (client side): `QuicPeerTransport → UpgradableTransport → KeepAliveTransport → ReconnectTransport`. Server side omits the outermost `ReconnectTransport` (a new peer just opens a new QUIC connection at the QUIC server endpoint).
 

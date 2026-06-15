@@ -1,4 +1,5 @@
 pub mod keepalive;
+pub mod meter;
 pub mod quic;
 pub mod upgradable;
 #[cfg(test)]

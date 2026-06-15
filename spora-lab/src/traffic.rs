@@ -7,8 +7,9 @@
 //! share-side netstack answers pings locally).
 //!
 //! Drivers:
-//! - **UDP echo**: crafts IPv4+UDP via etherparse from
-//!   [`crate::CLIENT_INNER_IP`]:&lt;per-session port starting 40000&gt; to the
+//! - **UDP echo**: crafts IPv4+UDP (or IPv6+UDP for a v6 server) via
+//!   etherparse from [`crate::CLIENT_INNER_IP`] /
+//!   [`crate::CLIENT_INNER_IP6`]:&lt;per-session port starting 40000&gt; to the
 //!   server; the share netstack verifies lengths but not checksums
 //!   client→share; replies arrive src=server, dst=our addr, TTL 20, valid
 //!   checksums. Sends with light pacing (a few ms) — the share-side UDP NAT
@@ -36,25 +37,32 @@
 //!   (CLOCK_THREAD_CPUTIME_ID) for perf accounting.
 //!
 //! Both drivers tolerate unrelated inbound packets interleaving (keepalive
-//! ICMP, stale echo replies, ...): everything inbound flows through an IPv4
-//! [`Reassembler`] first — large UDP replies (share→client) arrive as IPv4
-//! FRAGMENTS because the tunnel fragments datagrams larger than the QUIC
-//! datagram budget and there is no kernel on this side to reassemble them —
-//! and is then matched against the in-flight session or dropped.
+//! ICMP, stale echo replies, ...): everything inbound flows through a
+//! [`Reassembler`] first — large UDP replies (share→client) arrive as IP
+//! FRAGMENTS (IPv4, or the RFC 8200 Fragment header for IPv6) because the
+//! tunnel fragments datagrams larger than the QUIC datagram budget and there
+//! is no kernel on this side to reassemble them — and is then matched
+//! against the in-flight session or dropped.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
 use smoltcp::time::Instant as SmolInstant;
 use spora_core::IpTransport;
 
-use crate::CLIENT_INNER_IP;
+use crate::{CLIENT_INNER_IP, CLIENT_INNER_IP6};
 
 /// Default gateway the smoltcp iface routes through — any address on the
 /// inner /24 works (Medium::Ip has no neighbor resolution).
 const INNER_GATEWAY: Ipv4Addr = Ipv4Addr::new(10, 200, 0, 1);
+
+/// v6 counterpart of [`INNER_GATEWAY`]: any address on the inner /64 works,
+/// for the same reason. Like [`crate::CLIENT_INNER_IP6`] it lives in a ULA
+/// (fd00::/8) — the inner v6 net mirrors the RFC1918 inner v4 net, so lab
+/// traffic can never alias globally routed space.
+const INNER_GATEWAY6: Ipv6Addr = Ipv6Addr::new(0xfd00, 0x0200, 0, 0, 0, 0, 0, 1);
 
 /// First inner source port; one fresh port per traffic command so stale
 /// share-side NAT entries from a previous session can never match.
@@ -113,13 +121,13 @@ impl Default for TcpOpts {
 /// Commands handled by the pump task (constructed in `peers::start_client`).
 pub enum TrafficCmd {
     UdpEcho {
-        server: std::net::SocketAddrV4,
+        server: std::net::SocketAddr,
         count: usize,
         payload_len: usize,
         respond: tokio::sync::oneshot::Sender<Result<EchoStats, String>>,
     },
     TcpBulk {
-        server: std::net::SocketAddrV4,
+        server: std::net::SocketAddr,
         bytes: usize,
         respond: tokio::sync::oneshot::Sender<Result<BulkStats, String>>,
     },
@@ -127,7 +135,7 @@ pub enum TrafficCmd {
     /// 8-byte big-endian request, receive exactly `bytes`. `elapsed` runs
     /// from connection establishment to the last byte.
     TcpDownload {
-        server: std::net::SocketAddrV4,
+        server: std::net::SocketAddr,
         bytes: usize,
         opts: TcpOpts,
         respond: tokio::sync::oneshot::Sender<Result<BulkStats, String>>,
@@ -136,7 +144,7 @@ pub enum TrafficCmd {
     /// (FIN), await the 8-byte big-endian count ack and verify it. `elapsed`
     /// runs from the first send to the ack.
     TcpUpload {
-        server: std::net::SocketAddrV4,
+        server: std::net::SocketAddr,
         bytes: usize,
         opts: TcpOpts,
         respond: tokio::sync::oneshot::Sender<Result<BulkStats, String>>,
@@ -269,7 +277,7 @@ impl TrafficPump {
     /// or 3s pass without progress after the last send.
     async fn udp_echo(
         &mut self,
-        server: SocketAddrV4,
+        server: SocketAddr,
         count: usize,
         payload_len: usize,
     ) -> Result<EchoStats, String> {
@@ -353,7 +361,7 @@ impl TrafficPump {
 
     /// Run a real TCP connection (smoltcp) against `server`, write `bytes`
     /// of a deterministic pattern and read the echo back, verifying content.
-    async fn tcp_bulk(&mut self, server: SocketAddrV4, bytes: usize) -> Result<BulkStats, String> {
+    async fn tcp_bulk(&mut self, server: SocketAddr, bytes: usize) -> Result<BulkStats, String> {
         use smoltcp::socket::tcp;
 
         /// Abort if neither direction makes progress for this long.
@@ -495,7 +503,7 @@ impl TrafficPump {
     /// here). `elapsed` runs from connection establishment to the last byte.
     async fn tcp_download(
         &mut self,
-        server: SocketAddrV4,
+        server: SocketAddr,
         bytes: usize,
         opts: &TcpOpts,
     ) -> Result<BulkStats, String> {
@@ -620,7 +628,7 @@ impl TrafficPump {
     /// send to the complete ack.
     async fn tcp_upload(
         &mut self,
-        server: SocketAddrV4,
+        server: SocketAddr,
         bytes: usize,
         opts: &TcpOpts,
     ) -> Result<BulkStats, String> {
@@ -762,10 +770,12 @@ impl TrafficPump {
 /// Build the smoltcp interface plus one TCP socket (already `connect`ed to
 /// `server` from `local_port`) over a fresh [`SmolDevice`], applying `opts`'
 /// buffer sizes and congestion control. Shared by TcpBulk / TcpDownload /
-/// TcpUpload.
+/// TcpUpload. The interface is dual-stack regardless of `server`'s family;
+/// smoltcp picks the inner source ([`CLIENT_INNER_IP`] or
+/// [`CLIENT_INNER_IP6`]) by route lookup.
 #[allow(clippy::type_complexity)]
 fn tcp_session(
-    server: SocketAddrV4,
+    server: SocketAddr,
     local_port: u16,
     opts: &TcpOpts,
 ) -> Result<
@@ -785,18 +795,27 @@ fn tcp_session(
     let mut iface_cfg = IfaceConfig::new(HardwareAddress::Ip);
     iface_cfg.random_seed = fresh_nonce();
     let mut iface = Interface::new(iface_cfg, &mut device, SmolInstant::now());
-    // Mirror a host that owns CLIENT_INNER_IP: the address on a /24,
-    // a default route, and any-ip (parity with the share-side stack).
+    // Mirror a host that owns both inner addresses: the v4 address on a /24,
+    // the v6 ULA on a /64, a default route per family (Medium::Ip has no
+    // neighbor resolution, so any on-link gateway works — same trick for
+    // both), and any-ip (parity with the share-side stack).
     iface.set_any_ip(true);
     iface.update_ip_addrs(|addrs| {
         addrs
             .push(IpCidr::new(IpAddress::Ipv4(CLIENT_INNER_IP), 24))
             .expect("first interface address always fits");
+        addrs
+            .push(IpCidr::new(IpAddress::Ipv6(CLIENT_INNER_IP6), 64))
+            .expect("IFACE_MAX_ADDR_COUNT is 2: the v6 address fits");
     });
     iface
         .routes_mut()
         .add_default_ipv4_route(INNER_GATEWAY)
-        .map_err(|e| format!("default route: {e}"))?;
+        .map_err(|e| format!("default v4 route: {e}"))?;
+    iface
+        .routes_mut()
+        .add_default_ipv6_route(INNER_GATEWAY6)
+        .map_err(|e| format!("default v6 route: {e}"))?;
 
     let mut sockets = SocketSet::new(vec![]);
     let mut sock = tcp::Socket::new(
@@ -811,7 +830,7 @@ fn tcp_session(
         .get_mut::<tcp::Socket>(handle)
         .connect(
             iface.context(),
-            (IpAddress::Ipv4(*server.ip()), server.port()),
+            (IpAddress::from(server.ip()), server.port()),
             local_port,
         )
         .map_err(|e| format!("tcp connect: {e}"))?;
@@ -849,11 +868,12 @@ fn fresh_nonce() -> u64 {
         .finish()
 }
 
-/// IPv4+UDP echo request from CLIENT_INNER_IP:`local_port` to `server`,
+/// IP+UDP echo request from our inner address (the family follows `server`:
+/// CLIENT_INNER_IP for v4, CLIENT_INNER_IP6 for v6) at `local_port`,
 /// payload = [seq:4][nonce:8][0xA5 padding] (min 12 bytes).
 fn build_echo_request(
     local_port: u16,
-    server: SocketAddrV4,
+    server: SocketAddr,
     seq: u32,
     nonce: u64,
     payload_len: usize,
@@ -864,84 +884,137 @@ fn build_echo_request(
     payload.extend_from_slice(&nonce.to_be_bytes());
     payload.resize(payload_len, 0xA5);
 
-    let mut pkt = Vec::with_capacity(28 + payload.len());
-    etherparse::PacketBuilder::ipv4(CLIENT_INNER_IP.octets(), server.ip().octets(), 64)
-        .udp(local_port, server.port())
-        .write(&mut pkt, &payload)
-        .expect("writing a UDP packet into a Vec cannot fail");
+    let mut pkt = Vec::with_capacity(48 + payload.len());
+    match server {
+        SocketAddr::V4(s) => {
+            etherparse::PacketBuilder::ipv4(CLIENT_INNER_IP.octets(), s.ip().octets(), 64)
+                .udp(local_port, s.port())
+                .write(&mut pkt, &payload)
+                .expect("writing a UDP packet into a Vec cannot fail");
+        }
+        SocketAddr::V6(s) => {
+            etherparse::PacketBuilder::ipv6(CLIENT_INNER_IP6.octets(), s.ip().octets(), 64)
+                .udp(local_port, s.port())
+                .write(&mut pkt, &payload)
+                .expect("writing a UDP packet into a Vec cannot fail");
+        }
+    }
     pkt
 }
 
-/// If `pkt` is a (whole) IPv4/UDP reply from `server` to our echo session,
+/// If `pkt` is a whole IP packet of `proto` (17 = UDP, 6 = TCP) from
+/// `server`'s address to our inner address of the matching family, return
+/// the offset of the transport header.
+///
+/// The v6 branch requires `next_header == proto` right in the fixed header —
+/// the lab's own traffic carries no extension headers, and reassembled
+/// fragments come out of the [`Reassembler`] with `next_header` restored to
+/// the transport proto.
+fn session_transport_offset(pkt: &[u8], server: SocketAddr, proto: u8) -> Option<usize> {
+    match server {
+        SocketAddr::V4(s) => {
+            if pkt.len() < 20 || pkt[0] >> 4 != 4 || pkt[9] != proto {
+                return None;
+            }
+            let ihl = ((pkt[0] & 0x0f) as usize) * 4;
+            if ihl < 20 || pkt.len() < ihl {
+                return None;
+            }
+            (pkt[12..16] == s.ip().octets() && pkt[16..20] == CLIENT_INNER_IP.octets())
+                .then_some(ihl)
+        }
+        SocketAddr::V6(s) => {
+            if pkt.len() < 40 || pkt[0] >> 4 != 6 || pkt[6] != proto {
+                return None;
+            }
+            (pkt[8..24] == s.ip().octets() && pkt[24..40] == CLIENT_INNER_IP6.octets())
+                .then_some(40)
+        }
+    }
+}
+
+/// If `pkt` is a (whole) IP/UDP reply from `server` to our echo session,
 /// return the sequence number from its payload tag. Matching is on the
 /// 12-byte tag prefix so padded replies still count.
-fn match_echo_reply(
-    pkt: &[u8],
-    server: SocketAddrV4,
-    local_port: u16,
-    nonce: u64,
-) -> Option<u32> {
-    if pkt.len() < 20 || pkt[0] >> 4 != 4 || pkt[9] != 17 {
+fn match_echo_reply(pkt: &[u8], server: SocketAddr, local_port: u16, nonce: u64) -> Option<u32> {
+    let off = session_transport_offset(pkt, server, 17)?;
+    if pkt.len() < off + 8 + ECHO_TAG_LEN {
         return None;
     }
-    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
-    if ihl < 20 || pkt.len() < ihl + 8 + ECHO_TAG_LEN {
-        return None;
-    }
-    if pkt[12..16] != server.ip().octets() || pkt[16..20] != CLIENT_INNER_IP.octets() {
-        return None;
-    }
-    if u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]) != server.port()
-        || u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]) != local_port
+    if u16::from_be_bytes([pkt[off], pkt[off + 1]]) != server.port()
+        || u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]) != local_port
     {
         return None;
     }
-    let payload = &pkt[ihl + 8..];
+    let payload = &pkt[off + 8..];
     if payload[4..12] != nonce.to_be_bytes() {
         return None;
     }
     Some(u32::from_be_bytes(payload[0..4].try_into().unwrap()))
 }
 
-/// True if `pkt` is an IPv4/TCP segment belonging to the in-flight bulk
-/// session (src = server, dst = CLIENT_INNER_IP:local_port).
-fn is_session_tcp(pkt: &[u8], server: SocketAddrV4, local_port: u16) -> bool {
-    if pkt.len() < 20 || pkt[0] >> 4 != 4 || pkt[9] != 6 {
+/// True if `pkt` is an IP/TCP segment belonging to the in-flight bulk
+/// session (src = server, dst = our inner address:local_port).
+fn is_session_tcp(pkt: &[u8], server: SocketAddr, local_port: u16) -> bool {
+    let Some(off) = session_transport_offset(pkt, server, 6) else {
         return false;
-    }
-    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
-    if ihl < 20 || pkt.len() < ihl + 4 {
-        return false;
-    }
-    pkt[12..16] == server.ip().octets()
-        && pkt[16..20] == CLIENT_INNER_IP.octets()
-        && u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]) == server.port()
-        && u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]) == local_port
+    };
+    pkt.len() >= off + 4
+        && u16::from_be_bytes([pkt[off], pkt[off + 1]]) == server.port()
+        && u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]) == local_port
 }
 
 // ---------------------------------------------------------------------------
-// IPv4 fragment reassembly
+// IP fragment reassembly
 
-/// Reassembles IPv4 fragments back into whole packets.
+/// Reassembles IP fragments (IPv4, and the IPv6 Fragment-header form the
+/// tunnel emits) back into whole packets.
 ///
-/// The tunnel IPv4-fragments any IP packet larger than the QUIC datagram
-/// budget (`fragment_ipv4` in spora-core's QuicPeerTransport), and there is
-/// no kernel on this side of the transport to reassemble — so large UDP
-/// replies (share→client) arrive as fragments. Fragments are grouped by the
-/// RFC 791 key (src, dst, protocol, identification), ordered by fragment
-/// offset, and completed once the no-MF tail is present and every byte up to
-/// it is covered. Non-fragments pass straight through.
+/// The tunnel fragments any inner IP packet larger than the QUIC datagram
+/// budget (spora-core's QuicPeerTransport: RFC 791 fragments for v4, RFC
+/// 8200 Fragment extension headers for v6), and there is no kernel on this
+/// side of the transport to reassemble — so large UDP replies
+/// (share→client) arrive as fragments. v4 fragments are grouped by the RFC
+/// 791 key (src, dst, protocol, identification), v6 by (src, dst,
+/// identification); chunks are ordered by fragment offset and completed
+/// once the no-MF tail is present and every byte up to it is covered.
+/// Non-fragments pass straight through.
 #[derive(Default)]
 pub struct Reassembler {
     partial: HashMap<FragKey, Partial>,
 }
 
 #[derive(Clone, PartialEq, Eq, Hash)]
-struct FragKey {
-    src: [u8; 4],
-    dst: [u8; 4],
-    proto: u8,
-    id: u16,
+enum FragKey {
+    /// RFC 791 reassembly key.
+    V4 {
+        src: [u8; 4],
+        dst: [u8; 4],
+        proto: u8,
+        id: u16,
+    },
+    /// RFC 8200 reassembly key (the transport proto is not part of it —
+    /// it travels in the Fragment header's `next_header` instead).
+    V6 {
+        src: [u8; 16],
+        dst: [u8; 16],
+        id: u32,
+    },
+}
+
+/// One parsed fragment, family-independent: everything [`Reassembler::push`]
+/// needs to file it into a [`Partial`].
+struct Fragment {
+    key: FragKey,
+    /// Byte offset of this fragment's payload within the original payload.
+    offset: usize,
+    more_fragments: bool,
+    /// The reassembled packet's IP header as carved from this fragment
+    /// (v4: the IHL bytes verbatim; v6: the 40-byte fixed header with
+    /// `next_header` already restored from the Fragment header). Only the
+    /// offset-0 fragment's copy is kept.
+    header: Vec<u8>,
+    data: Vec<u8>,
 }
 
 struct Partial {
@@ -949,7 +1022,7 @@ struct Partial {
     chunks: BTreeMap<usize, Vec<u8>>,
     /// total payload length, known once the no-MF tail arrives
     total: Option<usize>,
-    /// IP header from the offset-0 fragment
+    /// IP header from the offset-0 fragment (see [`Fragment::header`])
     header: Option<Vec<u8>>,
     created: std::time::Instant,
 }
@@ -962,59 +1035,115 @@ impl Reassembler {
     /// itself when it isn't a fragment, or the reassembled datagram when
     /// `pkt` completes one — or `None` while fragments are still pending.
     pub fn push(&mut self, pkt: Vec<u8>) -> Option<Vec<u8>> {
-        if pkt.len() < 20 || pkt[0] >> 4 != 4 {
-            return Some(pkt); // not IPv4: pass through, callers ignore it
-        }
-        let flags_frag = u16::from_be_bytes([pkt[6], pkt[7]]);
-        let more_fragments = flags_frag & 0x2000 != 0;
-        let offset = ((flags_frag & 0x1fff) as usize) * 8;
-        if !more_fragments && offset == 0 {
-            return Some(pkt); // not fragmented
-        }
-        let ihl = ((pkt[0] & 0x0f) as usize) * 4;
-        if ihl < 20 || pkt.len() < ihl {
-            return Some(pkt); // malformed: pass through, callers ignore it
-        }
-        let total_field = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
-        let end = total_field.clamp(ihl, pkt.len());
-        let data = pkt[ihl..end].to_vec();
+        let frag = match pkt.first().map(|b| b >> 4) {
+            Some(4) => parse_fragment_v4(&pkt),
+            Some(6) => parse_fragment_v6(&pkt),
+            _ => None,
+        };
+        let Some(frag) = frag else {
+            // Not a fragment (or malformed): pass through, callers ignore it.
+            return Some(pkt);
+        };
 
         self.partial
             .retain(|_, p| p.created.elapsed() < REASSEMBLY_TIMEOUT);
 
-        let key = FragKey {
-            src: pkt[12..16].try_into().unwrap(),
-            dst: pkt[16..20].try_into().unwrap(),
-            proto: pkt[9],
-            id: u16::from_be_bytes([pkt[4], pkt[5]]),
-        };
-        let partial = self.partial.entry(key.clone()).or_insert_with(|| Partial {
-            chunks: BTreeMap::new(),
-            total: None,
-            header: None,
-            created: std::time::Instant::now(),
-        });
-        if offset == 0 {
-            partial.header = Some(pkt[..ihl].to_vec());
+        let partial = self
+            .partial
+            .entry(frag.key.clone())
+            .or_insert_with(|| Partial {
+                chunks: BTreeMap::new(),
+                total: None,
+                header: None,
+                created: std::time::Instant::now(),
+            });
+        if frag.offset == 0 {
+            partial.header = Some(frag.header);
         }
-        if !more_fragments {
-            partial.total = Some(offset + data.len());
+        if !frag.more_fragments {
+            partial.total = Some(frag.offset + frag.data.len());
         }
-        partial.chunks.insert(offset, data);
+        partial.chunks.insert(frag.offset, frag.data);
 
         let assembled = partial.try_assemble();
         if assembled.is_some() {
-            self.partial.remove(&key);
+            self.partial.remove(&frag.key);
         }
         assembled
     }
 }
 
+/// Parse `pkt` as an IPv4 FRAGMENT (MF set or a nonzero offset); `None` for
+/// whole packets and anything malformed.
+fn parse_fragment_v4(pkt: &[u8]) -> Option<Fragment> {
+    if pkt.len() < 20 || pkt[0] >> 4 != 4 {
+        return None;
+    }
+    let flags_frag = u16::from_be_bytes([pkt[6], pkt[7]]);
+    let more_fragments = flags_frag & 0x2000 != 0;
+    let offset = ((flags_frag & 0x1fff) as usize) * 8;
+    if !more_fragments && offset == 0 {
+        return None; // not fragmented
+    }
+    let ihl = ((pkt[0] & 0x0f) as usize) * 4;
+    if ihl < 20 || pkt.len() < ihl {
+        return None; // malformed
+    }
+    let total_field = u16::from_be_bytes([pkt[2], pkt[3]]) as usize;
+    let end = total_field.clamp(ihl, pkt.len());
+    Some(Fragment {
+        key: FragKey::V4 {
+            src: pkt[12..16].try_into().unwrap(),
+            dst: pkt[16..20].try_into().unwrap(),
+            proto: pkt[9],
+            id: u16::from_be_bytes([pkt[4], pkt[5]]),
+        },
+        offset,
+        more_fragments,
+        header: pkt[..ihl].to_vec(),
+        data: pkt[ihl..end].to_vec(),
+    })
+}
+
+/// Parse `pkt` as an IPv6 packet carrying a Fragment extension header the
+/// way the tunnel emits them (RFC 8200: the 40-byte fixed header with
+/// `next_header` = 44, then the 8-byte Fragment header, then the payload
+/// slice); `None` for non-fragments and anything malformed. The fixed
+/// header copied out for reassembly gets `next_header` restored to the
+/// transport proto from the Fragment header.
+fn parse_fragment_v6(pkt: &[u8]) -> Option<Fragment> {
+    if pkt.len() < 48 || pkt[0] >> 4 != 6 || pkt[6] != 44 {
+        return None;
+    }
+    // Fragment header: next_header, reserved, offset/flags u16 BE (top 13
+    // bits = offset in 8-byte units, bit 0 = M), identification u32 BE.
+    let frag_field = u16::from_be_bytes([pkt[42], pkt[43]]);
+    let offset = ((frag_field >> 3) as usize) * 8;
+    let more_fragments = frag_field & 0x0001 != 0;
+    let mut header = pkt[..40].to_vec();
+    header[6] = pkt[40]; // restore the transport proto
+    // payload_length covers the Fragment header (8 bytes) + the slice.
+    let payload_len = u16::from_be_bytes([pkt[4], pkt[5]]) as usize;
+    let end = (40 + payload_len).clamp(48, pkt.len());
+    Some(Fragment {
+        key: FragKey::V6 {
+            src: pkt[8..24].try_into().unwrap(),
+            dst: pkt[24..40].try_into().unwrap(),
+            id: u32::from_be_bytes(pkt[44..48].try_into().unwrap()),
+        },
+        offset,
+        more_fragments,
+        header,
+        data: pkt[48..end].to_vec(),
+    })
+}
+
 impl Partial {
     /// Build the whole packet if the tail has arrived and coverage from 0 to
-    /// the tail is contiguous. The header comes from the offset-0 fragment
-    /// with total length fixed up, MF/offset cleared, and a recomputed
-    /// checksum.
+    /// the tail is contiguous. The header comes from the offset-0 fragment:
+    /// v4 gets total length fixed up, MF/offset cleared, and a recomputed
+    /// checksum; v6 (whose `next_header` was already restored at parse time)
+    /// only needs `payload_length` fixed up — IPv6 has no header checksum.
     fn try_assemble(&self) -> Option<Vec<u8>> {
         let total = self.total?;
         let header = self.header.as_ref()?;
@@ -1038,18 +1167,22 @@ impl Partial {
             }
         }
 
-        let ihl = header.len();
-        let mut pkt = Vec::with_capacity(ihl + total);
+        let hlen = header.len();
+        let mut pkt = Vec::with_capacity(hlen + total);
         pkt.extend_from_slice(header);
         pkt.extend_from_slice(&payload);
-        let total_len = (ihl + total) as u16;
-        pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
-        pkt[6] &= 0x40; // keep only DF; clear MF + offset high bits
-        pkt[7] = 0;
-        pkt[10] = 0;
-        pkt[11] = 0;
-        let cks = ipv4_header_checksum(&pkt[..ihl]);
-        pkt[10..12].copy_from_slice(&cks.to_be_bytes());
+        if header[0] >> 4 == 6 {
+            pkt[4..6].copy_from_slice(&(total as u16).to_be_bytes());
+        } else {
+            let total_len = (hlen + total) as u16;
+            pkt[2..4].copy_from_slice(&total_len.to_be_bytes());
+            pkt[6] &= 0x40; // keep only DF; clear MF + offset high bits
+            pkt[7] = 0;
+            pkt[10] = 0;
+            pkt[11] = 0;
+            let cks = ipv4_header_checksum(&pkt[..hlen]);
+            pkt[10..12].copy_from_slice(&cks.to_be_bytes());
+        }
         Some(pkt)
     }
 }
@@ -1142,7 +1275,13 @@ impl smoltcp::phy::Device for SmolDevice {
 
 #[cfg(test)]
 mod tests {
+    use std::net::{SocketAddrV4, SocketAddrV6};
+
     use super::*;
+
+    /// The wan-side v6 server address used across the v6 tests (any global
+    /// unicast works; the inner v6 net is the ULA).
+    const SERVER_IP6: Ipv6Addr = Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x100);
 
     /// A full IPv4/UDP packet as the share-side netstack would build it
     /// (fresh header, TTL 20, valid checksums).
@@ -1150,6 +1289,18 @@ mod tests {
         let payload: Vec<u8> = (0..payload_len).map(|i| (i % 253) as u8).collect();
         let mut pkt = Vec::new();
         etherparse::PacketBuilder::ipv4([203, 0, 113, 100], [10, 200, 0, 2], 20)
+            .udp(7, 40000)
+            .write(&mut pkt, &payload)
+            .unwrap();
+        pkt
+    }
+
+    /// The IPv6 counterpart of [`udp_packet`]: a whole IPv6/UDP reply
+    /// addressed to our inner v6 address.
+    fn udp_packet_v6(payload_len: usize) -> Vec<u8> {
+        let payload: Vec<u8> = (0..payload_len).map(|i| (i % 253) as u8).collect();
+        let mut pkt = Vec::new();
+        etherparse::PacketBuilder::ipv6(SERVER_IP6.octets(), CLIENT_INNER_IP6.octets(), 20)
             .udp(7, 40000)
             .write(&mut pkt, &payload)
             .unwrap();
@@ -1180,6 +1331,36 @@ mod tests {
             frag[11] = 0;
             let cks = ipv4_header_checksum(&frag[..ihl]);
             frag[10..12].copy_from_slice(&cks.to_be_bytes());
+            frags.push(frag);
+            off = end;
+        }
+        frags
+    }
+
+    /// Split a whole IPv6 packet into RFC 8200 fragments carrying `chunk`
+    /// payload bytes each (must be a multiple of 8), mimicking spora-core's
+    /// v6 fragmenter: each fragment copies the 40-byte fixed header with
+    /// `next_header` = 44 and an adjusted `payload_length`, then the 8-byte
+    /// Fragment header, then the payload slice.
+    fn split_fragments_v6(pkt: &[u8], chunk: usize, id: u32) -> Vec<Vec<u8>> {
+        assert_eq!(chunk % 8, 0);
+        let next_header = pkt[6];
+        let payload = &pkt[40..];
+        let mut frags = Vec::new();
+        let mut off = 0usize;
+        while off < payload.len() {
+            let end = (off + chunk).min(payload.len());
+            let more = end < payload.len();
+            let mut frag = Vec::with_capacity(48 + end - off);
+            frag.extend_from_slice(&pkt[..40]);
+            frag[4..6].copy_from_slice(&((8 + end - off) as u16).to_be_bytes());
+            frag[6] = 44; // Fragment extension header
+            frag.push(next_header);
+            frag.push(0); // reserved
+            let frag_field = (((off / 8) as u16) << 3) | u16::from(more);
+            frag.extend_from_slice(&frag_field.to_be_bytes());
+            frag.extend_from_slice(&id.to_be_bytes());
+            frag.extend_from_slice(&payload[off..end]);
             frags.push(frag);
             off = end;
         }
@@ -1295,7 +1476,7 @@ mod tests {
 
     #[test]
     fn echo_request_and_reply_match() {
-        let server = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 100), 7);
+        let server: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 100), 7).into();
         let req = build_echo_request(40000, server, 3, 0xDEAD_BEEF_CAFE_F00D, 200);
         assert_eq!(req.len(), 20 + 8 + 200);
 
@@ -1326,5 +1507,103 @@ mod tests {
             match_echo_reply(&padded, server, 40000, 0xDEAD_BEEF_CAFE_F00D),
             Some(3)
         );
+    }
+
+    #[test]
+    fn echo_request_and_reply_match_v6() {
+        let server: SocketAddr = SocketAddrV6::new(SERVER_IP6, 7, 0, 0).into();
+        let req = build_echo_request(40000, server, 3, 0xDEAD_BEEF_CAFE_F00D, 200);
+        assert_eq!(req.len(), 40 + 8 + 200);
+        assert_eq!(req[0] >> 4, 6, "version");
+        assert_eq!(req[6], 17, "next_header is UDP");
+        assert_eq!(&req[8..24], &CLIENT_INNER_IP6.octets(), "inner v6 source");
+
+        // Reflect it the way the echo path does: same payload, swapped
+        // addressing.
+        let payload = &req[48..];
+        let mut reply = Vec::new();
+        etherparse::PacketBuilder::ipv6(SERVER_IP6.octets(), CLIENT_INNER_IP6.octets(), 20)
+            .udp(7, 40000)
+            .write(&mut reply, payload)
+            .unwrap();
+        assert_eq!(
+            match_echo_reply(&reply, server, 40000, 0xDEAD_BEEF_CAFE_F00D),
+            Some(3)
+        );
+        // Wrong nonce, wrong port: no match.
+        assert_eq!(match_echo_reply(&reply, server, 40000, 1), None);
+        assert_eq!(match_echo_reply(&reply, server, 40001, 0xDEAD_BEEF_CAFE_F00D), None);
+        // A v4 session never claims a v6 reply.
+        let v4: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 100), 7).into();
+        assert_eq!(match_echo_reply(&reply, v4, 40000, 0xDEAD_BEEF_CAFE_F00D), None);
+    }
+
+    #[test]
+    fn reassembles_out_of_order_fragments_v6() {
+        let mut r = Reassembler::default();
+        let pkt = udp_packet_v6(1400); // 1448-byte IP packet
+        let frags = split_fragments_v6(&pkt, 512, 0xDEAD_0001);
+        assert_eq!(frags.len(), 3);
+        // While pending, the matcher must not see the fragments as session
+        // traffic (next_header is 44, not UDP).
+        let server: SocketAddr = SocketAddrV6::new(SERVER_IP6, 7, 0, 0).into();
+        assert_eq!(match_echo_reply(&frags[0], server, 40000, 0), None);
+
+        // Feed tail first, then head, then the middle completes it.
+        assert_eq!(r.push(frags[2].clone()), None);
+        assert_eq!(r.push(frags[0].clone()), None);
+        let full = r.push(frags[1].clone()).expect("complete on last piece");
+
+        // The Fragment headers are stripped and the fixed header restored:
+        // byte-identical to the original packet.
+        assert_eq!(full, pkt);
+        assert_eq!(&full[8..40], &pkt[8..40], "addresses");
+        assert_eq!(full[6], 17, "next_header restored to UDP");
+        assert_eq!(
+            u16::from_be_bytes([full[4], full[5]]) as usize,
+            full.len() - 40,
+            "payload length"
+        );
+    }
+
+    #[test]
+    fn interleaved_v4_and_v6_trains_reassemble_independently() {
+        let mut r = Reassembler::default();
+        let a = udp_packet(1200);
+        let b = udp_packet_v6(1200);
+        let fa = split_fragments(&a, 488, 0x0001);
+        // Same low identification bits as the v4 train: the family tag in
+        // the key must keep them apart.
+        let fb = split_fragments_v6(&b, 488, 0x0000_0001);
+        assert_eq!(fa.len(), 3);
+        assert_eq!(fb.len(), 3);
+
+        assert_eq!(r.push(fa[0].clone()), None);
+        assert_eq!(r.push(fb[2].clone()), None);
+        assert_eq!(r.push(fb[0].clone()), None);
+        assert_eq!(r.push(fa[2].clone()), None);
+        let full_b = r.push(fb[1].clone()).expect("v6 train completes");
+        let full_a = r.push(fa[1].clone()).expect("v4 train completes");
+        assert_eq!(&full_a[20..], &a[20..]);
+        assert_eq!(full_b, b);
+    }
+
+    #[test]
+    fn session_tcp_matching_v6() {
+        let server: SocketAddr = SocketAddrV6::new(SERVER_IP6, 5201, 0, 0).into();
+        let mut pkt = Vec::new();
+        etherparse::PacketBuilder::ipv6(SERVER_IP6.octets(), CLIENT_INNER_IP6.octets(), 20)
+            .tcp(5201, 40000, 1, 1024)
+            .write(&mut pkt, &[])
+            .unwrap();
+        assert!(is_session_tcp(&pkt, server, 40000));
+        // Wrong local port, wrong server address, v4 session: no match.
+        assert!(!is_session_tcp(&pkt, server, 40001));
+        let other: SocketAddr =
+            SocketAddrV6::new(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x200), 5201, 0, 0)
+                .into();
+        assert!(!is_session_tcp(&pkt, other, 40000));
+        let v4: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 100), 5201).into();
+        assert!(!is_session_tcp(&pkt, v4, 40000));
     }
 }

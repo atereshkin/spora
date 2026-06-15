@@ -1,7 +1,7 @@
 use std::io;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -42,9 +42,10 @@ pub fn generate_self_signed_cert() -> (CertificateDer<'static>, PrivateKeyDer<'s
 pub struct QuicPeerTransport {
     rx: mpsc::UnboundedReceiver<io::Result<Vec<u8>>>,
     conn: Connection,
-    /// Monotonic IP Identification for outbound fragmented datagrams (see
-    /// `fragment_ipv4`), so distinct datagrams never share an id.
-    ip_id_ctr: AtomicU16,
+    /// Monotonic Identification for outbound fragmented datagrams (see
+    /// `fragment_ipv4` / `fragment_ipv6`), so distinct datagrams never share
+    /// an id. 32 bits for the IPv6 Fragment header; IPv4 uses the low 16.
+    ip_id_ctr: AtomicU32,
     _reader: JoinHandle<()>,
 }
 
@@ -142,7 +143,7 @@ impl QuicPeerTransport {
         Self {
             rx,
             conn,
-            ip_id_ctr: AtomicU16::new(0),
+            ip_id_ctr: AtomicU32::new(0),
             _reader: reader,
         }
     }
@@ -170,11 +171,20 @@ impl Sink<Vec<u8>> for QuicPeerTransport {
         // larger than it — most importantly inbound UDP datagrams (HTTP/3,
         // QUIC, large DNS), which can't be MSS-clamped the way TCP is. Rather
         // than silently dropping those (which blackholes whole protocols), we
-        // IPv4-fragment them so the receiving peer's kernel reassembles.
+        // fragment them so the receiving peer reassembles: IPv4 via classic
+        // header fragmentation, IPv6 via the Fragment extension header (the
+        // tunnel endpoints are ours, so the "routers don't fragment v6" rule
+        // doesn't bind us — an ICMPv6 PTB can't help anyway, since IPv6's
+        // 1280-byte floor exceeds the initial datagram budget).
         match self.conn.max_datagram_size() {
             Some(max) if item.len() > max => {
-                let ip_id = self.ip_id_ctr.fetch_add(1, Ordering::Relaxed);
-                match fragment_ipv4(&item, max, ip_id) {
+                let id = self.ip_id_ctr.fetch_add(1, Ordering::Relaxed);
+                let frags = match item.first().map(|b| b >> 4) {
+                    Some(4) => fragment_ipv4(&item, max, id as u16),
+                    Some(6) => fragment_ipv6(&item, max, id),
+                    _ => None,
+                };
+                match frags {
                     Some(frags) => {
                         for frag in frags {
                             send_datagram_logged(&self.conn, frag)?;
@@ -182,8 +192,8 @@ impl Sink<Vec<u8>> for QuicPeerTransport {
                         Ok(())
                     }
                     None => {
-                        // Not IPv4 (or unfragmentable) and too large — nothing
-                        // we can do but drop. IPv6 would need an ICMPv6 PTB.
+                        // Unfragmentable (not IP, or a v6 packet that already
+                        // carries extension headers) and too large — drop.
                         warn!(
                             "dropping oversized unfragmentable datagram: {} bytes > max {}",
                             item.len(),
@@ -329,6 +339,79 @@ fn fragment_ipv4(pkt: &[u8], max_len: usize, ip_id: u16) -> Option<Vec<Vec<u8>>>
         frag[11] = 0;
         let csum = ipv4_header_checksum(&frag[..ihl]);
         frag[10..12].copy_from_slice(&csum.to_be_bytes());
+
+        frags.push(frag);
+        off = end;
+    }
+    Some(frags)
+}
+
+/// IPv6 extension headers we refuse to fragment behind (RFC 8200 would put
+/// some of them in the unfragmentable part, but our tunnel only ever needs to
+/// fragment plain transport packets — anything else is dropped as before).
+fn is_ipv6_ext_header(next_header: u8) -> bool {
+    matches!(next_header, 0 | 43 | 44 | 50 | 51 | 60)
+}
+
+/// Split an IPv6 packet into fragments that each fit within `max_len` bytes,
+/// using the RFC 8200 Fragment extension header, so the receiving side (the
+/// peer's kernel behind a TUN, or our reassemblers in front of the netstack)
+/// can rebuild the original. Returns `None` if `pkt` isn't a plain-transport
+/// IPv6 packet (extension headers present) or can't be fragmented to fit.
+/// Every fragment carries `frag_id` as its 32-bit Identification — the caller
+/// must pass a value unique per datagram.
+///
+/// Layout per fragment: the original 40-byte fixed header with `next_header`
+/// rewritten to 44 and `payload_length` updated, then the 8-byte Fragment
+/// header `[next_header, 0, offset/flags (13-bit offset in 8-byte units, bit
+/// 0 = M), id (4 bytes)]`, then the payload slice.
+fn fragment_ipv6(pkt: &[u8], max_len: usize, frag_id: u32) -> Option<Vec<Vec<u8>>> {
+    const FIXED: usize = 40;
+    const FRAG_HDR: usize = 8;
+    if pkt.len() < FIXED || (pkt[0] >> 4) != 6 {
+        return None;
+    }
+    let next_header = pkt[6];
+    if is_ipv6_ext_header(next_header) {
+        return None;
+    }
+    if max_len <= FIXED + FRAG_HDR + 8 {
+        return None;
+    }
+    let payload = &pkt[FIXED..];
+
+    // Each fragment's data must be a multiple of 8 bytes (except the last).
+    let max_data = (max_len - FIXED - FRAG_HDR) & !7usize;
+    // Offsets are 13 bits of 8-byte units; anything that would overflow them
+    // can't be represented (a >64 KiB packet can't reach us anyway).
+    if payload.len() > (1 << 13) * 8 {
+        return None;
+    }
+
+    let mut frags = Vec::new();
+    let mut off = 0usize;
+    while off < payload.len() {
+        let end = (off + max_data).min(payload.len());
+        let chunk = &payload[off..end];
+        let is_last = end >= payload.len();
+
+        let mut frag = Vec::with_capacity(FIXED + FRAG_HDR + chunk.len());
+        frag.extend_from_slice(&pkt[..FIXED]);
+        // Fixed header: next_header = Fragment, payload_length covers the
+        // fragment header + this chunk.
+        frag[6] = 44;
+        let payload_len = (FRAG_HDR + chunk.len()) as u16;
+        frag[4..6].copy_from_slice(&payload_len.to_be_bytes());
+        // Fragment extension header.
+        frag.push(next_header);
+        frag.push(0);
+        let mut off_flags = ((off / 8) as u16) << 3;
+        if !is_last {
+            off_flags |= 1; // M: more fragments
+        }
+        frag.extend_from_slice(&off_flags.to_be_bytes());
+        frag.extend_from_slice(&frag_id.to_be_bytes());
+        frag.extend_from_slice(chunk);
 
         frags.push(frag);
         off = end;
@@ -501,6 +584,101 @@ mod tests {
         assert!(fragment_ipv4(&pkt, 1414, 0x4242).is_none());
         // Too short to be IPv4.
         assert!(fragment_ipv4(&[0x45, 0x00], 1414, 0x4242).is_none());
+    }
+
+    /// Build a valid IPv6/UDP packet with `payload_len` bytes of UDP payload.
+    fn ipv6_udp(payload_len: usize) -> Vec<u8> {
+        let src = std::net::Ipv6Addr::new(0xfd00, 0x200, 0, 0, 0, 0, 0, 2);
+        let dst = std::net::Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 1);
+        let mut pkt = Vec::new();
+        etherparse::PacketBuilder::ipv6(src.octets(), dst.octets(), 64)
+            .udp(1234, 5678)
+            .write(&mut pkt, &vec![0xCDu8; payload_len])
+            .unwrap();
+        pkt
+    }
+
+    /// Reassemble RFC 8200 fragments back into the original IPv6 packet,
+    /// checking offsets, the M flag, and the shared identification.
+    fn reassemble_v6(frags: &[Vec<u8>]) -> Vec<u8> {
+        let mut ordered: Vec<&Vec<u8>> = frags.iter().collect();
+        ordered.sort_by_key(|f| u16::from_be_bytes([f[42], f[43]]) >> 3);
+
+        let id = u32::from_be_bytes(frags[0][44..48].try_into().unwrap());
+        let next_header = frags[0][40];
+        let mut payload = Vec::new();
+        for (i, f) in ordered.iter().enumerate() {
+            assert_eq!(f[0] >> 4, 6, "fragment is IPv6");
+            assert_eq!(f[6], 44, "fixed header chains to the Fragment header");
+            let plen = u16::from_be_bytes([f[4], f[5]]) as usize;
+            assert_eq!(plen, f.len() - 40, "payload_length matches buffer");
+            assert_eq!(f[40], next_header, "all fragments carry the original proto");
+            assert_eq!(u32::from_be_bytes(f[44..48].try_into().unwrap()), id);
+            let off_flags = u16::from_be_bytes([f[42], f[43]]);
+            assert_eq!(
+                ((off_flags >> 3) as usize) * 8,
+                payload.len(),
+                "fragment offset is contiguous"
+            );
+            let is_last = i == ordered.len() - 1;
+            assert_eq!(off_flags & 1 != 0, !is_last, "M set on all but the last");
+            payload.extend_from_slice(&f[48..]);
+        }
+
+        let mut out = ordered[0][..40].to_vec();
+        out[6] = next_header;
+        out[4..6].copy_from_slice(&(payload.len() as u16).to_be_bytes());
+        out.extend_from_slice(&payload);
+        out
+    }
+
+    #[test]
+    fn fragments_oversized_ipv6_and_reassembles() {
+        // 1452-byte UDP payload -> 1500-byte IPv6 packet; tunnel max 1414.
+        let pkt = ipv6_udp(1452);
+        assert_eq!(pkt.len(), 1500);
+        let max = 1414;
+
+        let frags = fragment_ipv6(&pkt, max, 0xDEAD_BEEF).expect("should fragment");
+        assert!(frags.len() >= 2, "should split into multiple fragments");
+        for f in &frags {
+            assert!(f.len() <= max, "fragment {} exceeds max {}", f.len(), max);
+            // Every fragment but the last carries a multiple of 8 data bytes.
+        }
+        for f in &frags[..frags.len() - 1] {
+            assert_eq!((f.len() - 48) % 8, 0);
+        }
+        assert_eq!(reassemble_v6(&frags), pkt, "fragments reassemble to the original");
+    }
+
+    #[test]
+    fn ipv6_fragments_carry_the_given_id() {
+        let pkt = ipv6_udp(3000);
+        for id in [1u32, 0xABCD_EF01, u32::MAX] {
+            let frags = fragment_ipv6(&pkt, 1414, id).unwrap();
+            assert!(frags.len() >= 2);
+            for f in &frags {
+                assert_eq!(u32::from_be_bytes(f[44..48].try_into().unwrap()), id);
+            }
+        }
+    }
+
+    #[test]
+    fn ipv6_with_extension_headers_returns_none() {
+        // A v6 packet already carrying a Fragment header (next_header 44):
+        // refuse to double-fragment.
+        let mut pkt = ipv6_udp(2000);
+        pkt[6] = 44;
+        assert!(fragment_ipv6(&pkt, 1414, 1).is_none());
+        // Hop-by-hop likewise.
+        pkt[6] = 0;
+        assert!(fragment_ipv6(&pkt, 1414, 1).is_none());
+        // Not IPv6 at all.
+        let v4 = ipv4_udp(2000);
+        assert!(fragment_ipv6(&v4, 1414, 1).is_none());
+        // Too small a budget for 40 + 8 + 8 bytes.
+        let v6 = ipv6_udp(2000);
+        assert!(fragment_ipv6(&v6, 56, 1).is_none());
     }
 
     #[test]

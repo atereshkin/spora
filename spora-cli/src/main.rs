@@ -48,6 +48,12 @@ enum Mode {
         /// TUN interface address in CIDR form (with --os-routing).
         #[arg(long, default_value = "10.213.0.1/24", requires = "os_routing")]
         tun_addr: String,
+        /// TUN interface IPv6 address in CIDR form (with --os-routing). Must
+        /// be a ULA (fc00::/7): clients may only source inner v6 traffic from
+        /// ULA space, so a global address here would shadow a real prefix
+        /// without ever being reachable.
+        #[arg(long, default_value = "fd00:5350::1/64", requires = "os_routing")]
+        tun_addr6: String,
         /// TUN MTU (with --os-routing).
         #[arg(long, default_value_t = 1280, requires = "os_routing")]
         tun_mtu: u16,
@@ -56,14 +62,34 @@ enum Mode {
         /// TUN are still installed.
         #[arg(long, requires = "os_routing")]
         no_nat: bool,
-        /// Override the relay address (host:port) used for registration and
-        /// baked into the share URL.
+        /// Override the relay address(es) (host:port) used for registration
+        /// and baked into the share URL. Repeat the flag for multiple relays
+        /// (the sharer registers with all; the client tries them IPv6-first
+        /// then in order). A hostname with both A and AAAA records counts as
+        /// two relays.
         #[arg(long)]
-        relay: Option<String>,
+        relay: Vec<String>,
         /// Override the STUN server (host:port) used for direct-upgrade
         /// endpoint discovery.
         #[arg(long)]
         stun: Option<String>,
+        /// Disable the connection log. By default the sharer keeps a local
+        /// per-flow record (who connected to which destination, when) at
+        /// $XDG_STATE_HOME/spora/connlog/<routing-key>/ — the sharer's own
+        /// egress accountability record for answering abuse reports.
+        #[arg(long)]
+        no_conn_log: bool,
+        /// Override the connection-log directory.
+        #[arg(long, conflicts_with = "no_conn_log")]
+        conn_log_dir: Option<PathBuf>,
+        /// Connection-log retention in days; older records are deleted
+        /// (unless pinned by `spora log hold`).
+        #[arg(long, default_value_t = 90, conflicts_with = "no_conn_log")]
+        conn_log_retention_days: u32,
+        /// Log sessions only (who was connected and when), without per-flow
+        /// destination records.
+        #[arg(long, conflicts_with = "no_conn_log")]
+        conn_log_sessions_only: bool,
     },
     Use {
         url: String,
@@ -71,6 +97,93 @@ enum Mode {
         /// endpoint discovery.
         #[arg(long)]
         stun: Option<String>,
+    },
+    /// Inspect the share's connection log (see docs/connection-logging.md).
+    Log {
+        #[command(subcommand)]
+        cmd: LogCmd,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum LogCmd {
+    /// Query flows: "who connected to destination IP X during [from, to]".
+    /// Prints matching flows, the sessions they belong to (with everything
+    /// known about the client's outer address), and any log gaps or clock
+    /// jumps overlapping the window.
+    Query {
+        /// Destination IP to match.
+        #[arg(long)]
+        ip: Option<std::net::IpAddr>,
+        /// Destination port to match.
+        #[arg(long)]
+        port: Option<u16>,
+        /// Window start: RFC3339 (2026-06-12T10:00:00Z), a date
+        /// (2026-06-12), or unix seconds/milliseconds.
+        #[arg(long)]
+        from: Option<String>,
+        /// Window end (same formats as --from).
+        #[arg(long)]
+        to: Option<String>,
+        /// Machine-readable JSON output (for export/handover).
+        #[arg(long)]
+        json: bool,
+        /// Log directory (default: derived from the identity file;
+        /// overrides --identity-file when both are given).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Identity file used to locate the default log directory.
+        #[arg(long)]
+        identity_file: Option<PathBuf>,
+    },
+    /// List sessions with their address records.
+    Sessions {
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        identity_file: Option<PathBuf>,
+    },
+    /// Manage legal holds: time ranges pinned against retention expiry
+    /// (e.g. after receiving a preservation request).
+    Hold {
+        #[command(subcommand)]
+        cmd: HoldCmd,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum HoldCmd {
+    /// Pin [from, to] against the retention sweep.
+    Add {
+        #[arg(long)]
+        from: String,
+        #[arg(long)]
+        to: String,
+        /// Why this hold exists (e.g. the case/reference number).
+        #[arg(long)]
+        note: Option<String>,
+        /// Log directory; overrides --identity-file when both are given.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Identity file used to locate the default log directory.
+        #[arg(long)]
+        identity_file: Option<PathBuf>,
+    },
+    /// List active holds.
+    List {
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        identity_file: Option<PathBuf>,
+    },
+    /// Remove a hold by id (records it pinned become subject to retention
+    /// again on the next sweep).
+    Remove {
+        id: i64,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        identity_file: Option<PathBuf>,
     },
 }
 
@@ -106,27 +219,48 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             fresh,
             os_routing,
             tun_addr,
+            tun_addr6,
             tun_mtu,
             no_nat,
             relay,
             stun,
+            no_conn_log,
+            conn_log_dir,
+            conn_log_retention_days,
+            conn_log_sessions_only,
         } => {
             let path = identity_file.unwrap_or_else(default_identity_path);
             let identity = load_or_create_identity(&path, fresh)?;
             let mut config = Config::default();
-            if let Some(relay) = relay {
-                let (host, port) = parse_host_port(&relay)
-                    .map_err(|e| format!("--relay: {}", e))?;
-                config.relay_host = host;
-                config.relay_port = port;
+            if !relay.is_empty() {
+                let mut relays = Vec::with_capacity(relay.len());
+                for r in &relay {
+                    let (host, port) = parse_host_port(r).map_err(|e| format!("--relay: {}", e))?;
+                    relays.push(spora_core::identity::RelayEndpoint::new(host, port));
+                }
+                config.relays = relays;
             }
             if let Some(stun) = stun {
                 parse_host_port(&stun).map_err(|e| format!("--stun: {}", e))?;
                 config.stun_server = stun;
             }
+            let connlog_dir = if no_conn_log {
+                None
+            } else {
+                let dir = conn_log_dir.unwrap_or_else(|| default_connlog_dir(&identity));
+                let mut cl = spora_core::connlog::ConnLogConfig::in_dir(&dir);
+                cl.retention =
+                    std::time::Duration::from_secs(u64::from(conn_log_retention_days) * 86_400);
+                cl.log_destinations = !conn_log_sessions_only;
+                if os_routing {
+                    cl.egress_lookup = Some(os_route::conntrack_egress_lookup());
+                }
+                config.conn_log = Some(cl);
+                Some(dir)
+            };
             let mut routing = None;
             if os_routing {
-                let opts = os_route::Options::parse(&tun_addr, tun_mtu, !no_nat)?;
+                let opts = os_route::Options::parse(&tun_addr, &tun_addr6, tun_mtu, !no_nat)?;
                 let guard = os_route::OsRoute::setup(&opts)?;
                 config.exit_mode = ExitMode::Custom(guard.session_handler());
                 routing = Some(guard);
@@ -140,6 +274,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "OS routing enabled: client traffic is forwarded by the kernel via {}.",
                     g.tun_name()
                 );
+            }
+            match &connlog_dir {
+                Some(dir) => println!(
+                    "Connection log: {} (retention {} days; query with `spora log`, disable with --no-conn-log)",
+                    dir.display(),
+                    conn_log_retention_days
+                ),
+                None => println!(
+                    "Connection log DISABLED: you will have no record of what clients did with your IP."
+                ),
             }
             println!("Press Ctrl+C to stop sharing.");
             wait_for_shutdown().await?;
@@ -186,8 +330,359 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 tun_util::start(result.transport, tun).await?;
             }
         }
+        Mode::Log { cmd } => run_log_cmd(cmd)?,
     }
     Ok(())
+}
+
+// ---------- `spora log` ----------
+
+fn run_log_cmd(cmd: LogCmd) -> Result<(), Box<dyn std::error::Error>> {
+    use spora_core::connlog;
+    match cmd {
+        LogCmd::Query {
+            ip,
+            port,
+            from,
+            to,
+            json,
+            dir,
+            identity_file,
+        } => {
+            let dir = resolve_connlog_dir(dir, identity_file)?;
+            let db = connlog::open_readonly(&dir)?;
+            let q = connlog::FlowQuery {
+                ip,
+                port,
+                session: None,
+                from_ms: from.as_deref().map(parse_time).transpose()?,
+                to_ms: to.as_deref().map(parse_time).transpose()?,
+            };
+            let flows = connlog::query_flows(&db, &q)?;
+            let mut session_ids: Vec<i64> = flows.iter().map(|f| f.session_id).collect();
+            session_ids.sort_unstable();
+            session_ids.dedup();
+            let sessions = if session_ids.is_empty() {
+                Vec::new()
+            } else {
+                connlog::query_sessions(&db, Some(&session_ids))?
+            };
+            let marks = connlog::query_marks(&db, q.from_ms, q.to_ms)?;
+            if json {
+                print_query_json(&flows, &sessions, &marks);
+            } else {
+                print_query_human(&flows, &sessions, &marks);
+            }
+        }
+        LogCmd::Sessions { dir, identity_file } => {
+            let dir = resolve_connlog_dir(dir, identity_file)?;
+            let db = connlog::open_readonly(&dir)?;
+            for s in connlog::query_sessions(&db, None)? {
+                print_session(&s);
+            }
+        }
+        LogCmd::Hold { cmd } => match cmd {
+            HoldCmd::Add {
+                from,
+                to,
+                note,
+                dir,
+                identity_file,
+            } => {
+                let dir = resolve_connlog_dir(dir, identity_file)?;
+                let db = connlog::open_readwrite(&dir)?;
+                let id = connlog::add_hold(&db, parse_time(&from)?, parse_time(&to)?, note.as_deref())?;
+                println!("hold {} added: records in [{}, {}] are pinned against retention", id, from, to);
+            }
+            HoldCmd::List { dir, identity_file } => {
+                let dir = resolve_connlog_dir(dir, identity_file)?;
+                let db = connlog::open_readonly(&dir)?;
+                let holds = connlog::list_holds(&db)?;
+                if holds.is_empty() {
+                    println!("no holds");
+                }
+                for (id, from, to, note) in holds {
+                    println!(
+                        "hold {}: {} .. {}  {}",
+                        id,
+                        fmt_ms(from),
+                        fmt_ms(to),
+                        note.unwrap_or_default()
+                    );
+                }
+            }
+            HoldCmd::Remove {
+                id,
+                dir,
+                identity_file,
+            } => {
+                let dir = resolve_connlog_dir(dir, identity_file)?;
+                let db = connlog::open_readwrite(&dir)?;
+                if connlog::remove_hold(&db, id)? {
+                    println!("hold {} removed", id);
+                } else {
+                    println!("no hold with id {}", id);
+                }
+            }
+        },
+    }
+    Ok(())
+}
+
+fn print_query_human(
+    flows: &[spora_core::connlog::FlowRow],
+    sessions: &[spora_core::connlog::SessionRow],
+    marks: &[spora_core::connlog::MarkRow],
+) {
+    if flows.is_empty() {
+        println!("no matching flows");
+    }
+    for f in flows {
+        let last = f.last_ms.map(fmt_ms).unwrap_or_else(|| "open".into());
+        let mut extra = String::new();
+        if let Some(e) = &f.egress_addr {
+            extra.push_str(&format!("  egress {}", e));
+        }
+        if !f.confirmed {
+            // Meter-path records: traffic offered to the tunnel; the handler
+            // may still have dropped it.
+            extra.push_str("  (offered, not confirmed egress)");
+        }
+        println!(
+            "{} .. {}  {} {}:{} -> {}:{}  up {}B down {}B  {}{}  session {:016x}",
+            fmt_ms(f.first_ms),
+            last,
+            proto_name(f.proto),
+            f.src,
+            f.src_port,
+            f.dst,
+            f.dst_port,
+            f.bytes_up,
+            f.bytes_down,
+            match (f.end_reason.as_deref(), f.established) {
+                (Some(r), true) => format!("established, {}", r),
+                (Some(r), false) => format!("unanswered, {}", r),
+                (None, true) => "established, still open".into(),
+                (None, false) => "unanswered, still open".into(),
+            },
+            extra,
+            f.session_id as u64,
+        );
+    }
+    for s in sessions {
+        print_session(s);
+    }
+    let mut warned = false;
+    for m in marks {
+        if matches!(m.kind.as_str(), "log_gap" | "clock_jump" | "flow_throttle") {
+            if !warned {
+                println!("\nWARNING: the log has irregularities overlapping this window:");
+                warned = true;
+            }
+            println!(
+                "  {} {} {}",
+                fmt_ms(m.ts_ms),
+                m.kind,
+                m.detail.as_deref().unwrap_or("")
+            );
+        }
+    }
+}
+
+fn print_session(s: &spora_core::connlog::SessionRow) {
+    println!(
+        "\nsession {:016x}: {} .. {}  via relay {}  ({})",
+        s.id as u64,
+        fmt_ms(s.start_ms),
+        s.end_ms.map(fmt_ms).unwrap_or_else(|| "open".into()),
+        s.relay_addr,
+        s.end_reason.as_deref().unwrap_or("still active")
+    );
+    for (ts, kind, addr) in &s.addrs {
+        let caveat = match kind.as_str() {
+            "reported" => "  (client-asserted, UNVERIFIED)",
+            "punch_verified" => "  (address-validated by hole punch)",
+            "verified" => "  (verified direct connection)",
+            "sharer_public" => "  (this sharer's own public address)",
+            _ => "",
+        };
+        println!("  {}  {} {}{}", fmt_ms(*ts), kind, addr, caveat);
+    }
+    if !s.addrs.iter().any(|(_, k, _)| k == "verified" || k == "punch_verified") {
+        println!("  note: relay-via only — the client's outer address was never directly observed");
+    }
+}
+
+fn print_query_json(
+    flows: &[spora_core::connlog::FlowRow],
+    sessions: &[spora_core::connlog::SessionRow],
+    marks: &[spora_core::connlog::MarkRow],
+) {
+    let mut out = String::from("{\"flows\":[");
+    for (i, f) in flows.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"session\":\"{:016x}\",\"proto\":\"{}\",\"src\":\"{}\",\"src_port\":{},\"dst\":\"{}\",\"dst_port\":{},\"first\":\"{}\",\"last\":{},\"bytes_up\":{},\"bytes_down\":{},\"egress\":{},\"established\":{},\"confirmed_egress\":{},\"end_reason\":{}}}",
+            f.session_id as u64,
+            proto_name(f.proto),
+            json_str(&f.src),
+            f.src_port,
+            json_str(&f.dst),
+            f.dst_port,
+            fmt_ms(f.first_ms),
+            f.last_ms.map(|t| format!("\"{}\"", fmt_ms(t))).unwrap_or_else(|| "null".into()),
+            f.bytes_up,
+            f.bytes_down,
+            f.egress_addr.as_deref().map(|e| format!("\"{}\"", json_str(e))).unwrap_or_else(|| "null".into()),
+            f.established,
+            f.confirmed,
+            f.end_reason.as_deref().map(|r| format!("\"{}\"", json_str(r))).unwrap_or_else(|| "null".into()),
+        ));
+    }
+    out.push_str("],\"sessions\":[");
+    for (i, s) in sessions.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        out.push_str(&format!(
+            "{{\"id\":\"{:016x}\",\"start\":\"{}\",\"end\":{},\"end_reason\":{},\"relay\":\"{}\",\"addrs\":[",
+            s.id as u64,
+            fmt_ms(s.start_ms),
+            s.end_ms.map(|t| format!("\"{}\"", fmt_ms(t))).unwrap_or_else(|| "null".into()),
+            s.end_reason.as_deref().map(|r| format!("\"{}\"", json_str(r))).unwrap_or_else(|| "null".into()),
+            json_str(&s.relay_addr),
+        ));
+        for (j, (ts, kind, addr)) in s.addrs.iter().enumerate() {
+            if j > 0 {
+                out.push(',');
+            }
+            out.push_str(&format!(
+                "{{\"ts\":\"{}\",\"kind\":\"{}\",\"addr\":\"{}\"}}",
+                fmt_ms(*ts),
+                json_str(kind),
+                json_str(addr)
+            ));
+        }
+        out.push_str("]}");
+    }
+    out.push_str("],\"marks\":[");
+    for (i, m) in marks.iter().enumerate() {
+        if i > 0 {
+            out.push(',');
+        }
+        // Mark details written by the logger are JSON objects already; emit
+        // them as nested objects rather than escaped strings.
+        let detail = match m.detail.as_deref() {
+            Some(d) if d.starts_with('{') => d.to_string(),
+            Some(d) => format!("\"{}\"", json_str(d)),
+            None => "null".into(),
+        };
+        out.push_str(&format!(
+            "{{\"ts\":\"{}\",\"kind\":\"{}\",\"detail\":{}}}",
+            fmt_ms(m.ts_ms),
+            json_str(&m.kind),
+            detail,
+        ));
+    }
+    out.push_str("]}");
+    println!("{}", out);
+}
+
+fn json_str(s: &str) -> String {
+    s.chars()
+        .flat_map(|c| match c {
+            '"' => "\\\"".chars().collect::<Vec<_>>(),
+            '\\' => "\\\\".chars().collect(),
+            c if (c as u32) < 0x20 => format!("\\u{:04x}", c as u32).chars().collect(),
+            c => vec![c],
+        })
+        .collect()
+}
+
+fn proto_name(p: u8) -> &'static str {
+    match p {
+        1 => "icmp",
+        6 => "tcp",
+        17 => "udp",
+        58 => "icmpv6",
+        _ => "other",
+    }
+}
+
+fn fmt_ms(ms: i64) -> String {
+    let t = std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms.max(0) as u64);
+    humantime::format_rfc3339_seconds(t).to_string()
+}
+
+/// Accepts RFC3339, a bare date (midnight UTC), or unix seconds/milliseconds.
+fn parse_time(s: &str) -> Result<i64, String> {
+    if let Ok(n) = s.parse::<i64>() {
+        // Heuristic: values before ~5138 AD in ms are seconds.
+        return Ok(if n < 100_000_000_000 { n * 1000 } else { n });
+    }
+    let attempt = if s.len() == 10 && s.as_bytes()[4] == b'-' {
+        format!("{}T00:00:00Z", s)
+    } else {
+        s.to_string()
+    };
+    humantime::parse_rfc3339(&attempt)
+        .map_err(|e| format!("'{}' is not a recognized time ({}); use RFC3339, YYYY-MM-DD, or unix seconds", s, e))
+        .map(|t| {
+            t.duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as i64)
+                .unwrap_or(0)
+        })
+}
+
+fn resolve_connlog_dir(
+    dir: Option<PathBuf>,
+    identity_file: Option<PathBuf>,
+) -> Result<PathBuf, String> {
+    if let Some(d) = dir {
+        return Ok(d);
+    }
+    let path = identity_file.unwrap_or_else(default_identity_path);
+    let bytes = std::fs::read(&path).map_err(|e| {
+        format!(
+            "cannot read identity {} to locate the log ({}); pass --dir explicitly",
+            path.display(),
+            e
+        )
+    })?;
+    let identity = spora_core::identity::Identity::from_bytes(&bytes)?;
+    Ok(default_connlog_dir(&identity))
+}
+
+fn default_connlog_dir(identity: &spora_core::identity::Identity) -> PathBuf {
+    let rk_hex: String = identity
+        .routing_key
+        .iter()
+        .map(|b| format!("{:02x}", b))
+        .collect();
+    connlog_base_dir().join(rk_hex)
+}
+
+#[cfg(not(windows))]
+fn connlog_base_dir() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state"))
+        })
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("spora")
+        .join("connlog")
+}
+
+#[cfg(windows)]
+fn connlog_base_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("spora")
+        .join("connlog")
 }
 
 /// Wait for an interactive (Ctrl+C / SIGINT) or service (SIGTERM) shutdown

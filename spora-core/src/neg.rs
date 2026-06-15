@@ -63,9 +63,11 @@ fn parse_endpoint(data: &[u8]) -> Result<SocketAddr, TunnelError> {
 
 /// Whether `addr` is acceptable as a hole-punch target. Rejects loopback,
 /// unspecified, multicast, broadcast, and port 0 — none of which is ever a
-/// real peer endpoint.
+/// real peer endpoint. The IP is canonicalized first so a v4-mapped IPv6
+/// form (`::ffff:127.0.0.1`, `::ffff:255.255.255.255`, ...) can't smuggle a
+/// blocked v4 address past the checks.
 fn is_valid_punch_target(addr: &SocketAddr) -> bool {
-    let ip = addr.ip();
+    let ip = addr.ip().to_canonical();
     if addr.port() == 0 || ip.is_unspecified() || ip.is_multicast() || ip.is_loopback() {
         return false;
     }
@@ -107,6 +109,13 @@ mod tests {
             "224.0.0.1:443",
             "255.255.255.255:443",
             "203.0.113.5:0",
+            // v4-mapped evasion attempts: must be judged as their v4 form.
+            "[::ffff:127.0.0.1]:443",
+            "[::ffff:0.0.0.0]:443",
+            "[::ffff:224.0.0.1]:443",
+            "[::ffff:255.255.255.255]:443",
+            // v6 multicast.
+            "[ff02::1]:443",
         ];
         for s in bad {
             assert!(
@@ -118,8 +127,14 @@ mod tests {
 
     #[test]
     fn accepts_real_unicast_endpoints() {
-        // Public and same-LAN private reflexive addresses are both valid.
-        for s in ["203.0.113.5:54321", "192.168.1.50:54321", "[2001:db8::1]:443"] {
+        // Public and same-LAN private reflexive addresses are both valid,
+        // and a v4-mapped form of a fine v4 address stays fine.
+        for s in [
+            "203.0.113.5:54321",
+            "192.168.1.50:54321",
+            "[2001:db8::1]:443",
+            "[::ffff:203.0.113.5]:54321",
+        ] {
             assert!(
                 is_valid_punch_target(&s.parse().unwrap()),
                 "should accept {s}"

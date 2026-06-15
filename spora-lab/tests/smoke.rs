@@ -278,7 +278,9 @@ fn nat_mapping_semantics() -> Result<(), String> {
                             }
                             last = Some((m1, m2));
                         }
-                        NatKind::Open => unreachable!("Open is never iterated here"),
+                        NatKind::Open | NatKind::Firewalled => {
+                            unreachable!("not iterated here")
+                        }
                     }
                 }
                 Err(format!(
