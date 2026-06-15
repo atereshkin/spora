@@ -24,7 +24,16 @@ use crate::signal::SignalChannel;
 use crate::transport::quic::{build_transport_config, QuicPeerTransport};
 use crate::Timings;
 
-const E2E_ALPN: &[u8] = b"spora-e2e/1";
+// Present as HTTP/3 ("h3") rather than a product-unique token: the ALPN in the
+// ClientHello is derivable from a QUIC Initial, so a project-specific value
+// positively identifies Spora. Both ends still agree on this exact byte string,
+// so negotiation succeeds — no HTTP/3 semantics are involved. Authentication is
+// the cert pinning (RoutingKeyVerifier), so ALPN/SNI carry no security weight.
+const E2E_ALPN: &[u8] = b"h3";
+// rustls verification name for the (fingerprint-pinned) connection. SNI is
+// suppressed on the wire (`enable_sni = false`, see `client_endpoint`), so this
+// product-specific name never reaches the ClientHello; it survives only as the
+// name our custom verifier ignores.
 const SERVER_NAME: &str = "spora.peer";
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const AUTH_TIMEOUT: Duration = Duration::from_secs(5);
@@ -187,6 +196,11 @@ pub fn client_endpoint(
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
     client_crypto.alpn_protocols = vec![E2E_ALPN.to_vec()];
+    // Don't advertise SNI: pinning is by routing key (cert fingerprint), so the
+    // server name has no security value, and a fixed product-specific SNI would
+    // be a global on-wire selector. (Absent SNI is itself a weak signal; a
+    // realistic per-deployment SNI is a later masquerade option.)
+    client_crypto.enable_sni = false;
 
     let quic_client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
         .map_err(|e| format!("QUIC client crypto: {}", e))?;

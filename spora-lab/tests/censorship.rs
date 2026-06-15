@@ -35,6 +35,7 @@ fn main() {
             register_magic_signature,
             quic_v1_wholesale,
             punch_marker_signature,
+            stun_software_signature,
         ],
     );
     std::process::exit(if ok { 0 } else { 1 });
@@ -325,6 +326,54 @@ fn punch_marker_signature() -> Result<(), String> {
     client
         .wait_event(is_upgrade_success, UPGRADE_TIMEOUT)
         .map_err(|e| format!("direct upgrade never succeeded after clearing the markers: {e}"))?;
+    expect_clean_echo(&client, "post-upgrade echo")?;
+
+    client.stop();
+    sharer.stop();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 4. stun_software_signature
+//
+// Fingerprint: the STUN binding request carried a default SOFTWARE attribute
+// "SimpleRustStunClient" (the stunclient crate default) — a near-unique
+// cleartext string. spora-core now suppresses it (`set_software(None)`). This
+// is the regression guard: with a censor dropping that literal in place, the
+// direct upgrade must STILL succeed, because the string is gone so STUN binding
+// requests are never matched. If the SOFTWARE attribute is ever reintroduced,
+// the rule would drop the binding requests, STUN would fail, and the upgrade
+// would never complete — failing this scenario.
+
+fn stun_software_signature() -> Result<(), String> {
+    let topo = Topology::build(&TopologySpec::new(NatKind::Open, NatKind::Open))?;
+    if !censor_available(&topo.wan)? {
+        return Ok(());
+    }
+    let wan = services::start_wan(&topo.wan, relay::State::default)?;
+    let mut opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
+    opts.timings = fast_retry_timings();
+    opts.enable_direct_upgrade = true;
+
+    // A censor dropping the (now-removed) STUN SOFTWARE literal must be a no-op.
+    censor::drop_signature(&topo.wan, censor::SIG_STUN_SOFTWARE)?;
+
+    let sharer = peers::start_sharer(&topo.sharer, &opts)?;
+    let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)?;
+    client
+        .wait_event(is_relay_established, Duration::from_secs(15))
+        .map_err(|e| format!("client relay session: {e}"))?;
+
+    // STUN — and thus the punch and direct upgrade — must succeed despite the
+    // rule, because the SimpleRustStunClient string is no longer emitted.
+    client
+        .wait_event(is_upgrade_success, UPGRADE_TIMEOUT)
+        .map_err(|e| {
+            format!(
+                "direct upgrade never succeeded under the STUN-SOFTWARE drop — \
+                 has the SOFTWARE attribute been reintroduced? {e}"
+            )
+        })?;
     expect_clean_echo(&client, "post-upgrade echo")?;
 
     client.stop();

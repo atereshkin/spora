@@ -42,6 +42,12 @@ pub const SIG_REGISTER_MAGIC: &str = "8073705201";
 /// punch and the verify packets of the direct-upgrade probe.
 pub const SIG_PUNCH_MARKER: &str = "73706f7261485031";
 
+/// The STUN `SOFTWARE` attribute the stunclient crate sends by default,
+/// "SimpleRustStunClient" — a near-unique cleartext string in every binding
+/// request. spora-core suppresses it via `set_software(None)`; this constant
+/// lets the suite regression-guard that it stays gone.
+pub const SIG_STUN_SOFTWARE: &str = "53696d706c65527573745374756e436c69656e74";
+
 /// Chains an on-path middlebox would inspect: traffic transiting the router
 /// (`FORWARD`) and traffic terminating on it (`INPUT`). See module docs.
 const CHAINS: [&str; 2] = ["FORWARD", "INPUT"];

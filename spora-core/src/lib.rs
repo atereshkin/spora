@@ -1383,7 +1383,10 @@ pub async fn pierce_keep_socket(
             protect_socket(protector, &udp);
             debug!("Local addr: {}", &local_addr);
 
-            let c = StunClient::new(stun_addr);
+            let mut c = StunClient::new(stun_addr);
+            // Drop the default SOFTWARE attribute ("SimpleRustStunClient"): it
+            // is a near-unique cleartext fingerprint in every binding request.
+            c.set_software(None);
             let f = c.query_external_address_async(&udp);
             match f.await {
                 Ok(external_addr) => return Ok((udp, external_addr)),
