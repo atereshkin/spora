@@ -21,6 +21,10 @@ url = "2.5.7"
 libc = "0.2"
 serde_json = "1"
 socket2 = "0.5.6"
+# Tier-1 fingerprint inspector (src/quic_inspect.rs): HKDF-SHA256, AES-128-GCM,
+# and QUIC header protection for decrypting captured QUIC v1 Initials in-tree
+# (no external nDPI/tshark). Already in the workspace lock via rustls.
+ring = "0.17"
 
 # Lab suites manage namespaces from main() and must run scenarios
 # sequentially inside one process, so they bypass libtest.
@@ -69,4 +73,11 @@ name = "peers_loopback"
 # connectivity. Needs the iptables `string` match (self-skips without it).
 [[test]]
 name = "censorship"
+harness = false
+
+# DPI-fingerprint (Tier 1): capture the client's QUIC handshake off the wan leg
+# and decrypt the Initial in-tree (quic_inspect) to verify the de-branded
+# ClientHello (ALPN h3, no SNI) and emit the JA4-Q fingerprint. Needs tcpdump.
+[[test]]
+name = "fingerprint"
 harness = false

@@ -7,6 +7,7 @@
 //! iptables NAT, and runs the production sharer/client/relay **in-process**,
 //! one pinned OS thread + current-thread tokio runtime per simulated host.
 
+pub mod capture;
 pub mod censor;
 pub mod harness;
 pub mod metrics;
@@ -14,6 +15,7 @@ pub mod nat;
 pub mod netem;
 pub mod netns;
 pub mod peers;
+pub mod quic_inspect;
 pub mod services;
 pub mod topology;
 pub mod traffic;
