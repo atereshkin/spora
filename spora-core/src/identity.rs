@@ -190,34 +190,113 @@ fn read_lp_field(bytes: &[u8], cur: &mut usize, name: &str) -> Result<Vec<u8>, S
     Ok(field)
 }
 
-/// One relay's address as a host (hostname or IP literal) and port. The host
-/// is stored bare — an IPv6 literal carries NO brackets here; bracketing is a
-/// URL-encoding concern handled by [`RelayEndpoint::to_url_param`] /
-/// `from_url_param`. A hostname is resolved (and may expand to several
+/// Which relay protocol reaches a given endpoint. The client selects the
+/// matching dialer; the sharer treats registerable protocols and direct
+/// (relay-less) ones differently. Additional protocols (a TCP/TLS relay, an
+/// obfuscated UDP relay) slot in here and get a URL tag.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum RelayProtocol {
+    /// The dumb UDP relay carrying end-to-end QUIC — today's default.
+    #[default]
+    UdpQuic,
+    /// No relay: dial the sharer's own listener directly (the sharer is
+    /// publicly reachable). Zero relay bandwidth; see the `carrier` module.
+    Direct,
+}
+
+impl RelayProtocol {
+    /// Whether reaching a sharer over this protocol goes through a relay the
+    /// sharer must register with. `Direct` is peer-to-peer (no registration);
+    /// the sharer instead binds and advertises the endpoint itself.
+    pub fn is_relayed(self) -> bool {
+        match self {
+            RelayProtocol::UdpQuic => true,
+            RelayProtocol::Direct => false,
+        }
+    }
+
+    /// The URL tag for this protocol, or `None` for the default (`UdpQuic`),
+    /// which is encoded as a bare `host:port` for back-compatibility. Non-default
+    /// protocols encode as `tag/host:port`.
+    fn url_tag(self) -> Option<&'static str> {
+        match self {
+            RelayProtocol::UdpQuic => None,
+            RelayProtocol::Direct => Some("direct"),
+        }
+    }
+
+    /// Parse a URL protocol tag. `quic` is accepted as an explicit spelling of
+    /// the default.
+    fn from_url_tag(tag: &str) -> Option<Self> {
+        match tag {
+            "quic" | "udpquic" => Some(RelayProtocol::UdpQuic),
+            "direct" => Some(RelayProtocol::Direct),
+            _ => None,
+        }
+    }
+}
+
+/// One relay's address as a host (hostname or IP literal), port, and protocol.
+/// The host is stored bare — an IPv6 literal carries NO brackets here;
+/// bracketing is a URL-encoding concern handled by [`RelayEndpoint::to_url_param`]
+/// / `from_url_param`. A hostname is resolved (and may expand to several
 /// addresses, both families) at connect/register time, not here.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RelayEndpoint {
     pub host: String,
     pub port: u16,
+    pub protocol: RelayProtocol,
 }
 
 impl RelayEndpoint {
+    /// A `UdpQuic` (default-protocol) relay endpoint.
     pub fn new(host: impl Into<String>, port: u16) -> Self {
-        Self { host: host.into(), port }
-    }
-
-    /// Render for a URL `?r=` value: `host:port`, bracketing an IPv6 literal.
-    fn to_url_param(&self) -> String {
-        if self.host.contains(':') && !self.host.starts_with('[') {
-            format!("[{}]:{}", self.host, self.port)
-        } else {
-            format!("{}:{}", self.host, self.port)
+        Self {
+            host: host.into(),
+            port,
+            protocol: RelayProtocol::UdpQuic,
         }
     }
 
-    /// Parse one `?r=` value: `[v6literal]:port` or `host:port`. The brackets
-    /// are stripped so `host` is always a bare hostname / IP literal.
+    /// An endpoint reached via a specific protocol.
+    pub fn with_protocol(host: impl Into<String>, port: u16, protocol: RelayProtocol) -> Self {
+        Self {
+            host: host.into(),
+            port,
+            protocol,
+        }
+    }
+
+    /// Render for a URL `?r=` value: `host:port` (bracketing an IPv6 literal),
+    /// prefixed with `tag/` for non-default protocols.
+    fn to_url_param(&self) -> String {
+        let host_port = if self.host.contains(':') && !self.host.starts_with('[') {
+            format!("[{}]:{}", self.host, self.port)
+        } else {
+            format!("{}:{}", self.host, self.port)
+        };
+        match self.protocol.url_tag() {
+            Some(tag) => format!("{tag}/{host_port}"),
+            None => host_port,
+        }
+    }
+
+    /// Parse one `?r=` value: an optional `tag/` protocol prefix followed by
+    /// `[v6literal]:port` or `host:port`. The brackets are stripped so `host` is
+    /// always a bare hostname / IP literal. A bare value (no `tag/`) is the
+    /// back-compatible `UdpQuic` case.
     fn from_url_param(value: &str) -> Result<Self, String> {
+        // A host:port never contains '/', so a '/' means an explicit protocol
+        // tag (which must be one we understand).
+        let (protocol, value) = match value.split_once('/') {
+            Some((tag, rest)) => {
+                let p = RelayProtocol::from_url_tag(tag).ok_or_else(|| {
+                    format!("unknown relay protocol '{tag}' in ?r= value: {value}")
+                })?;
+                (p, rest)
+            }
+            None => (RelayProtocol::UdpQuic, value),
+        };
         let (host, port_str) = if let Some(rest) = value.strip_prefix('[') {
             let (host, port) = rest
                 .split_once("]:")
@@ -243,7 +322,11 @@ impl RelayEndpoint {
         let port: u16 = port_str
             .parse()
             .map_err(|_| format!("invalid port in ?r= value: {}", port_str))?;
-        Ok(RelayEndpoint { host: host.to_string(), port })
+        Ok(RelayEndpoint {
+            host: host.to_string(),
+            port,
+            protocol,
+        })
     }
 }
 
@@ -501,6 +584,49 @@ mod tests {
         };
         let parsed = Token::from_url(&pre_bracketed.to_url()).unwrap();
         assert_eq!(parsed.relays, vec![relay("2001:db8::1", 443)]);
+    }
+
+    #[test]
+    fn relay_endpoint_protocol_tag_round_trips() {
+        // The default (UdpQuic) stays a bare host:port for back-compat; a
+        // non-default protocol gets a `tag/` prefix, with v6 still bracketed.
+        let token = Token {
+            routing_key: [0x42u8; ROUTING_KEY_LEN],
+            secret: [0x99u8; SECRET_LEN],
+            relays: vec![
+                RelayEndpoint::new("relay.example", 443),
+                RelayEndpoint::with_protocol("1.2.3.4", 8443, RelayProtocol::Direct),
+                RelayEndpoint::with_protocol("2001:db8::9", 443, RelayProtocol::Direct),
+            ],
+        };
+        let url = token.to_url();
+        let s = url.as_str();
+        assert!(s.contains("r=relay.example:443"), "default stays bare: {s}");
+        assert!(s.contains("r=direct/1.2.3.4:8443"), "direct is tagged: {s}");
+        assert!(
+            s.contains("r=direct/[2001:db8::9]:443"),
+            "direct v6 bracketed inside the tag: {s}"
+        );
+        assert_eq!(Token::from_url(&url).unwrap(), token, "protocol must round-trip");
+    }
+
+    #[test]
+    fn from_url_rejects_unknown_protocol() {
+        let blob = URL_SAFE_NO_PAD.encode([0u8; TOKEN_BLOB_LEN]);
+        let bad =
+            Url::parse(&format!("https://spora.to/s/{}?r=warpspeed/1.2.3.4:443", blob)).unwrap();
+        let err = Token::from_url(&bad).unwrap_err();
+        assert!(err.contains("unknown relay protocol"), "got: {err}");
+    }
+
+    #[test]
+    fn quic_tag_parses_as_the_default_protocol() {
+        let blob = URL_SAFE_NO_PAD.encode([0u8; TOKEN_BLOB_LEN]);
+        let url =
+            Url::parse(&format!("https://spora.to/s/{}?r=quic/relay.example:443", blob)).unwrap();
+        let ep = &Token::from_url(&url).unwrap().relays[0];
+        assert_eq!(ep.protocol, RelayProtocol::UdpQuic);
+        assert_eq!(ep.host, "relay.example");
     }
 
     #[test]

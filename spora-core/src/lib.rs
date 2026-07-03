@@ -1,3 +1,4 @@
+mod carrier;
 mod neg;
 mod reassembly;
 pub mod connlog;
@@ -28,7 +29,7 @@ use crate::connlog::{AddrKind, ConnLog, ConnLogConfig, SessionLog};
 use crate::e2e::{
     authenticate_incoming, client_connect, client_endpoint, server_endpoint, E2eSession,
 };
-use crate::identity::{Identity, RelayEndpoint, Token, ROUTING_KEY_LEN, SECRET_LEN};
+use crate::identity::{Identity, RelayEndpoint, RelayProtocol, Token, ROUTING_KEY_LEN, SECRET_LEN};
 use crate::neg::{NegChannel, SignalNegChannel};
 use crate::server::TunnelError;
 use crate::signal::SignalChannel;
@@ -272,17 +273,23 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     if config.relays.is_empty() {
         return Err("share: Config.relays is empty".into());
     }
-    // Resolve every configured relay (a hostname may expand to v4+v6); the
-    // sharer registers with all of them so a client can reach it via any.
-    let relay_addrs = resolve_relays(&config.relays)?;
+    // Resolve every configured relay (a hostname may expand to v4+v6). The
+    // sharer registers with each *relayed* endpoint; `Direct` endpoints are the
+    // sharer's own advertised listener — accepted directly, never registered.
+    let resolved = resolve_relays(&config.relays)?;
     let url = identity.token(config.relays.clone()).to_url();
+    let register_addrs: Vec<SocketAddr> = resolved
+        .iter()
+        .filter(|(_, p)| p.is_relayed())
+        .map(|(a, _)| *a)
+        .collect();
 
-    // One socket serves quinn (accepting clients forwarded by ANY relay) and
-    // registration with all of them. It must be dual-stack when the relay set
-    // spans families, so a single socket can send to both v4 and v6 relays
-    // (v4 as v4-mapped) and receive forwarded Initials from either; a pure-v4
-    // relay set keeps a plain v4 socket (unchanged behavior).
-    let want_v6 = relay_addrs.iter().any(|a| a.is_ipv6());
+    // One socket serves quinn (accepting clients forwarded by ANY relay, or
+    // dialing us directly) and registration with all relays. It must be
+    // dual-stack when the endpoint set spans families, so a single socket can
+    // send to both v4 and v6 relays (v4 as v4-mapped) and receive Initials from
+    // either; a pure-v4 set keeps a plain v4 socket (unchanged behavior).
+    let want_v6 = resolved.iter().any(|(a, _)| a.is_ipv6());
     let std_socket = bind_share_udp(&config.protector, want_v6)?;
     let std_clone = std_socket
         .try_clone()
@@ -297,9 +304,10 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
 
     let endpoint = server_endpoint(std_socket, &identity, &config.timings)?;
     info!(
-        "share: e2e endpoint up, rk {:x?}, relays {:?}",
+        "share: e2e endpoint up, rk {:x?}, endpoints {:?}, registering with {:?}",
         &routing_key[..4],
-        relay_addrs
+        resolved,
+        register_addrs
     );
 
     // Sign each relay registration with the identity's certificate key, so the
@@ -336,7 +344,7 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
         // `JoinHandle` is a local here, and dropping a `JoinHandle` does not abort
         // the task, so the registrar would keep flapping the relay binding forever.
         tokio::select! {
-            _ = relay_client::register_loop(registrar, relay_addrs, register_interval, signer) => {}
+            _ = relay_client::register_loop(registrar, register_addrs, register_interval, signer) => {}
             _ = run_share_loop(endpoint, identity_for_loop, cancel_child, config_for_loop, conn_log) => {}
         }
     });
@@ -620,7 +628,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
 /// mismatch looks identical: the Initial is silently dropped) — fails over to
 /// the next instead of stalling. Returns the last error if all fail.
 async fn dial_relays(
-    relay_addrs: &[SocketAddr],
+    relay_addrs: &[(SocketAddr, RelayProtocol)],
     token: &Token,
     config: &Config,
     cancel: CancellationToken,
@@ -628,9 +636,10 @@ async fn dial_relays(
     keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
 ) -> std::io::Result<IpTransport> {
     let mut last_err: Option<std::io::Error> = None;
-    for &relay_addr in relay_addrs {
+    for &(relay_addr, protocol) in relay_addrs {
         let attempt = dial_initiator(
             relay_addr,
+            protocol,
             token,
             config,
             cancel.clone(),
@@ -662,19 +671,28 @@ async fn dial_relays(
 
 async fn dial_initiator(
     relay_addr: SocketAddr,
+    protocol: RelayProtocol,
     token: &Token,
     config: &Config,
     cancel: CancellationToken,
     keepalive_knob: Arc<AtomicU64>,
     keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
 ) -> std::io::Result<IpTransport> {
-    let std_socket =
-        bind_local_udp(&config.protector, relay_addr).map_err(std::io::Error::other)?;
-    let endpoint = client_endpoint(std_socket, token.routing_key, &config.timings)
-        .map_err(std::io::Error::other)?;
-    // Relay path: require the sharer's accept ack so a bad/expired token fails
-    // here instead of silently reconnect-looping.
-    let session = client_connect(&endpoint, relay_addr, &token.secret, true)
+    // Select the client-side dialer for this endpoint's protocol. The returned
+    // session is end-to-end authenticated (routing-key pinned + secret) whatever
+    // the protocol; the relay is never trusted. Relay path: require the sharer's
+    // accept ack so a bad/expired token fails here instead of reconnect-looping.
+    let client = carrier::relay_client_for(protocol);
+    debug!("dialing {} via {:?} carrier", relay_addr, client.protocol());
+    let session = client
+        .dial(carrier::DialCtx {
+            target: relay_addr,
+            routing_key: token.routing_key,
+            secret: token.secret,
+            protector: &config.protector,
+            timings: &config.timings,
+            expect_ack: true,
+        })
         .await
         .map_err(std::io::Error::other)?;
     let E2eSession {
@@ -1170,15 +1188,18 @@ fn resolve_one_relay(relay: &RelayEndpoint) -> Result<Vec<SocketAddr>, String> {
 /// (URL/config order preserved). A per-relay resolution failure is logged and
 /// skipped — censorship that blocks one relay's DNS must not take down the
 /// rest — so this errors only when NOTHING resolves.
-fn resolve_relays(relays: &[RelayEndpoint]) -> Result<Vec<SocketAddr>, String> {
-    let mut out: Vec<SocketAddr> = Vec::new();
-    let mut seen: HashSet<SocketAddr> = HashSet::new();
+fn resolve_relays(relays: &[RelayEndpoint]) -> Result<Vec<(SocketAddr, RelayProtocol)>, String> {
+    let mut out: Vec<(SocketAddr, RelayProtocol)> = Vec::new();
+    let mut seen: HashSet<(SocketAddr, RelayProtocol)> = HashSet::new();
     for relay in relays {
         match resolve_one_relay(relay) {
             Ok(addrs) => {
                 for a in addrs {
-                    if seen.insert(a) {
-                        out.push(a);
+                    // Each resolved address inherits its endpoint's protocol; a
+                    // hostname with A+AAAA records fans out into several.
+                    let entry = (a, relay.protocol);
+                    if seen.insert(entry) {
+                        out.push(entry);
                     }
                 }
             }
@@ -1193,10 +1214,12 @@ fn resolve_relays(relays: &[RelayEndpoint]) -> Result<Vec<SocketAddr>, String> {
 
 /// Like [`resolve_relays`], but stable-sorted IPv6-first. The client uses
 /// this so a v6 relay path (and therefore a v6 hole punch) is tried before
-/// v4; within a family the configured order is preserved.
-fn resolve_relays_preferring_v6(relays: &[RelayEndpoint]) -> Result<Vec<SocketAddr>, String> {
+/// v4; within a family the configured order (and protocol) is preserved.
+fn resolve_relays_preferring_v6(
+    relays: &[RelayEndpoint],
+) -> Result<Vec<(SocketAddr, RelayProtocol)>, String> {
     let mut addrs = resolve_relays(relays)?;
-    addrs.sort_by_key(|a| !a.is_ipv6()); // false(0)=v6 first, true(1)=v4
+    addrs.sort_by_key(|(a, _)| !a.is_ipv6()); // false(0)=v6 first, true(1)=v4
     Ok(addrs)
 }
 
@@ -1227,7 +1250,7 @@ fn bind_share_udp(protector: &SocketProtector, want_v6: bool) -> Result<std::net
 /// protector, and return it as a `std::net::UdpSocket` ready for handoff to
 /// quinn. The client uses this per relay-dial attempt, so the punch family
 /// matches the relay family unambiguously (no v4-mapped guessing).
-fn bind_local_udp(protector: &SocketProtector, peer: SocketAddr) -> Result<std::net::UdpSocket, String> {
+pub(crate) fn bind_local_udp(protector: &SocketProtector, peer: SocketAddr) -> Result<std::net::UdpSocket, String> {
     let wildcard: SocketAddr = if peer.is_ipv6() {
         (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
     } else {
