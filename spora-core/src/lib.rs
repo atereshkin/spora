@@ -273,16 +273,24 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     if config.relays.is_empty() {
         return Err("share: Config.relays is empty".into());
     }
-    // Resolve every configured relay (a hostname may expand to v4+v6). The
-    // sharer registers with each *relayed* endpoint; `Direct` endpoints are the
-    // sharer's own advertised listener — accepted directly, never registered.
-    let resolved = resolve_relays(&config.relays)?;
     let url = identity.token(config.relays.clone()).to_url();
-    let register_addrs: Vec<SocketAddr> = resolved
+
+    // Resolve only the *relayed* endpoints — the ones we register with. A
+    // `Direct` endpoint is the sharer's own advertised listener: the sharer
+    // binds a wildcard socket and it is the CLIENT that resolves the advertised
+    // name. So a Direct hostname the sharer can't resolve locally (split-horizon
+    // or external-only DNS) must NOT abort the share.
+    let relayed: Vec<RelayEndpoint> = config
+        .relays
         .iter()
-        .filter(|(_, p)| p.is_relayed())
-        .map(|(a, _)| *a)
+        .filter(|r| r.protocol.is_relayed())
+        .cloned()
         .collect();
+    let register_addrs: Vec<SocketAddr> = if relayed.is_empty() {
+        Vec::new()
+    } else {
+        resolve_relays(&relayed)?.into_iter().map(|(a, _)| a).collect()
+    };
 
     // A `Direct` (relay-less) sharer must bind the advertised port so clients
     // can dial it; a relay-only sharer keeps an ephemeral port (0). One socket
@@ -304,12 +312,15 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
         }
     };
 
-    // One socket serves quinn (accepting clients forwarded by ANY relay, or
-    // dialing us directly) and registration with all relays. It must be
-    // dual-stack when the endpoint set spans families, so a single socket can
-    // send to both v4 and v6 relays (v4 as v4-mapped) and receive Initials from
-    // either; a pure-v4 set keeps a plain v4 socket (unchanged behavior).
-    let want_v6 = resolved.iter().any(|(a, _)| a.is_ipv6());
+    // Bind dual-stack when any endpoint is (or may be) v6: a resolved relay v6,
+    // or a Direct endpoint that is a v6 literal or a hostname (which may carry an
+    // AAAA record the client will dial). Only a Direct *v4 literal* stays v4-only
+    // — resolving the advertised name here (which may be external-only) is
+    // avoided, so a dual-stack socket serves whichever family the client picks.
+    let want_v6 = register_addrs.iter().any(|a| a.is_ipv6())
+        || config.relays.iter().any(|r| {
+            !r.protocol.is_relayed() && r.host.parse::<std::net::Ipv4Addr>().is_err()
+        });
     let std_socket = bind_share_udp(&config.protector, want_v6, bind_port)?;
     let std_clone = std_socket
         .try_clone()
@@ -324,10 +335,10 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
 
     let endpoint = server_endpoint(std_socket, &identity, &config.timings)?;
     info!(
-        "share: e2e endpoint up, rk {:x?}, endpoints {:?}, registering with {:?}",
+        "share: e2e endpoint up, rk {:x?}, registering with {:?}, direct bind_port {}",
         &routing_key[..4],
-        resolved,
-        register_addrs
+        register_addrs,
+        bind_port
     );
 
     // Sign each relay registration with the identity's certificate key, so the
@@ -744,7 +755,14 @@ async fn dial_initiator(
         Box::new(KeepAliveTransport::new(Box::new(upgradable), keepalive_cfg));
 
     let upgrade_cancel = cancel.clone();
-    if config.enable_direct_upgrade {
+    // Only a *relayed* session benefits from a direct upgrade. A Direct-carrier
+    // session already terminates directly on the sharer's advertised listener,
+    // so punching a second path is pure waste — and would leak both peers'
+    // addresses to STUN, defeating the point of a relay-less path. So skip it,
+    // and drop the signal channel now: the sharer starts a responder upgrade not
+    // knowing the session is already direct, and a closed signal makes its first
+    // `recv_endpoint` return EOF, terminating it *before* it ever STUNs.
+    if config.enable_direct_upgrade && protocol.is_relayed() {
         let role = DirectRole::Initiator {
             routing_key: token.routing_key,
             secret: token.secret,
@@ -774,19 +792,31 @@ async fn dial_initiator(
             drop(router_handle);
         });
     } else {
-        // Direct upgrade disabled: hold the SignalChannel open so the peer's
-        // signal stream doesn't see EOF. The holder must die with the
-        // *session*, not just the connect-level cancel token: each re-dial
-        // runs through here again, so a cancel-only holder would accumulate
-        // one parked task (pinning a dead connection's streams) per redial.
-        // The router drops its upgrade receiver when the session ends, so
-        // `upgrade_sender.closed()` is exactly the session-death signal.
+        // Not attempting an initiator upgrade. For a Direct session drop the
+        // signal now (stops the peer's responder before STUN). For a relayed
+        // session with the upgrade globally disabled, hold the SignalChannel
+        // open so the peer's attempts time out instead of seeing EOF. Either
+        // way the holder must die with the *session*, not just the connect-level
+        // cancel token: each re-dial runs through here again, so a cancel-only
+        // holder would accumulate one parked task per redial. The router drops
+        // its upgrade receiver when the session ends, so `upgrade_sender.closed()`
+        // is exactly the session-death signal.
+        let drop_signal_now = !protocol.is_relayed();
         tokio::spawn(async move {
+            // Direct: drop the signal now (peer's responder stops before STUN).
+            // Relayed+disabled: hold it until session death (peer's attempts
+            // time out instead of erroring).
+            let held_signal = if drop_signal_now {
+                drop(signal);
+                None
+            } else {
+                Some(signal)
+            };
             tokio::select! {
                 _ = upgrade_cancel.cancelled() => {}
                 _ = upgrade_sender.closed() => {}
             }
-            drop(signal);
+            drop(held_signal);
             drop(router_handle);
         });
     }

@@ -226,10 +226,12 @@ async fn udp_echo_over_relayless_direct() {
         spora_core::identity::RelayProtocol::Direct,
     );
 
-    // No relay is spawned. The upgrade is disabled: the session is already
-    // direct, so there is nothing to punch (and STUN is never hit).
-    let mut opts = LabPeerOpts::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1:3478");
-    opts.enable_direct_upgrade = false;
+    // No relay is spawned. Leave enable_direct_upgrade at its production default
+    // (true): the Direct carrier must skip the upgrade INTERNALLY (the session
+    // is already direct). The STUN name is deliberately unresolvable, so a buggy
+    // upgrade attempt would emit DirectUpgradeFailed within milliseconds — its
+    // absence proves the client skipped STUN/punch entirely.
+    let opts = LabPeerOpts::new("127.0.0.1:0".parse().unwrap(), "stun.invalid:3478");
 
     let (mut share_cfg, _share_events) = opts.config();
     share_cfg.relays = vec![direct];
@@ -246,7 +248,7 @@ async fn udp_echo_over_relayless_direct() {
         session.url
     );
 
-    let (client_cfg, _client_events) = opts.config();
+    let (client_cfg, mut client_events) = opts.config();
     let connected = spora_core::connect(session.url.clone(), &client_cfg)
         .await
         .expect("connect() establishes a relay-less direct session");
@@ -273,11 +275,68 @@ async fn udp_echo_over_relayless_direct() {
         "echo lost packets over the direct path: {stats:?}"
     );
 
+    // The client must NOT attempt a direct upgrade on an already-direct session.
+    // With the unresolvable STUN name, a (buggy) attempt would emit
+    // DirectUpgradeFailed near-instantly; its absence over this window proves
+    // the Direct carrier skipped STUN/punch.
+    let upgrade_ev = tokio::task::spawn_blocking(move || {
+        client_events.wait_event(
+            |e| {
+                matches!(
+                    e,
+                    TunnelEvent::DirectUpgradeFailed { .. } | TunnelEvent::DirectUpgradeSucceeded { .. }
+                )
+            },
+            Duration::from_secs(2),
+        )
+    })
+    .await
+    .unwrap();
+    assert!(
+        upgrade_ev.is_err(),
+        "a Direct session must skip the direct-upgrade, but an upgrade event fired: {upgrade_ev:?}"
+    );
+
     drop(cmd_tx);
     tokio::time::timeout(Duration::from_secs(5), pump)
         .await
         .expect("pump exits when the command channel closes")
         .unwrap();
+    session.abort();
+}
+
+/// Regression: a pure-`Direct` sharer whose advertised host is a name the
+/// sharer itself CANNOT resolve locally (split-horizon / external-only DNS)
+/// must still start — it binds a wildcard socket and the CLIENT resolves the
+/// advertised name. share() must not resolve `Direct` endpoints.
+#[tokio::test(flavor = "multi_thread")]
+async fn relayless_share_with_unresolvable_advertised_host_starts() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let port = {
+        let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        s.local_addr().unwrap().port()
+    };
+    let opts = LabPeerOpts::new("127.0.0.1:0".parse().unwrap(), "stun.invalid:3478");
+    let (mut share_cfg, _events) = opts.config();
+    share_cfg.relays = vec![spora_core::identity::RelayEndpoint::with_protocol(
+        "sharer.unresolvable.invalid",
+        port,
+        spora_core::identity::RelayProtocol::Direct,
+    )];
+    share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
+
+    let session = spora_core::share(Identity::generate(), share_cfg)
+        .await
+        .expect("relay-less share() must start even when the advertised host does not resolve locally");
+    assert!(
+        session
+            .url
+            .as_str()
+            .contains(&format!("r=direct/sharer.unresolvable.invalid:{port}")),
+        "URL must advertise the (unresolved) hostname, got {}",
+        session.url
+    );
     session.abort();
 }
 
