@@ -73,6 +73,12 @@ enum Mode {
         /// endpoint discovery.
         #[arg(long)]
         stun: Option<String>,
+        /// Capability token authorizing this sharer to use the relay(s), when
+        /// the relay requires one. Accepts a base64url token (as printed by
+        /// `spora-issuer issue`) or a path to a file containing it. Not needed
+        /// for open-mode relays.
+        #[arg(long)]
+        relay_token: Option<String>,
         /// Disable the connection log. By default the sharer keeps a local
         /// per-flow record (who connected to which destination, when) at
         /// $XDG_STATE_HOME/spora/connlog/<routing-key>/ — the sharer's own
@@ -187,6 +193,17 @@ enum HoldCmd {
     },
 }
 
+/// Load a relay capability token from `--relay-token`: either a path to a file
+/// containing the base64url token, or the token string itself. Returns the raw
+/// (decoded) token bytes for `Config::relay_token`.
+fn load_relay_token(arg: &str) -> Result<Vec<u8>, String> {
+    let text = match std::fs::read_to_string(arg) {
+        Ok(contents) => contents,
+        Err(_) => arg.to_string(), // not a readable file: treat as a literal token
+    };
+    spora_core::authz::decode_b64(text.trim()).map_err(|e| format!("--relay-token: {e}"))
+}
+
 /// Split `host:port` on the LAST ':' (so bracketed IPv6 like `[::1]:443`
 /// works) and validate the port.
 fn parse_host_port(s: &str) -> Result<(String, u16), String> {
@@ -224,6 +241,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_nat,
             relay,
             stun,
+            relay_token,
             no_conn_log,
             conn_log_dir,
             conn_log_retention_days,
@@ -232,6 +250,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let path = identity_file.unwrap_or_else(default_identity_path);
             let identity = load_or_create_identity(&path, fresh)?;
             let mut config = Config::default();
+            if let Some(tok) = relay_token {
+                config.relay_token = Some(load_relay_token(&tok)?);
+            }
             if !relay.is_empty() {
                 let mut relays = Vec::with_capacity(relay.len());
                 for r in &relay {
@@ -265,10 +286,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.exit_mode = ExitMode::Custom(guard.session_handler());
                 routing = Some(guard);
             }
+            let routing_key_hex = spora_core::authz::hex_encode(&identity.routing_key);
             let session = share(identity, config).await?;
             println!("Share this URL with the peer that wants to connect:");
             println!("{}", session.url);
             println!("(Identity persisted at {})", path.display());
+            println!(
+                "Routing key: {} (give this to your relay operator if the relay requires authorization)",
+                routing_key_hex
+            );
             if let Some(g) = &routing {
                 println!(
                     "OS routing enabled: client traffic is forwarded by the kernel via {}.",

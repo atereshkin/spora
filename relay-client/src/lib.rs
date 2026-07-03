@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use log::warn;
 
+pub mod authz;
 pub mod protocol;
 
 pub use protocol::ROUTING_KEY_LEN;

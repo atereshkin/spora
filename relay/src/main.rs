@@ -34,6 +34,13 @@ struct Args {
     /// Session-log retention in days; older sessions are swept.
     #[arg(long, default_value_t = 90, conflicts_with = "no_session_log")]
     session_log_retention_days: u32,
+    /// Require capability-token authorization. Repeatable: each value is a
+    /// base64url issuer public key (from `spora-issuer gen`). When omitted the
+    /// relay runs in OPEN mode — any validly self-signed registration is
+    /// accepted. When given, a sharer must present a capability token signed by
+    /// one of these issuers and bound to its routing key.
+    #[arg(long = "issuer-key", value_name = "BASE64_PUBKEY")]
+    issuer_keys: Vec<String>,
 }
 
 /// Where the session log lives when `--session-log` is not given. Prefers
@@ -91,6 +98,28 @@ async fn main() {
         }
     } else {
         info!("session log DISABLED (--no-session-log)");
+    }
+
+    // Authorization: with no issuer keys the relay stays in open mode (any valid
+    // registration accepted). With one or more, registrations must carry a valid
+    // capability token — see relay_client::authz.
+    let issuer_keys = args
+        .issuer_keys
+        .iter()
+        .map(|s| relay_client::authz::decode_pubkey(s))
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap_or_else(|e| {
+            eprintln!("relay: invalid --issuer-key: {e}");
+            std::process::exit(1);
+        });
+    if issuer_keys.is_empty() {
+        info!("authorization DISABLED (open mode): any valid registration is accepted");
+    } else {
+        info!(
+            "authorization ENABLED: {} trusted issuer key(s)",
+            issuer_keys.len()
+        );
+        state = state.with_issuer_keys(issuer_keys);
     }
 
     let socket = bind_relay_socket(bind).unwrap_or_else(|e| panic!("bind {} failed: {}", bind, e));

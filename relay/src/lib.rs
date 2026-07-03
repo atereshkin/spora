@@ -22,6 +22,7 @@ use std::time::{Duration, Instant};
 use log::{debug, info, warn};
 use tokio::net::UdpSocket;
 
+use relay_client::authz::{self, ISSUER_PUBKEY_LEN};
 use relay_client::protocol::{self, Classified, ROUTING_KEY_LEN};
 
 pub mod sessionlog;
@@ -73,6 +74,12 @@ pub struct State {
     registration_timeout: Duration,
     flow_timeout: Duration,
     sweep_interval: Duration,
+    /// Trusted capability-token issuer public keys. **Empty means open mode**:
+    /// any validly self-signed registration is accepted (today's behavior).
+    /// When non-empty, a registration must carry a capability token that is
+    /// signed by one of these issuers, marked allowed, and bound to the routing
+    /// key being registered — see [`authz`].
+    issuer_keys: Vec<[u8; ISSUER_PUBKEY_LEN]>,
     /// Optional persistent session log (off by default; the deployed binary
     /// attaches one). Records each matched flow for operator accountability —
     /// see [`sessionlog`].
@@ -129,6 +136,7 @@ impl State {
             registration_timeout,
             flow_timeout,
             sweep_interval,
+            issuer_keys: Vec::new(),
             session_log: None,
         }
     }
@@ -139,6 +147,20 @@ impl State {
     pub fn with_session_log(mut self, log: SessionLog) -> State {
         self.session_log = Some(log);
         self
+    }
+
+    /// Require capability-token authorization, trusting the given issuer public
+    /// keys. Builder-style; passing an empty set leaves the relay in open mode.
+    /// See [`authz`] and [`State::handle_control`].
+    pub fn with_issuer_keys(mut self, keys: Vec<[u8; ISSUER_PUBKEY_LEN]>) -> State {
+        self.issuer_keys = keys;
+        self
+    }
+
+    /// Whether the relay requires capability-token authorization (i.e. it has at
+    /// least one trusted issuer key configured).
+    pub fn requires_authorization(&self) -> bool {
+        !self.issuer_keys.is_empty()
     }
 
     /// Decide what to do with a packet from `src`. Updates internal state
@@ -300,13 +322,28 @@ impl State {
                 // Verify the signature and that the routing key commits to the
                 // presented cert. We hold no secret — this only proves the
                 // registration was authorized by the key the routing key pins.
-                let (rk, ts) = match protocol::verify_signed_register(body) {
+                let (rk, ts, token) = match protocol::verify_signed_register(body) {
                     Ok(v) => v,
                     Err(e) => {
                         warn!("rejecting REGISTER from {}: {:?}", src, e);
                         return;
                     }
                 };
+                // Authorization: in authorized mode (issuer keys configured) the
+                // registration must carry a valid capability token bound to this
+                // routing key. The registration signature above already proved
+                // possession of the key, so a token that names this routing key
+                // is non-transferable. In open mode (no issuer keys) any token
+                // (including none) is accepted — today's behavior.
+                if !self.issuer_keys.is_empty()
+                    && let Err(e) = authz::verify_token(token, &rk, &self.issuer_keys)
+                {
+                    warn!(
+                        "rejecting unauthorized REGISTER for rk {:x?} from {}: {:?}",
+                        &rk[..4], src, e
+                    );
+                    return;
+                }
                 // Replay guard: the signed timestamp must strictly exceed the
                 // last one accepted for this key. A captured registration
                 // replayed (e.g. from an attacker's address) carries an
@@ -414,6 +451,14 @@ mod tests {
     fn registrar() -> RegisterSigner {
         let ck = rcgen::generate_simple_self_signed(vec!["spora.peer".to_string()]).unwrap();
         RegisterSigner::new(&ck.cert.der().to_vec(), &ck.key_pair.serialize_der()).unwrap()
+    }
+
+    /// A registrar carrying a valid "allowed" capability token issued for its
+    /// own routing key by `issuer`.
+    fn authorized_registrar(issuer: &authz::IssuerKeyPair) -> RegisterSigner {
+        let signer = registrar();
+        let token = issuer.issue(&signer.routing_key());
+        signer.with_token(Some(token))
     }
 
     fn initial_with_dcid(dcid: &[u8]) -> Vec<u8> {
@@ -763,6 +808,74 @@ mod tests {
             s.handle_packet(b, &initial_with_dcid(&key), now),
             Action::Forward(sharer)
         );
+    }
+
+    // --- Capability-token authorization ---
+
+    #[test]
+    fn open_mode_accepts_tokenless_registration() {
+        // No issuer keys configured => open mode: a plain (tokenless) signed
+        // registration is accepted, exactly as before authz existed.
+        let mut s = State::default();
+        assert!(!s.requires_authorization());
+        let mut reg = registrar();
+        s.handle_packet(addr("10.0.0.1:1"), &reg.next_register_packet(), Instant::now());
+        assert_eq!(s.registration_count(), 1);
+    }
+
+    #[test]
+    fn authorized_mode_rejects_tokenless_registration() {
+        let issuer = authz::IssuerKeyPair::generate().unwrap();
+        let mut s = State::default().with_issuer_keys(vec![issuer.public_key()]);
+        assert!(s.requires_authorization());
+        // A perfectly valid signed registration, but with no capability token.
+        let mut reg = registrar();
+        s.handle_packet(addr("10.0.0.1:1"), &reg.next_register_packet(), Instant::now());
+        assert_eq!(s.registration_count(), 0, "tokenless register must be refused when gated");
+    }
+
+    #[test]
+    fn authorized_mode_accepts_valid_token_and_routes() {
+        let issuer = authz::IssuerKeyPair::generate().unwrap();
+        let mut s = State::default().with_issuer_keys(vec![issuer.public_key()]);
+        let now = Instant::now();
+        let a = addr("10.0.0.1:1111");
+        let b = addr("10.0.0.2:2222");
+
+        let mut reg = authorized_registrar(&issuer);
+        let key = reg.routing_key();
+        s.handle_packet(a, &reg.next_register_packet(), now);
+        assert_eq!(s.registration_count(), 1, "valid token must be accepted");
+
+        // ...and the authorized sharer routes a client normally.
+        assert_eq!(s.handle_packet(b, &initial_with_dcid(&key), now), Action::Forward(a));
+    }
+
+    #[test]
+    fn authorized_mode_rejects_token_from_untrusted_issuer() {
+        let trusted = authz::IssuerKeyPair::generate().unwrap();
+        let rogue = authz::IssuerKeyPair::generate().unwrap();
+        let mut s = State::default().with_issuer_keys(vec![trusted.public_key()]);
+        // Token signed by an issuer the relay does not trust.
+        let mut reg = authorized_registrar(&rogue);
+        s.handle_packet(addr("10.0.0.1:1"), &reg.next_register_packet(), Instant::now());
+        assert_eq!(s.registration_count(), 0, "untrusted-issuer token must be refused");
+    }
+
+    #[test]
+    fn authorized_mode_rejects_token_bound_to_a_different_key() {
+        // A token is bound to a routing key (its subject). Attaching a token
+        // issued for someone else's key to my own registration is refused, so a
+        // token cannot be transplanted onto a different identity.
+        let issuer = authz::IssuerKeyPair::generate().unwrap();
+        let mut s = State::default().with_issuer_keys(vec![issuer.public_key()]);
+        // A token issued for a foreign routing key, attached to our signer.
+        let foreign_key = registrar().routing_key();
+        let token = issuer.issue(&foreign_key);
+        let mut reg = registrar().with_token(Some(token));
+        assert_ne!(reg.routing_key(), foreign_key);
+        s.handle_packet(addr("10.0.0.1:1"), &reg.next_register_packet(), Instant::now());
+        assert_eq!(s.registration_count(), 0, "token bound to another key must be refused");
     }
 
     #[test]

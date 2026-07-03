@@ -4613,6 +4613,7 @@ dependencies = [
 name = "relay-client"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "log",
  "rcgen",
  "ring",

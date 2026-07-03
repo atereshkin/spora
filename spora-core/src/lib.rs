@@ -38,6 +38,10 @@ use crate::transport::DialFuture;
 use crate::transport::ReconnectTransport;
 pub use crate::server::is_local_address;
 pub use crate::transport::IpTransport;
+/// Capability-token authorization helpers (issuer keys, token encode/decode).
+/// Re-exported so platform front-ends can present a `Config::relay_token`
+/// without depending on `relay-client` directly.
+pub use relay_client::authz;
 
 /// Callback invoked once after the end-to-end QUIC connection's PMTUD has
 /// converged. The application can use this to configure its TUN device.
@@ -210,6 +214,12 @@ pub struct Config {
     /// enable it by default with a platform-appropriate directory. When set
     /// but unwritable, `share()` fails loudly rather than running unlogged.
     pub conn_log: Option<ConnLogConfig>,
+    /// Share side only: an opaque capability token attached to every relay
+    /// registration, proving this sharer is authorized to use the relay(s).
+    /// `None` registers in open mode (accepted by relays configured without
+    /// issuer keys). Obtain one from the relay operator; see
+    /// `relay_client::authz`.
+    pub relay_token: Option<Vec<u8>>,
 }
 
 impl Default for Config {
@@ -224,6 +234,7 @@ impl Default for Config {
             event_hook: None,
             enable_direct_upgrade: true,
             conn_log: None,
+            relay_token: None,
         }
     }
 }
@@ -296,7 +307,8 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     // reject an on-path attacker's attempt to rebind it.
     let signer =
         relay_client::protocol::RegisterSigner::new(&identity.cert_der_bytes, &identity.key_der_bytes)
-            .map_err(|e| format!("build register signer: {}", e))?;
+            .map_err(|e| format!("build register signer: {}", e))?
+            .with_token(config.relay_token.clone());
 
     // Connection log: opened before the share goes live, so a default-on log
     // that cannot be written fails here loudly instead of running unlogged.

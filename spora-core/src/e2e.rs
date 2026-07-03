@@ -322,6 +322,17 @@ mod tests {
         relay_addr: SocketAddr,
         identity: &Identity,
     ) -> (std::net::UdpSocket, tokio::task::JoinHandle<()>) {
+        split_a_socket_token(std_sock, relay_addr, identity, None)
+    }
+
+    /// Like [`split_a_socket`] but attaches a capability `token` to every
+    /// registration (for authz scenarios). `None` registers in open mode.
+    fn split_a_socket_token(
+        std_sock: std::net::UdpSocket,
+        relay_addr: SocketAddr,
+        identity: &Identity,
+        token: Option<Vec<u8>>,
+    ) -> (std::net::UdpSocket, tokio::task::JoinHandle<()>) {
         let clone = std_sock.try_clone().expect("try_clone");
         clone.set_nonblocking(true).unwrap();
         let tokio_clone = TokioUdp::from_std(clone).unwrap();
@@ -329,7 +340,8 @@ mod tests {
             &identity.cert_der_bytes,
             &identity.key_der_bytes,
         )
-        .expect("register signer");
+        .expect("register signer")
+        .with_token(token);
         let h = tokio::spawn(relay_client::register_loop(
             Arc::new(tokio_clone),
             vec![relay_addr],
@@ -423,6 +435,61 @@ mod tests {
 
         let result = client_connect(&b_endpoint, relay_addr, &identity.secret, true).await;
         assert!(result.is_err(), "should fail when no A is registered");
+    }
+
+    #[tokio::test]
+    async fn e2e_authz_gated_relay_requires_a_valid_token() {
+        // End-to-end over real sockets: a relay configured with an issuer key
+        // only routes sharers that present a valid capability token. A tokenless
+        // sharer's registration is refused, so the client cannot be routed to it
+        // (its Initial is dropped and the handshake times out); an authorized
+        // sharer connects normally.
+        let _ = env_logger::builder().is_test(true).try_init();
+        let issuer = relay_client::authz::IssuerKeyPair::generate().unwrap();
+        let relay_sock = TokioUdp::bind("127.0.0.1:0").await.unwrap();
+        let relay_addr = relay_sock.local_addr().unwrap();
+        let state = relay::State::default().with_issuer_keys(vec![issuer.public_key()]);
+        let _relay_h = tokio::spawn(relay::serve(relay_sock, state));
+
+        let identity = Identity::generate();
+        let routing_key = identity.routing_key;
+        let secret = identity.secret;
+
+        // Unauthorized: no token -> gated relay refuses the registration.
+        let a_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        a_std.set_nonblocking(true).unwrap();
+        let (a_for_quinn, reg_h) = split_a_socket_token(a_std, relay_addr, &identity, None);
+        let _a_endpoint = server_endpoint(a_for_quinn, &identity, &Timings::default()).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let b_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        b_std.set_nonblocking(true).unwrap();
+        let b_endpoint = client_endpoint(b_std, routing_key, &Timings::default()).unwrap();
+        let unauthorized = client_connect(&b_endpoint, relay_addr, &secret, true).await;
+        assert!(
+            unauthorized.is_err(),
+            "a tokenless sharer must be unreachable via a gated relay"
+        );
+        reg_h.abort();
+
+        // Authorized: a valid token for this routing key -> relay routes it.
+        let token = issuer.issue(&routing_key);
+        let a2_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        a2_std.set_nonblocking(true).unwrap();
+        let (a2_for_quinn, _reg_h2) =
+            split_a_socket_token(a2_std, relay_addr, &identity, Some(token));
+        let a2_endpoint = server_endpoint(a2_for_quinn, &identity, &Timings::default()).unwrap();
+        tokio::time::sleep(Duration::from_millis(150)).await;
+
+        let b2_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        b2_std.set_nonblocking(true).unwrap();
+        let b2_endpoint = client_endpoint(b2_std, routing_key, &Timings::default()).unwrap();
+        let accept_task =
+            tokio::spawn(async move { accept_one(&a2_endpoint, &secret, true).await.unwrap().unwrap() });
+        let _b = client_connect(&b2_endpoint, relay_addr, &secret, true)
+            .await
+            .expect("an authorized sharer must be reachable via the gated relay");
+        let _a = accept_task.await.unwrap();
     }
 
     #[tokio::test]

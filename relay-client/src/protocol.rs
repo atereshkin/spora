@@ -47,20 +47,35 @@ pub fn register_signing_input(
 }
 
 /// Assemble a signed `REGISTER` control packet. Body layout:
-/// `routing_key(20) | timestamp(8, BE) | cert_len(2, BE) | cert_der | signature`.
+/// `routing_key(20) | timestamp(8, BE) | cert_len(2, BE) | cert_der | sig_len(2, BE) | signature | token`.
 /// `signature` is an ECDSA-P256-SHA256 (ASN.1 DER) signature over
 /// [`register_signing_input`], made with the key whose self-signed cert is
 /// `cert_der`. The relay checks `SHA-256(cert_der)[..20] == routing_key`, so
 /// the cert (and thus the verifying key) is pinned by the routing key itself.
+///
+/// `token` is an optional trailing capability token (see [`crate::authz`]);
+/// pass an empty slice for an open-mode (unauthorized) registration. It is
+/// length-delimited only by riding at the end of the control packet, so the
+/// signature is now explicitly length-prefixed to separate the two.
 pub fn build_signed_register(
     routing_key: &[u8; ROUTING_KEY_LEN],
     timestamp_millis: u64,
     cert_der: &[u8],
     signature: &[u8],
+    token: &[u8],
 ) -> Vec<u8> {
     debug_assert!(cert_der.len() <= u16::MAX as usize, "cert too large for u16 length");
+    debug_assert!(signature.len() <= u16::MAX as usize, "signature too large for u16 length");
     let mut pkt = Vec::with_capacity(
-        CTRL_MAGIC.len() + 1 + ROUTING_KEY_LEN + REGISTER_TIMESTAMP_LEN + 2 + cert_der.len() + signature.len(),
+        CTRL_MAGIC.len()
+            + 1
+            + ROUTING_KEY_LEN
+            + REGISTER_TIMESTAMP_LEN
+            + 2
+            + cert_der.len()
+            + 2
+            + signature.len()
+            + token.len(),
     );
     pkt.extend_from_slice(&CTRL_MAGIC);
     pkt.push(ctrl::REGISTER);
@@ -68,7 +83,9 @@ pub fn build_signed_register(
     pkt.extend_from_slice(&timestamp_millis.to_be_bytes());
     pkt.extend_from_slice(&(cert_der.len() as u16).to_be_bytes());
     pkt.extend_from_slice(cert_der);
+    pkt.extend_from_slice(&(signature.len() as u16).to_be_bytes());
     pkt.extend_from_slice(signature);
+    pkt.extend_from_slice(token);
     pkt
 }
 
@@ -78,6 +95,8 @@ struct ParsedRegister<'a> {
     timestamp_millis: u64,
     cert_der: &'a [u8],
     signature: &'a [u8],
+    /// Trailing capability token; empty for an open-mode registration.
+    token: &'a [u8],
 }
 
 fn parse_signed_register(body: &[u8]) -> Option<ParsedRegister<'_>> {
@@ -96,14 +115,25 @@ fn parse_signed_register(body: &[u8]) -> Option<ParsedRegister<'_>> {
         u16::from_be_bytes(body[ROUTING_KEY_LEN + REGISTER_TIMESTAMP_LEN..HEAD].try_into().unwrap())
             as usize;
     let cert_end = HEAD.checked_add(cert_len)?;
-    if body.len() <= cert_end {
-        return None; // need a non-empty signature after the cert
+    // Read the 2-byte signature length that follows the cert.
+    let sig_len_end = cert_end.checked_add(2)?;
+    if body.len() < sig_len_end {
+        return None;
+    }
+    let sig_len = u16::from_be_bytes(body[cert_end..sig_len_end].try_into().unwrap()) as usize;
+    if sig_len == 0 {
+        return None; // signature must be present
+    }
+    let sig_end = sig_len_end.checked_add(sig_len)?;
+    if body.len() < sig_end {
+        return None;
     }
     Some(ParsedRegister {
         routing_key: rk,
         timestamp_millis: ts,
         cert_der: &body[HEAD..cert_end],
-        signature: &body[cert_end..],
+        signature: &body[sig_len_end..sig_end],
+        token: &body[sig_end..], // possibly empty
     })
 }
 
@@ -121,14 +151,17 @@ pub enum RegisterVerifyError {
     BadSignature,
 }
 
-/// Verify a signed `REGISTER` body and return the `(routing_key, timestamp)` it
-/// authorizes. The caller (relay) still enforces freshness (timestamp must
-/// exceed the last accepted one for the key) and source policy. Holding no
-/// secret, the relay can only *verify*: it confirms the routing key commits to
-/// the presented cert and that the cert's key signed this exact registration.
+/// Verify a signed `REGISTER` body and return the `(routing_key, timestamp,
+/// token)` it authorizes. The `token` slice (borrowed from `body`, possibly
+/// empty) is the trailing capability token; the relay passes it to
+/// [`crate::authz::verify_token`] when it is running in authorized mode. The
+/// caller still enforces freshness (timestamp must exceed the last accepted one
+/// for the key), authorization, and source policy. Holding no secret, the relay
+/// can only *verify*: it confirms the routing key commits to the presented cert
+/// and that the cert's key signed this exact registration.
 pub fn verify_signed_register(
     body: &[u8],
-) -> Result<([u8; ROUTING_KEY_LEN], u64), RegisterVerifyError> {
+) -> Result<([u8; ROUTING_KEY_LEN], u64, &[u8]), RegisterVerifyError> {
     let parsed = parse_signed_register(body).ok_or(RegisterVerifyError::Malformed)?;
 
     // The routing key must be the SHA-256 of the cert (truncated to 20 bytes) —
@@ -145,7 +178,7 @@ pub fn verify_signed_register(
     eec.verify_signature(webpki::ring::ECDSA_P256_SHA256, &input, parsed.signature)
         .map_err(|_| RegisterVerifyError::BadSignature)?;
 
-    Ok((parsed.routing_key, parsed.timestamp_millis))
+    Ok((parsed.routing_key, parsed.timestamp_millis, parsed.token))
 }
 
 /// Signs the sharer's periodic registrations with the identity's certificate
@@ -159,6 +192,10 @@ pub struct RegisterSigner {
     cert_der: Vec<u8>,
     routing_key: [u8; ROUTING_KEY_LEN],
     last_ts: u64,
+    /// Trailing capability token attached to every registration; empty means an
+    /// open-mode (unauthorized) registration, which a relay running without
+    /// issuer keys still accepts. See [`crate::authz`].
+    token: Vec<u8>,
 }
 
 impl RegisterSigner {
@@ -181,7 +218,17 @@ impl RegisterSigner {
             cert_der: cert_der.to_vec(),
             routing_key,
             last_ts: 0,
+            token: Vec::new(),
         })
+    }
+
+    /// Attach a capability token to every registration this signer produces
+    /// (see [`crate::authz`]). `None` (or an empty token) keeps registrations in
+    /// open mode. Builder-style so callers can write
+    /// `RegisterSigner::new(..)?.with_token(cfg.relay_token)`.
+    pub fn with_token(mut self, token: Option<Vec<u8>>) -> Self {
+        self.token = token.unwrap_or_default();
+        self
     }
 
     /// The routing key this signer registers (derived from the cert).
@@ -199,7 +246,7 @@ impl RegisterSigner {
             .key_pair
             .sign(&self.rng, &input)
             .expect("ECDSA signing of a fixed-size input does not fail");
-        build_signed_register(&self.routing_key, ts, &self.cert_der, sig.as_ref())
+        build_signed_register(&self.routing_key, ts, &self.cert_der, sig.as_ref(), &self.token)
     }
 }
 
@@ -277,8 +324,9 @@ mod tests {
         match classify(&pkt) {
             Classified::Control { ty, body } => {
                 assert_eq!(ty, ctrl::REGISTER);
-                let (rk, _ts) = verify_signed_register(body).expect("verifies");
+                let (rk, _ts, token) = verify_signed_register(body).expect("verifies");
                 assert_eq!(rk, signer.routing_key());
+                assert!(token.is_empty(), "a plain signer registers open-mode (no token)");
             }
             other => panic!("expected Control, got {:?}", other),
         }
@@ -292,11 +340,25 @@ mod tests {
 
         let p1 = signer.next_register_packet();
         let p2 = signer.next_register_packet();
-        let (rk1, ts1) = verify_signed_register(&body(&p1)).unwrap();
-        let (rk2, ts2) = verify_signed_register(&body(&p2)).unwrap();
+        let (rk1, ts1, _) = verify_signed_register(&body(&p1)).unwrap();
+        let (rk2, ts2, _) = verify_signed_register(&body(&p2)).unwrap();
         assert_eq!(rk1, signer.routing_key());
         assert_eq!(rk2, signer.routing_key());
         assert!(ts2 > ts1, "timestamps must strictly increase ({ts1} -> {ts2})");
+    }
+
+    #[test]
+    fn signed_register_carries_and_surfaces_its_token() {
+        let (cert, key) = test_cert();
+        let token = vec![0xAB; 40];
+        let mut signer = RegisterSigner::new(&cert, &key)
+            .unwrap()
+            .with_token(Some(token.clone()));
+        let pkt = signer.next_register_packet();
+        let body = &pkt[CTRL_MAGIC.len() + 1..];
+        let (rk, _ts, got) = verify_signed_register(body).expect("verifies");
+        assert_eq!(rk, signer.routing_key());
+        assert_eq!(got, &token[..], "the exact token must round-trip after the signature");
     }
 
     #[test]
