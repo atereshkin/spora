@@ -284,13 +284,33 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
         .map(|(a, _)| *a)
         .collect();
 
+    // A `Direct` (relay-less) sharer must bind the advertised port so clients
+    // can dial it; a relay-only sharer keeps an ephemeral port (0). One socket
+    // means one port, so all Direct endpoints must agree on it.
+    let direct_ports: std::collections::BTreeSet<u16> = config
+        .relays
+        .iter()
+        .filter(|r| !r.protocol.is_relayed())
+        .map(|r| r.port)
+        .collect();
+    let bind_port = match direct_ports.len() {
+        0 => 0,
+        1 => *direct_ports.iter().next().unwrap(),
+        _ => {
+            return Err(format!(
+                "share: all direct endpoints must use one port (a single socket), got {:?}",
+                direct_ports
+            ));
+        }
+    };
+
     // One socket serves quinn (accepting clients forwarded by ANY relay, or
     // dialing us directly) and registration with all relays. It must be
     // dual-stack when the endpoint set spans families, so a single socket can
     // send to both v4 and v6 relays (v4 as v4-mapped) and receive Initials from
     // either; a pure-v4 set keeps a plain v4 socket (unchanged behavior).
     let want_v6 = resolved.iter().any(|(a, _)| a.is_ipv6());
-    let std_socket = bind_share_udp(&config.protector, want_v6)?;
+    let std_socket = bind_share_udp(&config.protector, want_v6, bind_port)?;
     let std_clone = std_socket
         .try_clone()
         .map_err(|e| format!("socket try_clone: {}", e))?;
@@ -1227,17 +1247,24 @@ fn resolve_relays_preferring_v6(
 /// bind `::` dual-stack (IPV6_V6ONLY off) so one socket reaches relays of both
 /// families and receives Initials forwarded by any of them; a pure-v4 relay
 /// set keeps a plain `0.0.0.0` socket. Applies the FD protector.
-fn bind_share_udp(protector: &SocketProtector, want_v6: bool) -> Result<std::net::UdpSocket, String> {
+fn bind_share_udp(
+    protector: &SocketProtector,
+    want_v6: bool,
+    port: u16,
+) -> Result<std::net::UdpSocket, String> {
+    // `port` is 0 (ephemeral) for a relay-only sharer, or the advertised port a
+    // `Direct` (relay-less) sharer must bind so clients can dial it.
     let std = if want_v6 {
         let sock = socket2::Socket::new(socket2::Domain::IPV6, socket2::Type::DGRAM, None)
             .map_err(|e| format!("create v6 socket: {}", e))?;
         sock.set_only_v6(false)
             .map_err(|e| format!("set_only_v6(false): {}", e))?;
-        sock.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)).into())
-            .map_err(|e| format!("bind [::]:0: {}", e))?;
+        sock.bind(&SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, port)).into())
+            .map_err(|e| format!("bind [::]:{}: {}", port, e))?;
         std::net::UdpSocket::from(sock)
     } else {
-        std::net::UdpSocket::bind(("0.0.0.0", 0)).map_err(|e| format!("bind 0.0.0.0:0: {}", e))?
+        std::net::UdpSocket::bind(("0.0.0.0", port))
+            .map_err(|e| format!("bind 0.0.0.0:{}: {}", port, e))?
     };
     std.set_nonblocking(true)
         .map_err(|e| format!("set_nonblocking: {}", e))?;

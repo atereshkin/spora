@@ -206,6 +206,81 @@ async fn udp_echo_over_v6_loopback_relay() {
     session.abort();
 }
 
+/// Relay-less DIRECT sharing: no relay anywhere in the path. The sharer binds
+/// its advertised port and serves `connect()` directly; the client dials the
+/// `direct/` URL straight to it. Exercises the `Direct` carrier on both sides
+/// (DirectRelayClient + the sharer-side advertised-port bind) plus the full
+/// transport composition, with zero relay bandwidth.
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_echo_over_relayless_direct() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // A free loopback UDP port for the sharer to bind and advertise.
+    let port = {
+        let s = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        s.local_addr().unwrap().port()
+    };
+    let direct = spora_core::identity::RelayEndpoint::with_protocol(
+        "127.0.0.1",
+        port,
+        spora_core::identity::RelayProtocol::Direct,
+    );
+
+    // No relay is spawned. The upgrade is disabled: the session is already
+    // direct, so there is nothing to punch (and STUN is never hit).
+    let mut opts = LabPeerOpts::new("127.0.0.1:0".parse().unwrap(), "127.0.0.1:3478");
+    opts.enable_direct_upgrade = false;
+
+    let (mut share_cfg, _share_events) = opts.config();
+    share_cfg.relays = vec![direct];
+    share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
+    let session = spora_core::share(Identity::generate(), share_cfg)
+        .await
+        .expect("relay-less share() starts");
+    assert!(
+        session
+            .url
+            .as_str()
+            .contains(&format!("r=direct/127.0.0.1:{port}")),
+        "URL must advertise the direct endpoint, got {}",
+        session.url
+    );
+
+    let (client_cfg, _client_events) = opts.config();
+    let connected = spora_core::connect(session.url.clone(), &client_cfg)
+        .await
+        .expect("connect() establishes a relay-less direct session");
+
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pump = tokio::spawn(peers::drive_client(connected, cmd_rx));
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(TrafficCmd::UdpEcho {
+            server: FAKE_SERVER.into(),
+            count: 20,
+            payload_len: 64,
+            respond: tx,
+        })
+        .expect("pump is alive");
+    let stats = tokio::time::timeout(Duration::from_secs(30), rx)
+        .await
+        .expect("echo finishes within the deadline")
+        .expect("pump answers the command")
+        .expect("echo run succeeds");
+    assert_eq!(
+        stats.received, 20,
+        "echo lost packets over the direct path: {stats:?}"
+    );
+
+    drop(cmd_tx);
+    tokio::time::timeout(Duration::from_secs(5), pump)
+        .await
+        .expect("pump exits when the command channel closes")
+        .unwrap();
+    session.abort();
+}
+
 /// Spawn a bare dumb relay on `bind` (loopback), returning its bound address.
 async fn spawn_relay(bind: &str) -> std::net::SocketAddr {
     let sock = tokio::net::UdpSocket::bind(bind)

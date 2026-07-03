@@ -69,6 +69,13 @@ enum Mode {
         /// two relays.
         #[arg(long)]
         relay: Vec<String>,
+        /// Advertise a relay-less DIRECT endpoint (host:port) clients can dial
+        /// straight to this sharer — no relay, no relay bandwidth. The sharer
+        /// binds this port, so it must be publicly reachable. Repeat for
+        /// several advertised addresses (they must share one port). Combine
+        /// with --relay for a mix, or use alone for pure relay-less sharing.
+        #[arg(long)]
+        direct: Vec<String>,
         /// Override the STUN server (host:port) used for direct-upgrade
         /// endpoint discovery.
         #[arg(long)]
@@ -240,6 +247,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tun_mtu,
             no_nat,
             relay,
+            direct,
             stun,
             relay_token,
             no_conn_log,
@@ -253,12 +261,23 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if let Some(tok) = relay_token {
                 config.relay_token = Some(load_relay_token(&tok)?);
             }
-            if !relay.is_empty() {
-                let mut relays = Vec::with_capacity(relay.len());
-                for r in &relay {
-                    let (host, port) = parse_host_port(r).map_err(|e| format!("--relay: {}", e))?;
-                    relays.push(spora_core::identity::RelayEndpoint::new(host, port));
-                }
+            // --relay (UDP-QUIC) and --direct (relay-less) endpoints compose into
+            // one preference-ordered list; if any is given it replaces the
+            // built-in default relay.
+            let mut relays = Vec::with_capacity(relay.len() + direct.len());
+            for r in &relay {
+                let (host, port) = parse_host_port(r).map_err(|e| format!("--relay: {}", e))?;
+                relays.push(spora_core::identity::RelayEndpoint::new(host, port));
+            }
+            for d in &direct {
+                let (host, port) = parse_host_port(d).map_err(|e| format!("--direct: {}", e))?;
+                relays.push(spora_core::identity::RelayEndpoint::with_protocol(
+                    host,
+                    port,
+                    spora_core::identity::RelayProtocol::Direct,
+                ));
+            }
+            if !relays.is_empty() {
                 config.relays = relays;
             }
             if let Some(stun) = stun {
