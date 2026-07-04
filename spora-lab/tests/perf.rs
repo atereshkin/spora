@@ -40,6 +40,8 @@ fn main() {
         "perf",
         spora_lab::scenarios![
             relay_saturation,
+            relay_tcp_saturation,
+            relay_loss_compare,
             direct_saturation,
             bdp_window,
             latency_overhead,
@@ -173,6 +175,33 @@ fn shaped_saturation(client: &ClientHandle, path: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// A `TcpTls` relay endpoint at the WAN TCP relay.
+fn tcp_relay_endpoint(addr: std::net::SocketAddr) -> spora_core::identity::RelayEndpoint {
+    spora_core::identity::RelayEndpoint::with_protocol(
+        addr.ip().to_string(),
+        addr.port(),
+        spora_core::identity::RelayProtocol::TcpTls,
+    )
+}
+
+/// Download then upload over an established tunnel, recording report-only
+/// `{download,upload}_mbps.<path>.<cond>`, returning `(dl_mbps, ul_mbps)`. Uses
+/// smaller transfers than the gated `shaped_saturation` so the lossy/high-delay
+/// A/B stays inside the timeout.
+fn measure_saturation(
+    client: &ClientHandle,
+    path: &str,
+    cond: &str,
+) -> Result<(f64, f64), String> {
+    let dl = client.tcp_download(svc(TCP_SOURCE_PORT), 8 * MIB, perf_opts(), BULK_TIMEOUT)?;
+    let dl_mbps = dl.throughput_mbps();
+    metrics::record(&format!("download_mbps.{path}.{cond}"), dl_mbps, "mbps", false, 0.0);
+    let ul = client.tcp_upload(svc(TCP_SINK_PORT), 4 * MIB, perf_opts(), BULK_TIMEOUT)?;
+    let ul_mbps = ul.throughput_mbps();
+    metrics::record(&format!("upload_mbps.{path}.{cond}"), ul_mbps, "mbps", false, 0.0);
+    Ok((dl_mbps, ul_mbps))
+}
+
 // ---------------------------------------------------------------------------
 // 1. relay_saturation
 
@@ -211,6 +240,86 @@ fn relay_saturation() -> Result<(), String> {
 
     client.stop();
     sharer.stop();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 1b. TCP/TLS relay carrier — the A/B against the UDP relay
+
+/// TCP/TLS-relay saturation on the SAME clean shaped link as `relay_saturation`
+/// (50 Mbit/s + 5 ms), recorded report-only as `*.relay_tcp.shaped50`. On a
+/// loss-free link the stream carrier should reach roughly the UDP relay's
+/// goodput — this measures the fixed overhead (TLS + framing + splice), NOT the
+/// head-of-line penalty (that needs loss; see `relay_loss_compare`).
+fn relay_tcp_saturation() -> Result<(), String> {
+    let topo = Topology::build(&TopologySpec::new(
+        NatKind::PortRestricted,
+        NatKind::PortRestricted,
+    ))?;
+    let wan = services::start_wan(&topo.wan, relay::State::default)?;
+    shape_client_leg(&topo, "rate 50mbit delay 5ms")?;
+
+    let mut opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
+    opts.enable_direct_upgrade = false;
+    opts.relays = vec![tcp_relay_endpoint(wan.tcp_relay_addr())];
+
+    let (sharer, client, setup) = establish(&topo, &opts)?;
+    metrics::record("setup_time_s.relay_tcp.shaped50", setup.as_secs_f64(), "s", false, 50.0);
+    let (dl, ul) = measure_saturation(&client, "relay_tcp", "shaped50")?;
+    log::info!("relay_tcp shaped50: download {dl:.1} Mbit/s, upload {ul:.1} Mbit/s");
+    if dl <= 0.0 || ul <= 0.0 {
+        return Err(format!("tcp relay produced no throughput (dl {dl:.1}, ul {ul:.1})"));
+    }
+    client.stop();
+    sharer.stop();
+    Ok(())
+}
+
+/// The headline comparison: UDP-QUIC relay vs TCP/TLS relay through a LOSSY
+/// client leg (50 Mbit/s, 25 ms delay, 3% loss), where TCP head-of-line
+/// blocking and TCP-over-TCP retransmit stacking actually bite. Both legs are
+/// measured on the same shaping over fresh topologies; the ratio is recorded as
+/// `loss_download_ratio.udp_over_tcp` and logged. Report-only (this quantifies a
+/// known trade-off; it is not a regression gate).
+fn relay_loss_compare() -> Result<(), String> {
+    const SPEC: &str = "rate 50mbit delay 25ms loss 3%";
+
+    let measure = |use_tcp: bool| -> Result<(f64, f64), String> {
+        let topo = Topology::build(&TopologySpec::new(
+            NatKind::PortRestricted,
+            NatKind::PortRestricted,
+        ))?;
+        let wan = services::start_wan(&topo.wan, relay::State::default)?;
+        shape_client_leg(&topo, SPEC)?;
+        let mut opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
+        opts.enable_direct_upgrade = false;
+        let path = if use_tcp {
+            opts.relays = vec![tcp_relay_endpoint(wan.tcp_relay_addr())];
+            "relay_tcp"
+        } else {
+            "relay"
+        };
+        let (sharer, client, _setup) = establish(&topo, &opts)?;
+        let out = measure_saturation(&client, path, "lossy");
+        client.stop();
+        sharer.stop();
+        out
+    };
+
+    let (dl_udp, ul_udp) = measure(false)?;
+    let (dl_tcp, ul_tcp) = measure(true)?;
+
+    let dl_ratio = if dl_tcp > 0.01 { dl_udp / dl_tcp } else { f64::INFINITY };
+    let ul_ratio = if ul_tcp > 0.01 { ul_udp / ul_tcp } else { f64::INFINITY };
+    metrics::record("loss_download_ratio.udp_over_tcp", dl_ratio, "x", false, 0.0);
+    metrics::record("loss_upload_ratio.udp_over_tcp", ul_ratio, "x", false, 0.0);
+    log::info!(
+        "LOSS A/B ({SPEC}): download UDP {dl_udp:.1} vs TCP {dl_tcp:.1} Mbit/s ({dl_ratio:.1}x); \
+         upload UDP {ul_udp:.1} vs TCP {ul_tcp:.1} Mbit/s ({ul_ratio:.1}x)"
+    );
+    if dl_tcp <= 0.0 {
+        return Err("tcp relay produced no download throughput under loss".into());
+    }
     Ok(())
 }
 

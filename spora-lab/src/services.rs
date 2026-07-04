@@ -97,6 +97,14 @@ impl WanHandle {
         self.relay_addr
     }
 
+    /// The TCP/TLS relay carrier's endpoint (`WAN_SERVICES_IP:RELAY_PORT`, TCP).
+    /// Started alongside the UDP relay by [`start_wan`]; used by the perf suite
+    /// to A/B the two carriers.
+    pub fn tcp_relay_addr(&self) -> std::net::SocketAddr {
+        let ip: Ipv4Addr = WAN_SERVICES_IP.parse().expect("WAN_SERVICES_IP parses");
+        SocketAddr::from((ip, RELAY_PORT))
+    }
+
     /// The relay's IPv6 endpoint. Only meaningful under [`start_wan_dual`]
     /// (one dual-stack relay socket serves both families — peers reach it
     /// via either service address).
@@ -177,6 +185,11 @@ where
                 tokio::spawn(tcp_source(bind_tcp(ip, TCP_SOURCE_PORT).await?));
                 tokio::spawn(tcp_sink(bind_tcp(ip, TCP_SINK_PORT).await?));
             }
+            // TCP/TLS relay carrier, alongside the UDP relay (same port, TCP).
+            tokio::spawn(relay::tcp::serve_tcp(
+                bind_tcp(svc_ip, RELAY_PORT).await?,
+                relay::tcp::TcpRelayState::new(),
+            ));
             bind_relay(svc_ip, dual_stack).await
         }
         .await;
