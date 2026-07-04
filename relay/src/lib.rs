@@ -26,6 +26,7 @@ use relay_client::authz::{self, ISSUER_PUBKEY_LEN};
 use relay_client::protocol::{self, Classified, ROUTING_KEY_LEN};
 
 pub mod sessionlog;
+pub mod tcp;
 use sessionlog::{SessionLog, SessionState};
 
 pub const REGISTRATION_TIMEOUT: Duration = Duration::from_secs(120);

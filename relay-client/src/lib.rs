@@ -7,6 +7,7 @@ use log::warn;
 
 pub mod authz;
 pub mod protocol;
+pub mod tcp;
 
 pub use protocol::ROUTING_KEY_LEN;
 
