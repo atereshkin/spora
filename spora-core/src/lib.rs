@@ -393,6 +393,8 @@ fn spawn_tcp_registrars(
 ) {
     // Connections kept parked per relay so a client always finds one.
     const POOL_SIZE: usize = 4;
+    // Capability token presented in each REGISTER; empty for an open-mode relay.
+    let token = config.relay_token.clone().unwrap_or_default();
     for relay in config
         .relays
         .iter()
@@ -413,6 +415,7 @@ fn spawn_tcp_registrars(
                     session_tx.clone(),
                     cancel.clone(),
                     config.protector.clone(),
+                    token.clone(),
                 ));
             }
         }
@@ -427,19 +430,27 @@ async fn tcp_park_worker(
     session_tx: tokio::sync::mpsc::UnboundedSender<carrier::PeerSession>,
     cancel: CancellationToken,
     protector: SocketProtector,
+    token: Vec<u8>,
 ) {
     loop {
         if cancel.is_cancelled() {
             return;
         }
-        match park_and_accept(relay_addr, identity.as_ref(), &protector, &cancel).await {
+        match park_and_accept(relay_addr, identity.as_ref(), &protector, &token, &cancel).await {
             Ok(Some(session)) => {
                 if session_tx.send(session).is_err() {
                     return; // the share loop is gone
                 }
             }
-            // The parked connection was reaped (idle) — re-park immediately.
-            Ok(None) => {}
+            // Reaped (idle) or refused (a gated relay rejecting a bad/absent
+            // token) — re-park after a short pause so a refusal doesn't become a
+            // tight reconnect loop.
+            Ok(None) => {
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_millis(500)) => {}
+                }
+            }
             Err(e) => {
                 debug!("tcp registrar {}: {}", relay_addr, e);
                 tokio::select! {
@@ -458,6 +469,7 @@ async fn park_and_accept(
     relay_addr: SocketAddr,
     identity: &Identity,
     protector: &SocketProtector,
+    token: &[u8],
     cancel: &CancellationToken,
 ) -> Result<Option<carrier::PeerSession>, String> {
     use tokio::io::AsyncWriteExt;
@@ -469,6 +481,7 @@ async fn park_and_accept(
     tcp.write_all(&relay_client::tcp::build_preamble(
         relay_client::tcp::role::REGISTER,
         &identity.routing_key,
+        token,
     ))
     .await
     .map_err(|e| format!("register preamble: {}", e))?;

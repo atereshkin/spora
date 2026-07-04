@@ -124,7 +124,7 @@ async fn main() {
             "authorization ENABLED: {} trusted issuer key(s)",
             issuer_keys.len()
         );
-        state = state.with_issuer_keys(issuer_keys);
+        state = state.with_issuer_keys(issuer_keys.clone());
     }
 
     // Optionally serve the TCP/TLS carrier alongside the UDP relay.
@@ -135,7 +135,7 @@ async fn main() {
                 info!("tcp-relay listening on TCP {tcp_bind}");
                 tokio::spawn(relay::tcp::serve_tcp(
                     listener,
-                    relay::tcp::TcpRelayState::new(),
+                    relay::tcp::TcpRelayState::with_issuer_keys(issuer_keys),
                 ));
             }
             Err(e) => {

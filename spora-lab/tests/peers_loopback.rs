@@ -382,6 +382,90 @@ async fn udp_echo_over_tcp_tls_relay() {
     session.abort();
 }
 
+/// End-to-end authorization over the TCP/TLS relay: a gated relay (issuer key
+/// configured) parks — and thus serves — only a sharer presenting a valid
+/// capability token bound to its routing key. Without one, the sharer's REGISTER
+/// is refused, so it never parks and the client cannot be routed to it.
+#[tokio::test(flavor = "multi_thread")]
+async fn tcp_tls_gated_relay_requires_a_valid_token() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    let issuer = spora_core::authz::IssuerKeyPair::generate().unwrap();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = listener.local_addr().unwrap();
+    let state = relay::tcp::TcpRelayState::with_issuer_keys(vec![issuer.public_key()]);
+    tokio::spawn(relay::tcp::serve_tcp(listener, state));
+
+    let tcp_ep = spora_core::identity::RelayEndpoint::with_protocol(
+        "127.0.0.1",
+        relay_addr.port(),
+        spora_core::identity::RelayProtocol::TcpTls,
+    );
+    let opts = {
+        let mut o = LabPeerOpts::new("127.0.0.1:0".parse().unwrap(), "stun.invalid:3478");
+        o.enable_direct_upgrade = false;
+        o
+    };
+
+    // --- Authorized: a valid token for the sharer's routing key -> reachable ---
+    let identity = Identity::generate();
+    let token = issuer.issue(&identity.routing_key);
+    let (mut share_cfg, _e) = opts.config();
+    share_cfg.relays = vec![tcp_ep.clone()];
+    share_cfg.relay_token = Some(token);
+    share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
+    let session = spora_core::share(identity, share_cfg)
+        .await
+        .expect("authorized share() starts");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (client_cfg, _ce) = opts.config();
+    let connected = spora_core::connect(session.url.clone(), &client_cfg)
+        .await
+        .expect("an authorized sharer must be reachable via the gated tcp relay");
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pump = tokio::spawn(peers::drive_client(connected, cmd_rx));
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(TrafficCmd::UdpEcho {
+            server: FAKE_SERVER.into(),
+            count: 5,
+            payload_len: 64,
+            respond: tx,
+        })
+        .unwrap();
+    let stats = tokio::time::timeout(Duration::from_secs(20), rx)
+        .await
+        .expect("echo finishes")
+        .expect("pump answers")
+        .expect("echo succeeds");
+    assert_eq!(stats.received, 5, "authorized tunnel must carry traffic: {stats:?}");
+    drop(cmd_tx);
+    let _ = tokio::time::timeout(Duration::from_secs(5), pump).await;
+    session.abort();
+
+    // --- Unauthorized: no token -> REGISTER refused -> sharer unreachable ---
+    let (mut un_share_cfg, _e2) = opts.config();
+    un_share_cfg.relays = vec![tcp_ep];
+    un_share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
+    let un_session = spora_core::share(Identity::generate(), un_share_cfg)
+        .await
+        .expect("share() still starts — it can't know the relay will refuse");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (un_client_cfg, _ce2) = opts.config();
+    let r = tokio::time::timeout(
+        Duration::from_secs(15),
+        spora_core::connect(un_session.url.clone(), &un_client_cfg),
+    )
+    .await;
+    assert!(
+        !matches!(r, Ok(Ok(_))),
+        "a tokenless sharer must be unreachable via a gated tcp relay"
+    );
+    un_session.abort();
+}
+
 /// Regression: a pure-`Direct` sharer whose advertised host is a name the
 /// sharer itself CANNOT resolve locally (split-horizon / external-only DNS)
 /// must still start — it binds a wildcard socket and the CLIENT resolves the

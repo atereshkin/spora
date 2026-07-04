@@ -122,6 +122,7 @@ async fn tcp_tls_dial(ctx: DialCtx<'_>) -> Result<PeerSession, String> {
     tcp.write_all(&relay_client::tcp::build_preamble(
         relay_client::tcp::role::CONNECT,
         &ctx.routing_key,
+        &[], // clients aren't relay-authorized — their auth is the E2E secret
     ))
     .await
     .map_err(|e| format!("tcp preamble write: {e}"))?;
