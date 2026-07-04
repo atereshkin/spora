@@ -76,6 +76,12 @@ enum Mode {
         /// with --relay for a mix, or use alone for pure relay-less sharing.
         #[arg(long)]
         direct: Vec<String>,
+        /// Advertise a TCP/TLS relay endpoint (host:port): a TCP relay carrying
+        /// end-to-end TLS, for networks that block UDP/QUIC. The sharer connects
+        /// out and parks connections at it. Repeat for several; combine with
+        /// --relay to offer both (the client tries them in preference order).
+        #[arg(long)]
+        tcp_relay: Vec<String>,
         /// Override the STUN server (host:port) used for direct-upgrade
         /// endpoint discovery.
         #[arg(long)]
@@ -248,6 +254,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_nat,
             relay,
             direct,
+            tcp_relay,
             stun,
             relay_token,
             no_conn_log,
@@ -275,6 +282,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     host,
                     port,
                     spora_core::identity::RelayProtocol::Direct,
+                ));
+            }
+            for t in &tcp_relay {
+                let (host, port) = parse_host_port(t).map_err(|e| format!("--tcp-relay: {}", e))?;
+                relays.push(spora_core::identity::RelayEndpoint::with_protocol(
+                    host,
+                    port,
+                    spora_core::identity::RelayProtocol::TcpTls,
                 ));
             }
             if !relays.is_empty() {

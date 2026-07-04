@@ -305,6 +305,83 @@ async fn udp_echo_over_relayless_direct() {
     session.abort();
 }
 
+/// End-to-end over the TCP/TLS relay carrier: the sharer parks connections at
+/// the TCP relay, the client dials the `tcptls/` URL, the relay blind-splices
+/// them, and the end-to-end TLS carries the tunnel. Exercises the full
+/// stream-native path (StreamPeerTransport + e2e_tls + the parked-pool relay)
+/// through the real `share()`/`connect()` composition.
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_echo_over_tcp_tls_relay() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // In-process TCP/TLS relay on loopback.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let relay_addr = listener.local_addr().unwrap();
+    tokio::spawn(relay::tcp::serve_tcp(listener, relay::tcp::TcpRelayState::new()));
+
+    let tcp_ep = spora_core::identity::RelayEndpoint::with_protocol(
+        "127.0.0.1",
+        relay_addr.port(),
+        spora_core::identity::RelayProtocol::TcpTls,
+    );
+
+    // TcpTls has no hole-punch upgrade; STUN is never hit.
+    let mut opts = LabPeerOpts::new("127.0.0.1:0".parse().unwrap(), "stun.invalid:3478");
+    opts.enable_direct_upgrade = false;
+
+    let (mut share_cfg, _share_events) = opts.config();
+    share_cfg.relays = vec![tcp_ep];
+    share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
+    let session = spora_core::share(Identity::generate(), share_cfg)
+        .await
+        .expect("tcp-tls share() starts");
+    assert!(
+        session
+            .url
+            .as_str()
+            .contains(&format!("r=tcptls/127.0.0.1:{}", relay_addr.port())),
+        "URL must advertise the tcptls endpoint, got {}",
+        session.url
+    );
+
+    // Let the sharer's registrar pool park connections at the relay.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (client_cfg, _client_events) = opts.config();
+    let connected = spora_core::connect(session.url.clone(), &client_cfg)
+        .await
+        .expect("connect() establishes over the tcp-tls relay");
+
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pump = tokio::spawn(peers::drive_client(connected, cmd_rx));
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(TrafficCmd::UdpEcho {
+            server: FAKE_SERVER.into(),
+            count: 20,
+            payload_len: 64,
+            respond: tx,
+        })
+        .expect("pump is alive");
+    let stats = tokio::time::timeout(Duration::from_secs(30), rx)
+        .await
+        .expect("echo finishes within the deadline")
+        .expect("pump answers the command")
+        .expect("echo run succeeds");
+    assert_eq!(
+        stats.received, 20,
+        "echo lost packets over the tcp-tls relay: {stats:?}"
+    );
+
+    drop(cmd_tx);
+    tokio::time::timeout(Duration::from_secs(5), pump)
+        .await
+        .expect("pump exits when the command channel closes")
+        .unwrap();
+    session.abort();
+}
+
 /// Regression: a pure-`Direct` sharer whose advertised host is a name the
 /// sharer itself CANNOT resolve locally (split-horizon / external-only DNS)
 /// must still start — it binds a wildcard socket and the CLIENT resolves the

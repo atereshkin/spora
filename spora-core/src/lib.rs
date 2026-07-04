@@ -27,9 +27,7 @@ pub use tokio_util::sync::CancellationToken;
 use url::Url;
 
 use crate::connlog::{AddrKind, ConnLog, ConnLogConfig, SessionLog};
-use crate::e2e::{
-    authenticate_incoming, client_connect, client_endpoint, server_endpoint, E2eSession,
-};
+use crate::e2e::{authenticate_incoming, client_connect, client_endpoint, server_endpoint};
 use crate::identity::{Identity, RelayEndpoint, RelayProtocol, Token, ROUTING_KEY_LEN, SECRET_LEN};
 use crate::neg::{NegChannel, SignalNegChannel};
 use crate::server::TunnelError;
@@ -276,21 +274,21 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     }
     let url = identity.token(config.relays.clone()).to_url();
 
-    // Resolve only the *relayed* endpoints — the ones we register with. A
-    // `Direct` endpoint is the sharer's own advertised listener: the sharer
-    // binds a wildcard socket and it is the CLIENT that resolves the advertised
-    // name. So a Direct hostname the sharer can't resolve locally (split-horizon
-    // or external-only DNS) must NOT abort the share.
-    let relayed: Vec<RelayEndpoint> = config
+    // Resolve only the UDP-QUIC relays — the ones the signed-REGISTER loop
+    // announces to. `TcpTls` relays are reached by the sharer connecting OUT
+    // (spawn_tcp_registrars), not by UDP registration. A `Direct` endpoint is
+    // the sharer's own advertised listener (the CLIENT resolves the name), so a
+    // Direct/TcpTls hostname the sharer can't resolve locally must NOT abort it.
+    let udp_relays: Vec<RelayEndpoint> = config
         .relays
         .iter()
-        .filter(|r| r.protocol.is_relayed())
+        .filter(|r| r.protocol == RelayProtocol::UdpQuic)
         .cloned()
         .collect();
-    let register_addrs: Vec<SocketAddr> = if relayed.is_empty() {
+    let register_addrs: Vec<SocketAddr> = if udp_relays.is_empty() {
         Vec::new()
     } else {
-        resolve_relays(&relayed)?.into_iter().map(|(a, _)| a).collect()
+        resolve_relays(&udp_relays)?.into_iter().map(|(a, _)| a).collect()
     };
 
     // A `Direct` (relay-less) sharer must bind the advertised port so clients
@@ -384,6 +382,118 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     Ok(ShareSession { url, cancel, task })
 }
 
+/// Spawn TCP/TLS registrar pools for every `TcpTls` relay in the config. Each
+/// pool worker parks a connection at the relay; when a client is spliced in it
+/// runs the E2E TLS server and delivers the session, then re-parks to refill.
+fn spawn_tcp_registrars(
+    config: &Config,
+    identity: Arc<Identity>,
+    session_tx: tokio::sync::mpsc::UnboundedSender<carrier::PeerSession>,
+    cancel: CancellationToken,
+) {
+    // Connections kept parked per relay so a client always finds one.
+    const POOL_SIZE: usize = 4;
+    for relay in config
+        .relays
+        .iter()
+        .filter(|r| r.protocol == RelayProtocol::TcpTls)
+    {
+        let addrs = match resolve_one_relay(relay) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("tcp registrar: skipping unresolvable {}: {}", relay.host, e);
+                continue;
+            }
+        };
+        for addr in addrs {
+            for _ in 0..POOL_SIZE {
+                tokio::spawn(tcp_park_worker(
+                    addr,
+                    identity.clone(),
+                    session_tx.clone(),
+                    cancel.clone(),
+                    config.protector.clone(),
+                ));
+            }
+        }
+    }
+}
+
+/// One pool worker: keep a connection parked at `relay_addr`, delivering a
+/// session whenever a client is spliced in, until cancelled.
+async fn tcp_park_worker(
+    relay_addr: SocketAddr,
+    identity: Arc<Identity>,
+    session_tx: tokio::sync::mpsc::UnboundedSender<carrier::PeerSession>,
+    cancel: CancellationToken,
+    protector: SocketProtector,
+) {
+    loop {
+        if cancel.is_cancelled() {
+            return;
+        }
+        match park_and_accept(relay_addr, identity.as_ref(), &protector, &cancel).await {
+            Ok(Some(session)) => {
+                if session_tx.send(session).is_err() {
+                    return; // the share loop is gone
+                }
+            }
+            // The parked connection was reaped (idle) — re-park immediately.
+            Ok(None) => {}
+            Err(e) => {
+                debug!("tcp registrar {}: {}", relay_addr, e);
+                tokio::select! {
+                    _ = cancel.cancelled() => return,
+                    _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+                }
+            }
+        }
+    }
+}
+
+/// Park one connection at the relay; when a client is spliced in, run the E2E
+/// TLS server and return the session. `Ok(None)` = the relay reaped an idle
+/// parked connection (re-park). Cancellable while parked.
+async fn park_and_accept(
+    relay_addr: SocketAddr,
+    identity: &Identity,
+    protector: &SocketProtector,
+    cancel: &CancellationToken,
+) -> Result<Option<carrier::PeerSession>, String> {
+    use tokio::io::AsyncWriteExt;
+    let mut tcp = tokio::net::TcpStream::connect(relay_addr)
+        .await
+        .map_err(|e| format!("connect relay: {}", e))?;
+    let _ = tcp.set_nodelay(true);
+    carrier::protect_tcp(protector, &tcp);
+    tcp.write_all(&relay_client::tcp::build_preamble(
+        relay_client::tcp::role::REGISTER,
+        &identity.routing_key,
+    ))
+    .await
+    .map_err(|e| format!("register preamble: {}", e))?;
+
+    // Park: wait (no timeout, cancellable) for the first byte — a client was
+    // spliced in. EOF (0) means the relay reaped this idle parked connection
+    // (its PARK_TTL); the caller re-parks.
+    let mut peek = [0u8; 1];
+    let n = tokio::select! {
+        _ = cancel.cancelled() => return Err("cancelled while parked".into()),
+        r = tcp.peek(&mut peek) => r.map_err(|e| format!("park peek: {}", e))?,
+    };
+    if n == 0 {
+        return Ok(None);
+    }
+
+    // A client is here — run the timed E2E TLS server handshake + secret.
+    let transport = e2e_tls::accept(tcp, identity).await?;
+    Ok(Some(carrier::PeerSession {
+        transport,
+        remote_addr: relay_addr,
+        quic: None,
+    }))
+}
+
 async fn run_share_loop(
     endpoint: quinn::Endpoint,
     identity: Arc<Identity>,
@@ -394,8 +504,14 @@ async fn run_share_loop(
     let secret = identity.secret;
     let mut tunnel_cancel: Option<CancellationToken> = None;
     let mut iteration: u32 = 0;
-    // Authenticated sessions arrive here from the per-connection auth tasks.
-    let (session_tx, mut session_rx) = tokio::sync::mpsc::unbounded_channel::<E2eSession>();
+    // Authenticated sessions arrive here from the per-connection QUIC auth tasks
+    // and the TCP/TLS registrar pools, unified as carrier::PeerSession.
+    let (session_tx, mut session_rx) =
+        tokio::sync::mpsc::unbounded_channel::<carrier::PeerSession>();
+
+    // Sharer-side TCP/TLS carrier: park connections at each TcpTls relay and
+    // deliver each spliced client as a session into the same channel.
+    spawn_tcp_registrars(&config, identity.clone(), session_tx.clone(), cancel.clone());
 
     info!("[share] waiting for peers");
     loop {
@@ -421,7 +537,9 @@ async fn run_share_loop(
                             tokio::select! {
                                 _ = cancel.cancelled() => {}
                                 res = authenticate_incoming(incoming, &secret, true) => match res {
-                                    Ok(session) => { let _ = tx.send(session); }
+                                    Ok(session) => {
+                                        let _ = tx.send(carrier::PeerSession::from_quic(session));
+                                    }
                                     Err(e) => warn!("[share] accept failed: {}", e),
                                 }
                             }
@@ -431,11 +549,10 @@ async fn run_share_loop(
             }
             Some(session) = session_rx.recv() => {
                 iteration += 1;
+                let remote_addr = session.remote_addr;
                 emit(
                     &config.event_hook,
-                    TunnelEvent::RelaySessionEstablished {
-                        peer: session.conn.remote_address(),
-                    },
+                    TunnelEvent::RelaySessionEstablished { peer: remote_addr },
                 );
 
                 if let Some(tc) = tunnel_cancel.take() {
@@ -445,9 +562,7 @@ async fn run_share_loop(
 
                 // Sessions accepted here always bootstrap relay-via, so the
                 // connection's remote address is the relay's, recorded as such.
-                let slog = conn_log
-                    .as_ref()
-                    .map(|cl| cl.session(session.conn.remote_address()));
+                let slog = conn_log.as_ref().map(|cl| cl.session(remote_addr));
 
                 let child_cancel = cancel.child_token();
                 tunnel_cancel = Some(child_cancel.clone());
@@ -458,19 +573,23 @@ async fn run_share_loop(
 }
 
 fn spawn_responder_tunnel(
-    session: E2eSession,
+    session: carrier::PeerSession,
     identity: Arc<Identity>,
     config: &Config,
     tunnel_cancel: CancellationToken,
     slog: Option<Arc<SessionLog>>,
 ) {
-    let E2eSession {
-        conn,
+    let carrier::PeerSession {
         transport,
-        signal,
+        remote_addr,
+        quic,
     } = session;
+    let (quic_conn, quic_signal) = match quic {
+        Some(q) => (Some(q.conn), Some(q.signal)),
+        None => (None, None),
+    };
 
-    let (upgradable, upgrade_sender, router_handle) = upgradable_transport(Box::new(transport));
+    let (upgradable, upgrade_sender, router_handle) = upgradable_transport(transport);
     let keepalive_cfg = KeepAliveConfig::default();
     // The meter (Custom exit mode) must ignore the synthetic keepalive pings
     // riding the tunnel; tell it which inner address pair they use.
@@ -481,55 +600,70 @@ fn spawn_responder_tunnel(
     ));
 
     let protector_for_tunnel = config.protector.clone();
-    let conn_for_mtu = conn.clone();
     let upgrade_cancel = tunnel_cancel.clone();
 
-    let upgrade_task = if config.enable_direct_upgrade {
-        let stun_server = config.stun_server.clone();
-        let protector = config.protector.clone();
-        let mtu_cb = config.mtu_callback.clone();
-        let timings = config.timings.clone();
-        let event_hook = config.event_hook.clone();
-        let role = DirectRole::Responder { identity };
-        let path_ipv6 = conn.remote_address().is_ipv6();
-        let upgrade_slog = slog.clone();
-        tokio::spawn(async move {
-            try_direct_upgrade(
-                signal,
-                upgrade_sender,
-                &stun_server,
-                role,
-                path_ipv6,
-                &protector,
-                upgrade_cancel,
-                None,
-                mtu_cb,
-                timings,
-                event_hook,
-                upgrade_slog,
-            )
-            .await;
-        })
-    } else {
-        // Direct upgrade disabled: drop the UpgradeSender (the upgradable
-        // router then drains forever, by design) but keep the SignalChannel
-        // alive for the session's lifetime so the peer's signal stream
-        // doesn't see EOF.
-        drop(upgrade_sender);
-        tokio::spawn(async move {
-            upgrade_cancel.cancelled().await;
-            drop(signal);
-        })
+    // Responder upgrade: only for a QUIC session with the upgrade enabled. A
+    // TcpTls (stream) session has no signal channel or UDP path; and a session
+    // whose client is Direct dropped its signal, so try_direct_upgrade
+    // terminates via SignalClosed before it STUNs.
+    let upgrade_task = match (config.enable_direct_upgrade, quic_signal) {
+        (true, Some(signal)) => {
+            let stun_server = config.stun_server.clone();
+            let protector = config.protector.clone();
+            let mtu_cb = config.mtu_callback.clone();
+            let timings = config.timings.clone();
+            let event_hook = config.event_hook.clone();
+            let role = DirectRole::Responder { identity };
+            let path_ipv6 = remote_addr.is_ipv6();
+            let upgrade_slog = slog.clone();
+            tokio::spawn(async move {
+                try_direct_upgrade(
+                    signal,
+                    upgrade_sender,
+                    &stun_server,
+                    role,
+                    path_ipv6,
+                    &protector,
+                    upgrade_cancel,
+                    None,
+                    mtu_cb,
+                    timings,
+                    event_hook,
+                    upgrade_slog,
+                )
+                .await;
+            })
+        }
+        // No upgrade (stream carrier, or upgrade disabled): drop the
+        // UpgradeSender (the router drains, by design) and hold the signal (if
+        // any) until the session ends so a QUIC peer's stream doesn't see EOF.
+        (_, held_signal) => {
+            drop(upgrade_sender);
+            tokio::spawn(async move {
+                upgrade_cancel.cancelled().await;
+                drop(held_signal);
+            })
+        }
     };
 
-    if let Some(cb) = config.mtu_callback.clone() {
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            if let Some(mds) = conn_for_mtu.max_datagram_size() {
-                info!("e2e max datagram size (post-PMTUD): {}", mds);
-                cb(mds as u16);
+    // MTU: dynamic (PMTUD) for QUIC, fixed for a stream carrier.
+    match quic_conn {
+        Some(conn) => {
+            if let Some(cb) = config.mtu_callback.clone() {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    if let Some(mds) = conn.max_datagram_size() {
+                        info!("e2e max datagram size (post-PMTUD): {}", mds);
+                        cb(mds as u16);
+                    }
+                });
             }
-        });
+        }
+        None => {
+            if let Some(cb) = config.mtu_callback.clone() {
+                cb(carrier::STREAM_TUNNEL_MTU);
+            }
+        }
     }
 
     let exit_slog = slog.clone();
@@ -727,20 +861,24 @@ async fn dial_initiator(
         })
         .await
         .map_err(std::io::Error::other)?;
-    let E2eSession {
-        conn,
+    let carrier::PeerSession {
         transport,
-        signal,
+        remote_addr,
+        quic,
     } = session;
+    // Split the QUIC-only extras: the connection (dynamic PMTUD MTU) and the
+    // signal channel (hole-punch upgrade). Both are None for a stream carrier.
+    let (quic_conn, quic_signal) = match quic {
+        Some(q) => (Some(q.conn), Some(q.signal)),
+        None => (None, None),
+    };
 
     emit(
         &config.event_hook,
-        TunnelEvent::RelaySessionEstablished {
-            peer: conn.remote_address(),
-        },
+        TunnelEvent::RelaySessionEstablished { peer: remote_addr },
     );
 
-    let (upgradable, upgrade_sender, router_handle) = upgradable_transport(Box::new(transport));
+    let (upgradable, upgrade_sender, router_handle) = upgradable_transport(transport);
     let upgrade_knob = keepalive_knob.clone();
     let keepalive_cfg = KeepAliveConfig {
         mode: KeepAliveMode::Adaptive {
@@ -755,15 +893,38 @@ async fn dial_initiator(
     let transport: IpTransport =
         Box::new(KeepAliveTransport::new(Box::new(upgradable), keepalive_cfg));
 
+    // MTU: a QUIC carrier reads the PMTUD-converged max_datagram_size after
+    // ~1.5s; a stream carrier has no per-datagram limit, so report a fixed MTU.
+    let mtu_cb_relay = config.mtu_callback.clone();
+    match quic_conn {
+        Some(conn) => {
+            if let Some(cb) = mtu_cb_relay {
+                tokio::spawn(async move {
+                    tokio::time::sleep(Duration::from_millis(1500)).await;
+                    if let Some(mds) = conn.max_datagram_size() {
+                        info!("e2e max datagram size (post-PMTUD): {}", mds);
+                        cb(mds as u16);
+                    }
+                });
+            }
+        }
+        None => {
+            if let Some(cb) = mtu_cb_relay {
+                cb(carrier::STREAM_TUNNEL_MTU);
+            }
+        }
+    }
+
     let upgrade_cancel = cancel.clone();
-    // Only a *relayed* session benefits from a direct upgrade. A Direct-carrier
-    // session already terminates directly on the sharer's advertised listener,
-    // so punching a second path is pure waste — and would leak both peers'
-    // addresses to STUN, defeating the point of a relay-less path. So skip it,
-    // and drop the signal channel now: the sharer starts a responder upgrade not
-    // knowing the session is already direct, and a closed signal makes its first
-    // `recv_endpoint` return EOF, terminating it *before* it ever STUNs.
-    if config.enable_direct_upgrade && protocol.is_relayed() {
+    // Only a *relayed QUIC* session benefits from a direct upgrade. A Direct
+    // session already terminates directly on the sharer; a TcpTls session has
+    // no QUIC signal channel and no UDP path to punch. Skipping for Direct also
+    // drops the signal now, so the sharer's responder upgrade hits EOF on its
+    // first recv_endpoint and stops *before* it ever STUNs.
+    let attempt_upgrade =
+        config.enable_direct_upgrade && protocol.is_relayed() && quic_signal.is_some();
+    if attempt_upgrade {
+        let signal = quic_signal.expect("attempt_upgrade requires a QUIC signal channel");
         let role = DirectRole::Initiator {
             routing_key: token.routing_key,
             secret: token.secret,
@@ -805,13 +966,13 @@ async fn dial_initiator(
         let drop_signal_now = !protocol.is_relayed();
         tokio::spawn(async move {
             // Direct: drop the signal now (peer's responder stops before STUN).
-            // Relayed+disabled: hold it until session death (peer's attempts
-            // time out instead of erroring).
+            // Relayed QUIC + disabled: hold it until session death (peer's
+            // attempts time out instead of erroring). Stream carrier: None.
             let held_signal = if drop_signal_now {
-                drop(signal);
+                drop(quic_signal);
                 None
             } else {
-                Some(signal)
+                quic_signal
             };
             tokio::select! {
                 _ = upgrade_cancel.cancelled() => {}
@@ -819,17 +980,6 @@ async fn dial_initiator(
             }
             drop(held_signal);
             drop(router_handle);
-        });
-    }
-
-    if let Some(cb) = config.mtu_callback.clone() {
-        let conn = conn.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(1500)).await;
-            if let Some(mds) = conn.max_datagram_size() {
-                info!("e2e max datagram size (post-PMTUD): {}", mds);
-                cb(mds as u16);
-            }
         });
     }
 
@@ -1530,7 +1680,7 @@ pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), Strin
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::e2e::accept_one;
+    use crate::e2e::{E2eSession, accept_one};
 
     #[test]
     fn punch_source_recording_is_deduped_and_bounded() {

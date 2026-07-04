@@ -41,6 +41,11 @@ struct Args {
     /// one of these issuers and bound to its routing key.
     #[arg(long = "issuer-key", value_name = "BASE64_PUBKEY")]
     issuer_keys: Vec<String>,
+    /// Also serve the TCP/TLS relay carrier on this port (alongside the UDP
+    /// relay), for clients on networks that block UDP/QUIC. The relay only
+    /// blind-splices; the end-to-end TLS stays between the peers.
+    #[arg(long)]
+    tcp_port: Option<u16>,
 }
 
 /// Where the session log lives when `--session-log` is not given. Prefers
@@ -120,6 +125,24 @@ async fn main() {
             issuer_keys.len()
         );
         state = state.with_issuer_keys(issuer_keys);
+    }
+
+    // Optionally serve the TCP/TLS carrier alongside the UDP relay.
+    if let Some(tcp_port) = args.tcp_port {
+        let tcp_bind = SocketAddr::new(bind.ip(), tcp_port);
+        match tokio::net::TcpListener::bind(tcp_bind).await {
+            Ok(listener) => {
+                info!("tcp-relay listening on TCP {tcp_bind}");
+                tokio::spawn(relay::tcp::serve_tcp(
+                    listener,
+                    relay::tcp::TcpRelayState::new(),
+                ));
+            }
+            Err(e) => {
+                eprintln!("relay: bind TCP {tcp_bind} failed: {e}");
+                std::process::exit(1);
+            }
+        }
     }
 
     let socket = bind_relay_socket(bind).unwrap_or_else(|e| panic!("bind {} failed: {}", bind, e));

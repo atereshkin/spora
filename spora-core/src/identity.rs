@@ -202,6 +202,10 @@ pub enum RelayProtocol {
     /// No relay: dial the sharer's own listener directly (the sharer is
     /// publicly reachable). Zero relay bandwidth; see the `carrier` module.
     Direct,
+    /// A TCP relay carrying end-to-end TLS (transport diversity: survives
+    /// UDP/QUIC-class blocking). Relayed, stream-native — see the `carrier`
+    /// module and `e2e_tls`.
+    TcpTls,
 }
 
 impl RelayProtocol {
@@ -210,8 +214,17 @@ impl RelayProtocol {
     /// the sharer instead binds and advertises the endpoint itself.
     pub fn is_relayed(self) -> bool {
         match self {
-            RelayProtocol::UdpQuic => true,
+            RelayProtocol::UdpQuic | RelayProtocol::TcpTls => true,
             RelayProtocol::Direct => false,
+        }
+    }
+
+    /// Whether this protocol's E2E path is QUIC datagrams (vs a byte stream).
+    /// Only QUIC carriers support the UDP hole-punch direct upgrade.
+    pub fn is_quic(self) -> bool {
+        match self {
+            RelayProtocol::UdpQuic | RelayProtocol::Direct => true,
+            RelayProtocol::TcpTls => false,
         }
     }
 
@@ -222,6 +235,7 @@ impl RelayProtocol {
         match self {
             RelayProtocol::UdpQuic => None,
             RelayProtocol::Direct => Some("direct"),
+            RelayProtocol::TcpTls => Some("tcptls"),
         }
     }
 
@@ -231,6 +245,7 @@ impl RelayProtocol {
         match tag {
             "quic" | "udpquic" => Some(RelayProtocol::UdpQuic),
             "direct" => Some(RelayProtocol::Direct),
+            "tcptls" => Some(RelayProtocol::TcpTls),
             _ => None,
         }
     }
