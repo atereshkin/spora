@@ -1,6 +1,7 @@
 pub mod keepalive;
 pub mod meter;
 pub mod quic;
+pub mod stream;
 pub mod upgradable;
 #[cfg(test)]
 pub mod mock;
