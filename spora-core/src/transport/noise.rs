@@ -304,18 +304,43 @@ pub(crate) async fn noise_connect(
     msg1.extend_from_slice(routing_key);
     msg1.extend_from_slice(&idx_b.to_be_bytes());
     msg1.extend_from_slice(&noise_msg1);
-    socket
-        .send_to(&msg1, relay_addr)
-        .await
-        .map_err(|e| format!("nz send msg1: {e}"))?;
-
-    // msg2: idx_B | idx_A | noise_msg2. Filter by our idx_B echoed back, so a
-    // stray punch/verify packet on a shared socket can't be misread as msg2.
+    // Retransmit msg1 until msg2 arrives or hs_timeout elapses — a lost first
+    // packet (a relay-registration race, or plain loss) must not fail the dial,
+    // just as QUIC retransmits its Initial. msg2 is filtered by our idx_B echoed
+    // back, so a stray punch/verify packet on a shared socket isn't misread.
+    const MSG1_RESEND: Duration = Duration::from_millis(250);
     let idx_b_bytes = idx_b.to_be_bytes();
-    let (msg2, _src) = recv_matching(&mut rx, hs_timeout, |d| {
-        d.len() >= 2 * INDEX_LEN && d[0..INDEX_LEN] == idx_b_bytes
-    })
-    .await?;
+    let deadline = tokio::time::Instant::now() + hs_timeout;
+    let msg2 = loop {
+        socket
+            .send_to(&msg1, relay_addr)
+            .await
+            .map_err(|e| format!("nz send msg1: {e}"))?;
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Err("nz: handshake timed out (no msg2)".to_string());
+        }
+        let wait = MSG1_RESEND.min(deadline - now);
+        let attempt = tokio::time::timeout(wait, async {
+            loop {
+                match rx.recv().await {
+                    Some((d, _src))
+                        if d.len() >= 2 * INDEX_LEN && d[0..INDEX_LEN] == idx_b_bytes =>
+                    {
+                        return Some(d);
+                    }
+                    Some(_) => continue,     // stray — skip
+                    None => return None,     // datagram source closed
+                }
+            }
+        })
+        .await;
+        match attempt {
+            Ok(Some(m)) => break m,
+            Ok(None) => return Err("nz: datagram source closed".to_string()),
+            Err(_) => {} // this attempt timed out — resend msg1 and keep waiting
+        }
+    };
     let idx_a = u32::from_be_bytes(msg2[INDEX_LEN..2 * INDEX_LEN].try_into().unwrap());
     hs.read_message(&msg2[2 * INDEX_LEN..])?;
     if !hs.is_finished() {
