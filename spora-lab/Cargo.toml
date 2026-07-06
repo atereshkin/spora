@@ -81,3 +81,9 @@ harness = false
 [[test]]
 name = "fingerprint"
 harness = false
+
+# Tier-3-lite: capture a live nz relay session and verify the Shaper removed the
+# structural DPI tells (fixed msg1 size, idx_B echo) from the wire. Needs tcpdump.
+[[test]]
+name = "shaper"
+harness = false

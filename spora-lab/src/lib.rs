@@ -9,6 +9,7 @@
 
 pub mod capture;
 pub mod censor;
+pub mod entropy_inspect;
 pub mod harness;
 pub mod metrics;
 pub mod nat;
