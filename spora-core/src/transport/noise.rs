@@ -90,25 +90,25 @@ const DEFAULT_IDLE: Duration = Duration::from_secs(30);
 
 // ---- header protection ----------------------------------------------------
 
-/// Per-session header-protection key, derived from the Noise channel binding so
-/// both peers agree without any extra exchange. Not a confidentiality key — its
-/// only job is to hide the packet counter's structure from a passive observer.
-fn derive_hp_key(handshake_hash: &[u8; 32]) -> [u8; 32] {
+/// Precompute the per-session header-protection HMAC key from the Noise channel
+/// binding, **once**. Both peers derive the same key; caching the `ring::hmac::Key`
+/// (which precomputes the HMAC ipad/opad) rather than rebuilding it per packet
+/// keeps header protection cheap on the hot path.
+fn derive_hp_key(handshake_hash: &[u8; 32]) -> ring::hmac::Key {
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
     ctx.update(b"spora-noise-hp-v1");
     ctx.update(handshake_hash);
     let mut k = [0u8; 32];
     k.copy_from_slice(ctx.finish().as_ref());
-    k
+    ring::hmac::Key::new(ring::hmac::HMAC_SHA256, &k)
 }
 
 /// The 8-byte counter mask = HMAC-SHA256(hp_key, ciphertext_sample)[..8]. The
 /// sample is at a fixed offset in the ciphertext (independent of the counter),
 /// so the receiver reproduces the mask before it needs the counter — the same
 /// shape as QUIC header protection.
-fn hp_mask(hp_key: &[u8; 32], sample: &[u8]) -> [u8; COUNTER_LEN] {
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, hp_key);
-    let tag = ring::hmac::sign(&key, sample);
+fn hp_mask(hp_key: &ring::hmac::Key, sample: &[u8]) -> [u8; COUNTER_LEN] {
+    let tag = ring::hmac::sign(hp_key, sample);
     let mut m = [0u8; COUNTER_LEN];
     m.copy_from_slice(&tag.as_ref()[..COUNTER_LEN]);
     m
@@ -117,7 +117,7 @@ fn hp_mask(hp_key: &[u8; 32], sample: &[u8]) -> [u8; COUNTER_LEN] {
 /// Build one data packet: `recv_index | protected_counter | AEAD(channel|payload)`.
 fn frame_data(
     session: &NoiseSession,
-    hp_key: &[u8; 32],
+    hp_key: &ring::hmac::Key,
     recv_index: u32,
     counter: u64,
     channel: u8,
@@ -145,7 +145,7 @@ fn frame_data(
 /// counter the header protection couldn't have produced).
 fn deframe_data(
     session: &NoiseSession,
-    hp_key: &[u8; 32],
+    hp_key: &ring::hmac::Key,
     local_index: u32,
     buf: &[u8],
 ) -> Result<(u64, u8, Vec<u8>), String> {
@@ -426,7 +426,7 @@ struct NoiseChannelInit {
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     session: Arc<NoiseSession>,
-    hp_key: [u8; 32],
+    hp_key: ring::hmac::Key,
     local_index: u32,
     peer_index: u32,
     send_counter_start: u64,
@@ -441,7 +441,7 @@ pub(crate) struct NoisePeerTransport {
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     session: Arc<NoiseSession>,
-    hp_key: [u8; 32],
+    hp_key: ring::hmac::Key,
     peer_index: u32,
     /// Shared with the [`NoiseSignal`] so data (`CH_IP`) and signal (`CH_SIGNAL`)
     /// frames drawn from the same cipher never reuse an AEAD nonce.
@@ -479,6 +479,7 @@ impl NoisePeerTransport {
         // channel; the reader forwards payloads and never blocks on it.
         let (sig_tx, sig_rx) = mpsc::unbounded_channel();
         let reader_session = session.clone();
+        let reader_hp = hp_key.clone();
         let reader = tokio::spawn(async move {
             let mut replay = ReplayWindow::new();
             for c in recv_seen {
@@ -499,7 +500,7 @@ impl NoisePeerTransport {
                 };
                 // Malformed / not-ours packets deframe to Err and are dropped.
                 if let Ok((counter, channel, payload)) =
-                    deframe_data(&reader_session, &hp_key, local_index, &buf)
+                    deframe_data(&reader_session, &reader_hp, local_index, &buf)
                 {
                     if !replay.check_and_set(counter) {
                         continue; // replay or too old
@@ -525,7 +526,7 @@ impl NoisePeerTransport {
         let signal = NoiseSignal {
             sig_rx,
             session: session.clone(),
-            hp_key,
+            hp_key: hp_key.clone(),
             peer_index,
             socket: socket.clone(),
             peer_addr,
@@ -589,7 +590,7 @@ impl NoisePeerTransport {
 pub struct NoiseSignal {
     sig_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     session: Arc<NoiseSession>,
-    hp_key: [u8; 32],
+    hp_key: ring::hmac::Key,
     peer_index: u32,
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
