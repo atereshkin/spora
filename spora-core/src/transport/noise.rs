@@ -38,6 +38,7 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -421,10 +422,15 @@ pub(crate) struct NoisePeerTransport {
     session: Arc<NoiseSession>,
     hp_key: [u8; 32],
     peer_index: u32,
-    send_counter: u64,
+    /// Shared with the [`NoiseSignal`] so data (`CH_IP`) and signal (`CH_SIGNAL`)
+    /// frames drawn from the same cipher never reuse an AEAD nonce.
+    send_counter: Arc<AtomicU64>,
     ip_id_ctr: u32,
     dec_rx: mpsc::UnboundedReceiver<io::Result<Vec<u8>>>,
     reader: JoinHandle<()>,
+    /// The in-band hole-punch signal channel, taken by the direct-upgrade task
+    /// (`take_signal`). Present until taken; dropped with the transport if unused.
+    signal: Option<NoiseSignal>,
     /// Some when this session owns its socket pump (client / test); None when a
     /// shared dispatcher feeds it (the share side).
     pump: Option<JoinHandle<()>>,
@@ -446,7 +452,11 @@ impl NoisePeerTransport {
             idle,
         } = init;
 
+        let send_counter = Arc::new(AtomicU64::new(send_counter_start));
         let (dec_tx, dec_rx) = mpsc::unbounded_channel();
+        // Incoming hole-punch signaling (CH_SIGNAL) is split off to the signal
+        // channel; the reader forwards payloads and never blocks on it.
+        let (sig_tx, sig_rx) = mpsc::unbounded_channel();
         let reader_session = session.clone();
         let reader = tokio::spawn(async move {
             let mut replay = ReplayWindow::new();
@@ -479,13 +489,27 @@ impl NoisePeerTransport {
                                 break;
                             }
                         }
+                        CH_SIGNAL => {
+                            // Best-effort: a dropped receiver (no upgrade task)
+                            // just discards it; never breaks the data path.
+                            let _ = sig_tx.send(payload);
+                        }
                         CH_CLOSE => break, // peer closed -> Stream end
-                        // CH_SIGNAL is wired in Stage 2; CH_AUTH shouldn't recur.
-                        _ => {}
+                        _ => {}            // CH_AUTH shouldn't recur
                     }
                 }
             }
         });
+
+        let signal = NoiseSignal {
+            sig_rx,
+            session: session.clone(),
+            hp_key,
+            peer_index,
+            socket: socket.clone(),
+            peer_addr,
+            send_counter: send_counter.clone(),
+        };
 
         Self {
             socket,
@@ -493,12 +517,19 @@ impl NoisePeerTransport {
             session,
             hp_key,
             peer_index,
-            send_counter: send_counter_start,
+            send_counter,
             ip_id_ctr: 0,
             dec_rx,
             reader,
+            signal: Some(signal),
             pump,
         }
+    }
+
+    /// Take the in-band signal channel for the direct-upgrade task. Returns
+    /// `None` if already taken.
+    pub(crate) fn take_signal(&mut self) -> Option<NoiseSignal> {
+        self.signal.take()
     }
 
     /// Remote address of the bootstrap path (the relay, or the peer when direct).
@@ -510,8 +541,7 @@ impl NoisePeerTransport {
     /// socket buffer drops the datagram (like QUIC's datagram path) rather than
     /// blocking the tunnel; the inner protocol recovers.
     fn send_on(&mut self, channel: u8, payload: &[u8]) -> io::Result<()> {
-        let counter = self.send_counter;
-        self.send_counter = self.send_counter.wrapping_add(1);
+        let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
         let pkt = frame_data(
             &self.session,
             &self.hp_key,
@@ -526,6 +556,53 @@ impl NoisePeerTransport {
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
             Err(e) => Err(e),
         }
+    }
+}
+
+/// The in-band hole-punch signal channel for an nz session: length-implicit
+/// messages carried as `CH_SIGNAL` data frames over the same E2E cipher as the
+/// tunnel. It shares the transport's `send_counter` (so the two never collide on
+/// an AEAD nonce) and receives via the transport reader's `CH_SIGNAL` split.
+/// The API mirrors [`crate::signal::SignalChannel`] so the direct-upgrade code
+/// treats both carriers alike.
+pub(crate) struct NoiseSignal {
+    sig_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    session: Arc<NoiseSession>,
+    hp_key: [u8; 32],
+    peer_index: u32,
+    socket: Arc<UdpSocket>,
+    peer_addr: SocketAddr,
+    send_counter: Arc<AtomicU64>,
+}
+
+impl NoiseSignal {
+    /// Send one signal message (a full-send, not the data path's drop-on-full —
+    /// signaling is low-rate and wants delivery).
+    pub(crate) async fn send_signal(&mut self, data: &[u8]) -> io::Result<()> {
+        let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
+        let pkt = frame_data(
+            &self.session,
+            &self.hp_key,
+            self.peer_index,
+            counter,
+            CH_SIGNAL,
+            data,
+        )
+        .map_err(io::Error::other)?;
+        self.socket.send_to(&pkt, self.peer_addr).await.map(|_| ())
+    }
+
+    /// Receive one signal message. Returns `None` only when the session driver
+    /// dies (the reader dropped its sender) — never on a single lost datagram,
+    /// which the upgrade loop's own timeout handles by retrying the round.
+    pub(crate) async fn recv_signal(&mut self) -> Option<Vec<u8>> {
+        self.sig_rx.recv().await
+    }
+
+    /// Point the signal channel's sends at a new peer address — used when the
+    /// session migrates from the relay to a punched direct socket.
+    pub(crate) fn set_peer_addr(&mut self, addr: SocketAddr) {
+        self.peer_addr = addr;
     }
 }
 
@@ -807,5 +884,41 @@ mod tests {
                 assert_ne!(delta_i, delta_prev, "counter field advances by a constant stride");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn in_band_signal_round_trips_both_directions() {
+        let (mut a, mut b) = connected_pair(Identity::generate()).await;
+        let mut a_sig = a.take_signal().expect("A has a signal channel");
+        let mut b_sig = b.take_signal().expect("B has a signal channel");
+
+        // A -> B (a hole-punch endpoint blob, as neg.rs would send).
+        a_sig.send_signal(b"203.0.113.7:41000").await.unwrap();
+        let got = timeout(Duration::from_secs(2), b_sig.recv_signal())
+            .await
+            .expect("B receives")
+            .expect("a message, not driver death");
+        assert_eq!(got, b"203.0.113.7:41000");
+
+        // B -> A, on the same session (shares the data cipher + counter).
+        b_sig.send_signal(b"198.51.100.9:42000").await.unwrap();
+        let got = timeout(Duration::from_secs(2), a_sig.recv_signal())
+            .await
+            .expect("A receives")
+            .expect("a message");
+        assert_eq!(got, b"198.51.100.9:42000");
+
+        // Signals interleave with tunnel data without nonce collision (shared
+        // counter): a data packet still deframes after the signals.
+        b.send(ipv4_udp(64)).await.unwrap();
+        let pkt = timeout(Duration::from_secs(2), a.next())
+            .await
+            .expect("A receives data")
+            .expect("open")
+            .expect("no error");
+        assert_eq!(pkt.len(), ipv4_udp(64).len());
+
+        // take_signal is once-only.
+        assert!(a.take_signal().is_none());
     }
 }
