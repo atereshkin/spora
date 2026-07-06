@@ -27,8 +27,11 @@
 //! - `channel` (inside the AEAD): `0x00` IP packet, `0x01` signal (hole-punch,
 //!   Stage 2), `0x02` cert-auth (A's first message), `0x03` close.
 //!
-//! Stage 1b: relay-only, no direct upgrade, no pacer (nz is functional-but-slow
-//! under load and MUST NOT be made a default carrier until a tunnel pacer lands).
+//! Send path: each datagram goes straight out (`try_send_to`), no tunnel-layer
+//! pacer. A feedback pacer was tried and reverted — with the ring-accelerated
+//! snow backend the AEAD is asm-fast and nz reaches QUIC parity on a shaped link
+//! unpaced (the earlier ~half-speed measurement was a debug-only pure-Rust-crypto
+//! artifact); pacing only added overhead and hurt throughput in every case.
 
 // Signal handling, roaming, and the multi-client dispatcher land in later
 // commits; until then a few constants/fields are only used by tests.
@@ -40,7 +43,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use futures_util::{Sink, Stream};
 use log::warn;
@@ -50,7 +53,6 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use super::frag::{fragment_ipv4, fragment_ipv6};
-use super::pace::Pacer;
 use crate::e2e_noise::{
     NOISE_TAG_LEN, NoiseHandshake, NoiseSession, build_cert_auth, verify_cert_auth,
 };
@@ -61,30 +63,6 @@ const CH_IP: u8 = 0x00;
 const CH_SIGNAL: u8 = 0x01;
 const CH_AUTH: u8 = 0x02;
 const CH_CLOSE: u8 = 0x03;
-/// Receiver -> sender delivery-rate feedback (payload = u64 bytes/sec, BE) that
-/// drives the sender's pacer. See [`super::pace`].
-const CH_RATE: u8 = 0x04;
-
-/// How often the receiver reports its measured receive rate to the sender.
-const RATE_INTERVAL: Duration = Duration::from_millis(25);
-/// Bounded pacer queue depth (datagrams). Full -> tail-drop, i.e. the tunnel's
-/// backpressure, like the QUIC datagram send buffer.
-const PACE_QUEUE_CAP: usize = 512;
-/// Pacer wakeup granularity: it refills tokens by elapsed time and drains what
-/// the bucket allows every tick. Coarse enough (vs the timer's ~1ms resolution)
-/// that pacing is accurate, fine enough that a 1ms batch is a few packets.
-const PACE_TICK: Duration = Duration::from_millis(1);
-/// Token-bucket burst budget (bytes): caps how many datagrams accumulate over an
-/// idle gap so a resumed flow doesn't burst. Must exceed `rate * PACE_TICK` at
-/// the top rate we care about (~256 Mbit/s here) or it would cap sustained rate.
-const PACE_BURST_BYTES: f64 = 32.0 * 1024.0;
-
-/// What the pacer task consumes: framed datagrams to send, and delivery-rate
-/// samples (from received `CH_RATE` feedback) that steer the pace rate.
-enum PaceMsg {
-    Data(Vec<u8>),
-    Rate(f64),
-}
 
 const INDEX_LEN: usize = 4;
 const COUNTER_LEN: usize = 8;
@@ -469,13 +447,8 @@ pub(crate) struct NoisePeerTransport {
     /// frames drawn from the same cipher never reuse an AEAD nonce.
     send_counter: Arc<AtomicU64>,
     ip_id_ctr: u32,
-    /// Data path: framed CH_IP datagrams go here to be paced out (bounded,
-    /// tail-drop). Rate feedback the reader receives also rides this channel so
-    /// the pacer sees samples and packets on one queue.
-    pace_tx: mpsc::Sender<PaceMsg>,
     dec_rx: mpsc::UnboundedReceiver<io::Result<Vec<u8>>>,
     reader: JoinHandle<()>,
-    pacer: JoinHandle<()>,
     /// The in-band hole-punch signal channel, taken by the direct-upgrade task
     /// (`take_signal`). Present until taken; dropped with the transport if unused.
     signal: Option<NoiseSignal>,
@@ -505,90 +478,45 @@ impl NoisePeerTransport {
         // Incoming hole-punch signaling (CH_SIGNAL) is split off to the signal
         // channel; the reader forwards payloads and never blocks on it.
         let (sig_tx, sig_rx) = mpsc::unbounded_channel();
-        // Data path: start_send frames CH_IP datagrams onto this bounded queue;
-        // the pacer task drains it. Received rate feedback rides the same queue.
-        let (pace_tx, pace_rx) = mpsc::channel::<PaceMsg>(PACE_QUEUE_CAP);
-        let pacer = tokio::spawn(pacer_loop(pace_rx, socket.clone(), peer_addr));
-
         let reader_session = session.clone();
-        let reader_counter = send_counter.clone();
-        let fb_socket = socket.clone();
-        let fb_pace_tx = pace_tx.clone();
         let reader = tokio::spawn(async move {
             let mut replay = ReplayWindow::new();
             for c in recv_seen {
                 replay.check_and_set(c);
             }
-            // Receive-rate measurement (for the CH_RATE feedback we send the peer).
-            let mut recv_bytes: u64 = 0;
-            let mut recv_since = Instant::now();
-            let mut fb = tokio::time::interval(RATE_INTERVAL);
-            fb.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            // Idle death is a wall deadline reset on every received datagram, so
-            // the feedback ticks below don't keep a dead path alive.
-            let mut idle_at = tokio::time::Instant::now() + idle;
             loop {
-                tokio::select! {
-                    _ = fb.tick() => {
-                        let now = Instant::now();
-                        let dt = now.duration_since(recv_since).as_secs_f64();
-                        if recv_bytes > 0 && dt >= 0.005 {
-                            let rate = (recv_bytes as f64 / dt) as u64;
-                            let ctr = reader_counter.fetch_add(1, Ordering::Relaxed);
-                            if let Ok(f) = frame_data(
-                                &reader_session, &hp_key, peer_index, ctr, CH_RATE, &rate.to_be_bytes(),
-                            ) {
-                                let _ = fb_socket.try_send_to(&f, peer_addr);
-                            }
-                            recv_bytes = 0;
-                            recv_since = now;
-                        }
-                    }
-                    _ = tokio::time::sleep_until(idle_at) => {
+                let next = timeout(idle, rx.recv()).await;
+                let (buf, _src) = match next {
+                    Err(_) => {
                         let _ = dec_tx.send(Err(io::Error::new(
-                            io::ErrorKind::TimedOut, "nz: idle timeout",
+                            io::ErrorKind::TimedOut,
+                            "nz: idle timeout",
                         )));
                         break;
                     }
-                    next = rx.recv() => {
-                        let (buf, _src) = match next {
-                            Some(x) => x,
-                            None => break, // socket source gone -> Stream end
-                        };
-                        idle_at = tokio::time::Instant::now() + idle;
-                        // Malformed / not-ours packets deframe to Err and are dropped.
-                        if let Ok((counter, channel, payload)) =
-                            deframe_data(&reader_session, &hp_key, local_index, &buf)
-                        {
-                            if !replay.check_and_set(counter) {
-                                continue; // replay or too old
-                            }
-                            match channel {
-                                CH_IP => {
-                                    recv_bytes += payload.len() as u64;
-                                    if dec_tx.send(Ok(payload)).is_err() {
-                                        break;
-                                    }
-                                }
-                                CH_RATE => {
-                                    // The peer's measured receive rate = our
-                                    // delivery rate; feed it to our pacer.
-                                    if payload.len() >= 8 {
-                                        let r = u64::from_be_bytes(
-                                            payload[..8].try_into().unwrap(),
-                                        ) as f64;
-                                        let _ = fb_pace_tx.try_send(PaceMsg::Rate(r));
-                                    }
-                                }
-                                CH_SIGNAL => {
-                                    // Best-effort: a dropped receiver (no upgrade
-                                    // task) just discards it; never breaks data.
-                                    let _ = sig_tx.send(payload);
-                                }
-                                CH_CLOSE => break, // peer closed -> Stream end
-                                _ => {}            // CH_AUTH shouldn't recur
+                    Ok(None) => break, // socket source gone -> Stream end
+                    Ok(Some(x)) => x,
+                };
+                // Malformed / not-ours packets deframe to Err and are dropped.
+                if let Ok((counter, channel, payload)) =
+                    deframe_data(&reader_session, &hp_key, local_index, &buf)
+                {
+                    if !replay.check_and_set(counter) {
+                        continue; // replay or too old
+                    }
+                    match channel {
+                        CH_IP => {
+                            if dec_tx.send(Ok(payload)).is_err() {
+                                break;
                             }
                         }
+                        CH_SIGNAL => {
+                            // Best-effort: a dropped receiver (no upgrade task)
+                            // just discards it; never breaks the data path.
+                            let _ = sig_tx.send(payload);
+                        }
+                        CH_CLOSE => break, // peer closed -> Stream end
+                        _ => {}            // CH_AUTH shouldn't recur
                     }
                 }
             }
@@ -612,10 +540,8 @@ impl NoisePeerTransport {
             peer_index,
             send_counter,
             ip_id_ctr: 0,
-            pace_tx,
             dec_rx,
             reader,
-            pacer,
             signal: Some(signal),
             pump,
         }
@@ -632,10 +558,12 @@ impl NoisePeerTransport {
         self.peer_addr
     }
 
-    /// Frame a payload on `channel` under the next counter (does not send).
-    fn frame(&self, channel: u8, payload: &[u8]) -> io::Result<Vec<u8>> {
+    /// Frame + send one payload on `channel` under the next counter. A full
+    /// socket buffer drops the datagram (like QUIC's datagram path) rather than
+    /// blocking the tunnel; the inner protocol recovers.
+    fn send_on(&mut self, channel: u8, payload: &[u8]) -> io::Result<()> {
         let counter = self.send_counter.fetch_add(1, Ordering::Relaxed);
-        frame_data(
+        let pkt = frame_data(
             &self.session,
             &self.hp_key,
             self.peer_index,
@@ -643,69 +571,11 @@ impl NoisePeerTransport {
             channel,
             payload,
         )
-        .map_err(io::Error::other)
-    }
-
-    /// Frame + send immediately, bypassing the pacer — for low-rate control
-    /// frames (close) that want prompt delivery, not pacing. A full socket
-    /// buffer drops the datagram; the inner protocol recovers.
-    fn send_direct(&self, channel: u8, payload: &[u8]) -> io::Result<()> {
-        let pkt = self.frame(channel, payload)?;
+        .map_err(io::Error::other)?;
         match self.socket.try_send_to(&pkt, self.peer_addr) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
             Err(e) => Err(e),
-        }
-    }
-
-    /// Frame a CH_IP datagram and hand it to the pacer (tail-drop when the pace
-    /// queue is full — the tunnel's backpressure).
-    fn enqueue_ip(&self, payload: &[u8]) -> io::Result<()> {
-        let pkt = self.frame(CH_IP, payload)?;
-        let _ = self.pace_tx.try_send(PaceMsg::Data(pkt));
-        Ok(())
-    }
-}
-
-/// The pacer task: drain the send queue, pacing CH_IP datagrams to the
-/// delivery-rate estimate ([`Pacer`]); rate samples on the same queue steer it.
-/// A token bucket (burst `PACE_BURST_BYTES`) lets a few datagrams go back-to-back
-/// before waiting, bounding both micro-bursts and pacing-timer churn.
-async fn pacer_loop(mut rx: mpsc::Receiver<PaceMsg>, socket: Arc<UdpSocket>, peer_addr: SocketAddr) {
-    let start = Instant::now();
-    let mut pacer = Pacer::new(start);
-    let mut tokens = 0.0f64;
-    let mut last = start;
-    let mut queue: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
-    // A coarse tick drains any backlog even when no new packet arrives (i.e.
-    // when rate-limited); packet arrivals drain opportunistically between ticks.
-    let mut tick = tokio::time::interval(PACE_TICK);
-    tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-
-    loop {
-        tokio::select! {
-            _ = tick.tick() => {}
-            msg = rx.recv() => match msg {
-                None => break, // transport dropped
-                Some(PaceMsg::Rate(r)) => pacer.on_sample(Instant::now(), r),
-                Some(PaceMsg::Data(p)) => queue.push_back(p),
-            },
-        }
-        // Refill by elapsed time (not a per-packet sleep — that hits the timer's
-        // ~1ms floor and throttles to one packet per tick), then drain what the
-        // bucket allows.
-        let now = Instant::now();
-        let rate = pacer.pace_rate(now);
-        tokens = (tokens + now.duration_since(last).as_secs_f64() * rate).min(PACE_BURST_BYTES);
-        last = now;
-        while let Some(front) = queue.front() {
-            let need = front.len() as f64;
-            if tokens < need {
-                break;
-            }
-            tokens -= need;
-            let pkt = queue.pop_front().unwrap();
-            let _ = socket.try_send_to(&pkt, peer_addr); // drop on WouldBlock/error
         }
     }
 }
@@ -787,7 +657,7 @@ impl Sink<Vec<u8>> for NoisePeerTransport {
             match frags {
                 Some(frags) => {
                     for f in frags {
-                        this.enqueue_ip(&f)?;
+                        this.send_on(CH_IP, &f)?;
                     }
                 }
                 None => warn!(
@@ -798,7 +668,7 @@ impl Sink<Vec<u8>> for NoisePeerTransport {
             }
             Ok(())
         } else {
-            this.enqueue_ip(&item)
+            this.send_on(CH_IP, &item)
         }
     }
 
@@ -806,8 +676,8 @@ impl Sink<Vec<u8>> for NoisePeerTransport {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
-        let _ = self.send_direct(CH_CLOSE, &[]);
+    fn poll_close(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+        let _ = self.send_on(CH_CLOSE, &[]);
         Poll::Ready(Ok(()))
     }
 }
@@ -824,10 +694,9 @@ impl Drop for NoisePeerTransport {
     fn drop(&mut self) {
         // Best-effort close so a superseded relay-via session's flow falls idle
         // promptly (the direct-upgrade swap and reconnect rely on it), then stop
-        // the reader/pacer/pump tasks so nothing keeps refreshing the relay flow.
-        let _ = self.send_direct(CH_CLOSE, &[]);
+        // the reader/pump tasks so nothing keeps refreshing the relay flow.
+        let _ = self.send_on(CH_CLOSE, &[]);
         self.reader.abort();
-        self.pacer.abort();
         if let Some(pump) = &self.pump {
             pump.abort();
         }
@@ -946,6 +815,36 @@ mod tests {
         assert!(w.check_and_set(1), "in-window reorder accepted");
         assert!(w.check_and_set(REPLAY_WINDOW + 10), "big jump accepted");
         assert!(!w.check_and_set(5), "now far below window -> rejected");
+    }
+
+    /// Crypto-backend guard: per-packet frame+deframe throughput. This is a
+    /// regression test for the snow `ring-accelerated` feature — without it,
+    /// snow's pure-Rust AEAD runs at ~19 Mbit/s in a debug build (which left nz
+    /// CPU-bound at half of QUIC); ring's asm does ~1 Gbit/s. The 200 Mbit/s
+    /// floor sits far above pure-Rust-debug and far below ring, so it fails only
+    /// if the fast backend is lost, not from machine noise.
+    #[test]
+    fn crypto_backend_is_fast_enough() {
+        let identity = Identity::generate();
+        let mut hs_b = NoiseHandshake::initiator(&identity.routing_key, &identity.secret).unwrap();
+        let mut hs_a = NoiseHandshake::responder(&identity).unwrap();
+        let m1 = hs_b.write_message(&[]).unwrap();
+        hs_a.read_message(&m1).unwrap();
+        let m2 = hs_a.write_message(&[]).unwrap();
+        hs_b.read_message(&m2).unwrap();
+        let a = hs_a.into_session().unwrap();
+        let b = hs_b.into_session().unwrap();
+        let hp = derive_hp_key(&a.handshake_hash);
+        let payload = vec![0x5au8; 1120];
+        let n = 8_000u64;
+        let t = std::time::Instant::now();
+        for i in 0..n {
+            let f = frame_data(&a, &hp, 0x1122_3344, i, CH_IP, &payload).unwrap();
+            deframe_data(&b, &hp, 0x1122_3344, &f).unwrap();
+        }
+        let mbps = (n as f64 * 1120.0 * 8.0) / t.elapsed().as_secs_f64() / 1e6;
+        println!("nz frame+deframe: {mbps:.0} Mbit/s");
+        assert!(mbps > 200.0, "nz crypto only {mbps:.0} Mbit/s — is snow ring-accelerated?");
     }
 
     #[test]

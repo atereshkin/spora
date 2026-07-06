@@ -49,6 +49,7 @@ fn main() {
             bdp_window,
             latency_overhead,
             efficiency_report,
+            nz_efficiency,
         ],
     );
     // Print/write whatever metrics WERE recorded even when a gate failed —
@@ -635,6 +636,69 @@ fn latency_overhead() -> Result<(), String> {
 
     client2.stop();
     sharer2.stop();
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 5b. nz_efficiency — the nz twin of efficiency_report
+
+/// NO GATES — nz on the direct Open×Open path, UNSHAPED: the raw-capacity /
+/// CPU-per-GiB number, comparable to QUIC's `efficiency_report`. (With the
+/// ring-accelerated snow backend nz reaches QUIC parity on the shaped link; this
+/// records the unshaped ceiling and per-side CPU for trend tracking.)
+fn nz_efficiency() -> Result<(), String> {
+    const DOWNLOAD_BYTES: usize = 64 * MIB;
+    const UPLOAD_BYTES: usize = 32 * MIB;
+    const GIB: f64 = 1024.0 * 1024.0 * 1024.0;
+
+    let topo = Topology::build(&TopologySpec::new(NatKind::Open, NatKind::Open))?;
+    let wan = services::start_wan(&topo.wan, relay::State::default)?;
+    let mut opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
+    opts.relays = vec![nz_relay_endpoint(wan.relay_addr())];
+
+    let mut sharer = peers::start_sharer(&topo.sharer, &opts)?;
+    let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)?;
+    client
+        .wait_event(upgrade_success, EVENT_TIMEOUT)
+        .map_err(|e| format!("nz client never upgraded: {e}"))?;
+    sharer
+        .wait_event(upgrade_success, Duration::from_secs(15))
+        .map_err(|e| format!("nz sharer never upgraded: {e}"))?;
+    let _ = client.udp_echo(svc(ECHO_UDP_PORT), 10, 200, Duration::from_secs(30))?;
+
+    let client_cpu0 = client.pump_cpu_time(Duration::from_secs(10))?;
+    let sharer_cpu0 = sharer.cpu_time();
+    let dl = client.tcp_download(svc(TCP_SOURCE_PORT), DOWNLOAD_BYTES, perf_opts(), BULK_TIMEOUT)?;
+    let client_cpu1 = client.pump_cpu_time(Duration::from_secs(10))?;
+    let sharer_cpu1 = sharer.cpu_time();
+
+    let dl_mbps = dl.throughput_mbps();
+    metrics::record("download_mbps.direct_nz.unshaped", dl_mbps, "mbps", false, 35.0);
+    let gib = DOWNLOAD_BYTES as f64 / GIB;
+    let client_ms_per_gb = client_cpu1.saturating_sub(client_cpu0).as_secs_f64() / gib * 1000.0;
+    metrics::record("cpu_ms_per_gib.client_nz", client_ms_per_gb, "ms/GiB", false, 35.0);
+    let sharer_ms_per_gb = match (sharer_cpu0, sharer_cpu1) {
+        (Some(c0), Some(c1)) => {
+            let v = c1.saturating_sub(c0).as_secs_f64() / gib * 1000.0;
+            metrics::record("cpu_ms_per_gib.sharer_nz", v, "ms/GiB", false, 35.0);
+            v
+        }
+        _ => f64::NAN,
+    };
+
+    let ul = client.tcp_upload(svc(TCP_SINK_PORT), UPLOAD_BYTES, perf_opts(), BULK_TIMEOUT)?;
+    let ul_mbps = ul.throughput_mbps();
+    metrics::record("upload_mbps.direct_nz.unshaped", ul_mbps, "mbps", false, 35.0);
+
+    log::info!(
+        "nz_efficiency (unshaped): download {dl_mbps:.1} Mbit/s, upload {ul_mbps:.1} Mbit/s, \
+         cpu {client_ms_per_gb:.0}/{sharer_ms_per_gb:.0} ms/GiB (client/sharer)"
+    );
+    if dl_mbps <= 0.0 || ul_mbps <= 0.0 {
+        return Err(format!("nz efficiency produced no throughput (dl {dl_mbps:.1}, ul {ul_mbps:.1})"));
+    }
+    client.stop();
+    sharer.stop();
     Ok(())
 }
 
