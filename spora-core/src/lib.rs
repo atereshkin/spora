@@ -1697,6 +1697,26 @@ fn resolve_relays_preferring_v6(
 /// bind `::` dual-stack (IPV6_V6ONLY off) so one socket reaches relays of both
 /// families and receives Initials forwarded by any of them; a pure-v4 relay
 /// set keeps a plain `0.0.0.0` socket. Applies the FD protector.
+/// UDP socket buffer size for nz sockets. The nz carrier has no tunnel pacer, so
+/// an unpaced inner-TCP burst (a full congestion window at once) can overrun the
+/// OS default receive buffer (~200 KB) and drop — which collapses the inner
+/// TCP. quinn sizes QUIC's sockets internally; nz must size its own. Best-effort:
+/// the kernel caps at net.core.{r,w}mem_max.
+const NZ_SOCK_BUF: usize = 4 * 1024 * 1024;
+
+/// Enlarge a UDP socket's send/recv buffers (see [`NZ_SOCK_BUF`]). Cross-platform
+/// via `socket2::SockRef` (AsFd on unix, AsSocket on Windows). Failures are
+/// ignored — a smaller-than-requested buffer still works, just with less burst
+/// headroom.
+fn tune_udp_buffers<'a, S>(socket: &'a S)
+where
+    socket2::SockRef<'a>: From<&'a S>,
+{
+    let sock = socket2::SockRef::from(socket);
+    let _ = sock.set_recv_buffer_size(NZ_SOCK_BUF);
+    let _ = sock.set_send_buffer_size(NZ_SOCK_BUF);
+}
+
 fn bind_share_udp(
     protector: &SocketProtector,
     want_v6: bool,
@@ -1718,6 +1738,7 @@ fn bind_share_udp(
     };
     std.set_nonblocking(true)
         .map_err(|e| format!("set_nonblocking: {}", e))?;
+    tune_udp_buffers(&std);
     apply_protector_to_std(protector, &std);
     Ok(std)
 }
@@ -1737,6 +1758,7 @@ pub(crate) fn bind_local_udp(protector: &SocketProtector, peer: SocketAddr) -> R
         .map_err(|e| format!("bind UDP {}: {}", wildcard, e))?;
     std.set_nonblocking(true)
         .map_err(|e| format!("set_nonblocking: {}", e))?;
+    tune_udp_buffers(&std);
     apply_protector_to_std(protector, &std);
     Ok(std)
 }
@@ -1918,6 +1940,7 @@ pub async fn pierce_keep_socket(
                     continue;
                 }
             };
+            tune_udp_buffers(&udp);
             protect_socket(protector, &udp);
             debug!("Local addr: {}", &local_addr);
 
