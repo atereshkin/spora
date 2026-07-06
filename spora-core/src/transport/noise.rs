@@ -53,6 +53,7 @@ use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
 use super::frag::{fragment_ipv4, fragment_ipv6};
+use super::shaper::{SharedShaper, nz_shaper};
 use crate::e2e_noise::{
     NOISE_TAG_LEN, NoiseHandshake, NoiseSession, build_cert_auth, verify_cert_auth,
 };
@@ -246,12 +247,19 @@ impl ReplayWindow {
 /// share-side multi-client dispatcher (a later commit) replaces it.
 pub(crate) fn spawn_socket_pump(
     socket: Arc<UdpSocket>,
+    shaper: SharedShaper,
 ) -> (mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>, JoinHandle<()>) {
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
         while let Ok((n, src)) = socket.recv_from(&mut buf).await {
-            if tx.send((buf[..n].to_vec(), src)).is_err() {
+            // Reverse the wire shaping before anything downstream (handshake
+            // parsers, deframe) inspects fixed offsets. A datagram that isn't a
+            // valid shaped packet deobfuscates to None and is dropped.
+            let Some(clean) = shaper.deobfuscate(&buf[..n]) else {
+                continue;
+            };
+            if tx.send((clean, src)).is_err() {
                 break;
             }
         }
@@ -295,7 +303,8 @@ pub(crate) async fn noise_connect(
     hs_timeout: Duration,
     idle: Duration,
 ) -> Result<NoisePeerTransport, String> {
-    let (mut rx, pump) = spawn_socket_pump(socket.clone());
+    let shaper = nz_shaper(routing_key, secret);
+    let (mut rx, pump) = spawn_socket_pump(socket.clone(), shaper.clone());
 
     let mut hs = NoiseHandshake::initiator(routing_key, secret)?;
     let idx_b: u32 = rand::random();
@@ -312,8 +321,10 @@ pub(crate) async fn noise_connect(
     let idx_b_bytes = idx_b.to_be_bytes();
     let deadline = tokio::time::Instant::now() + hs_timeout;
     let msg2 = loop {
+        // Shape a fresh wire image each retransmit (new nonce + pad) so the
+        // resends aren't a byte-identical packet on a fixed 250ms cadence.
         socket
-            .send_to(&msg1, relay_addr)
+            .send_to(&shaper.obfuscate(&msg1, true), relay_addr)
             .await
             .map_err(|e| format!("nz send msg1: {e}"))?;
         let now = tokio::time::Instant::now();
@@ -378,6 +389,7 @@ pub(crate) async fn noise_connect(
         rx,
         pump: Some(pump),
         idle,
+        shaper,
     }))
 }
 
@@ -394,6 +406,9 @@ pub(crate) async fn noise_accept(
     hs_timeout: Duration,
     idle: Duration,
 ) -> Result<NoisePeerTransport, String> {
+    // The caller's pump/dispatcher already deobfuscated incoming datagrams, so
+    // `rx` carries clean framed bytes; this shaper is for our OUTGOING packets.
+    let shaper = nz_shaper(&identity.routing_key, &identity.secret);
     // Filter to our own msg1 (routing_key prefix), skipping strays — on the
     // direct path the punched socket still carries in-flight punch markers.
     let (msg1, peer_addr) = recv_matching(&mut rx, hs_timeout, |d| {
@@ -413,7 +428,7 @@ pub(crate) async fn noise_accept(
     msg2.extend_from_slice(&idx_a.to_be_bytes());
     msg2.extend_from_slice(&noise_msg2);
     socket
-        .send_to(&msg2, peer_addr)
+        .send_to(&shaper.obfuscate(&msg2, false), peer_addr)
         .await
         .map_err(|e| format!("nz send msg2: {e}"))?;
     if !hs.is_finished() {
@@ -426,7 +441,7 @@ pub(crate) async fn noise_accept(
     let auth = build_cert_auth(identity, &session.handshake_hash)?;
     let auth_pkt = frame_data(&session, &hp_key, idx_b, 0, CH_AUTH, &auth)?;
     socket
-        .send_to(&auth_pkt, peer_addr)
+        .send_to(&shaper.obfuscate(&auth_pkt, false), peer_addr)
         .await
         .map_err(|e| format!("nz send cert-auth: {e}"))?;
 
@@ -442,6 +457,7 @@ pub(crate) async fn noise_accept(
         rx,
         pump,
         idle,
+        shaper,
     }))
 }
 
@@ -459,6 +475,7 @@ struct NoiseChannelInit {
     rx: mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>,
     pump: Option<JoinHandle<()>>,
     idle: Duration,
+    shaper: SharedShaper,
 }
 
 /// A `Transport` carrying tunnel IP packets as Noise datagrams over UDP.
@@ -468,6 +485,8 @@ pub(crate) struct NoisePeerTransport {
     session: Arc<NoiseSession>,
     hp_key: ring::hmac::Key,
     peer_index: u32,
+    /// Wire shaper applied to every outgoing datagram (and reversed on the pump).
+    shaper: SharedShaper,
     /// Shared with the [`NoiseSignal`] so data (`CH_IP`) and signal (`CH_SIGNAL`)
     /// frames drawn from the same cipher never reuse an AEAD nonce.
     send_counter: Arc<AtomicU64>,
@@ -496,6 +515,7 @@ impl NoisePeerTransport {
             mut rx,
             pump,
             idle,
+            shaper,
         } = init;
 
         let send_counter = Arc::new(AtomicU64::new(send_counter_start));
@@ -556,6 +576,7 @@ impl NoisePeerTransport {
             socket: socket.clone(),
             peer_addr,
             send_counter: send_counter.clone(),
+            shaper: shaper.clone(),
         };
 
         Self {
@@ -564,6 +585,7 @@ impl NoisePeerTransport {
             session,
             hp_key,
             peer_index,
+            shaper,
             send_counter,
             ip_id_ctr: 0,
             dec_rx,
@@ -598,7 +620,8 @@ impl NoisePeerTransport {
             payload,
         )
         .map_err(io::Error::other)?;
-        match self.socket.try_send_to(&pkt, self.peer_addr) {
+        let wire = self.shaper.obfuscate(&pkt, false);
+        match self.socket.try_send_to(&wire, self.peer_addr) {
             Ok(_) => Ok(()),
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => Ok(()),
             Err(e) => Err(e),
@@ -620,6 +643,7 @@ pub struct NoiseSignal {
     socket: Arc<UdpSocket>,
     peer_addr: SocketAddr,
     send_counter: Arc<AtomicU64>,
+    shaper: SharedShaper,
 }
 
 impl NoiseSignal {
@@ -636,7 +660,8 @@ impl NoiseSignal {
             data,
         )
         .map_err(io::Error::other)?;
-        self.socket.send_to(&pkt, self.peer_addr).await.map(|_| ())
+        let wire = self.shaper.obfuscate(&pkt, false);
+        self.socket.send_to(&wire, self.peer_addr).await.map(|_| ())
     }
 
     /// Receive one signal message. Returns `None` only when the session driver
@@ -745,7 +770,8 @@ mod tests {
         let b_sock = udp("127.0.0.1:0").await;
         let a_addr = a_sock.local_addr().unwrap();
 
-        let (rx_a, pump_a) = spawn_socket_pump(a_sock.clone());
+        let (rx_a, pump_a) =
+            spawn_socket_pump(a_sock.clone(), nz_shaper(&identity.routing_key, &identity.secret));
         let id = identity.clone();
         let accept = tokio::spawn(async move {
             noise_accept(

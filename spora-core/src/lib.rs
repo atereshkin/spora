@@ -604,6 +604,10 @@ async fn noise_accept_dispatcher(
     // idx_B -> idx_A, so a client's retransmitted msg1 (its msg2 was lost) is
     // re-delivered to the same session instead of spawning a duplicate.
     let mut by_client: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    // One deobfuscator for this identity's whole flow. It reverses the wire
+    // shaping before we inspect recv_index/routing_key at fixed offsets; the
+    // clean bytes are what we route AND forward to the per-session channels.
+    let shaper = crate::transport::shaper::nz_shaper(&identity.routing_key, &identity.secret);
     let mut buf = vec![0u8; 2048];
 
     loop {
@@ -615,11 +619,16 @@ async fn noise_accept_dispatcher(
             },
         };
 
+        // Reverse the wire shaping first; a non-shaped/garbage datagram drops.
+        let Some(clean) = shaper.deobfuscate(&buf[..n]) else {
+            continue;
+        };
+
         // 1) Belongs to an existing session? Route by recv_index.
-        if n >= DATA_MIN_LEN {
-            let idx = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+        if clean.len() >= DATA_MIN_LEN {
+            let idx = u32::from_be_bytes(clean[0..4].try_into().unwrap());
             if by_index.contains_key(&idx) {
-                let dead = by_index[&idx].send((buf[..n].to_vec(), src)).is_err();
+                let dead = by_index[&idx].send((clean.clone(), src)).is_err();
                 if dead {
                     by_index.remove(&idx);
                     by_client.retain(|_, v| *v != idx);
@@ -629,12 +638,12 @@ async fn noise_accept_dispatcher(
         }
 
         // 2) A handshake msg1 addressed to us (routing_key prefix)?
-        if n >= NZ_MSG1_MIN && buf[0..ROUTING_KEY_LEN] == identity.routing_key {
+        if clean.len() >= NZ_MSG1_MIN && clean[0..ROUTING_KEY_LEN] == identity.routing_key {
             let idx_b =
-                u32::from_be_bytes(buf[ROUTING_KEY_LEN..ROUTING_KEY_LEN + 4].try_into().unwrap());
+                u32::from_be_bytes(clean[ROUTING_KEY_LEN..ROUTING_KEY_LEN + 4].try_into().unwrap());
             if let Some(&idx_a) = by_client.get(&idx_b) {
                 if let Some(tx) = by_index.get(&idx_a) {
-                    let _ = tx.send((buf[..n].to_vec(), src)); // retransmit -> same session
+                    let _ = tx.send((clean.clone(), src)); // retransmit -> same session
                 }
                 continue;
             }
@@ -646,7 +655,7 @@ async fn noise_accept_dispatcher(
                 idx_a = rand::random();
             }
             let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, SocketAddr)>();
-            let _ = tx.send((buf[..n].to_vec(), src));
+            let _ = tx.send((clean.clone(), src));
             by_index.insert(idx_a, tx);
             by_client.insert(idx_b, idx_a);
 
@@ -1557,7 +1566,8 @@ async fn try_direct_as_responder(
     // the relay path; independent keys.
     if signal.is_noise() {
         let socket = std::sync::Arc::new(socket);
-        let (rx, pump) = crate::transport::noise::spawn_socket_pump(socket.clone());
+        let shaper = crate::transport::shaper::nz_shaper(&identity.routing_key, &identity.secret);
+        let (rx, pump) = crate::transport::noise::spawn_socket_pump(socket.clone(), shaper);
         let mut transport = crate::transport::noise::noise_accept(
             socket,
             rx,

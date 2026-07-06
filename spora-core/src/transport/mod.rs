@@ -3,6 +3,7 @@ pub mod keepalive;
 pub mod meter;
 pub mod noise;
 pub mod quic;
+pub mod shaper;
 pub mod stream;
 pub mod upgradable;
 #[cfg(test)]
