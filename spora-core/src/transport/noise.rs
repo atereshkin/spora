@@ -749,4 +749,63 @@ mod tests {
         assert_eq!((ctr0, ch0, pl0.as_slice()), (0, CH_IP, b"hello".as_slice()));
         assert_eq!(ctr1, 1);
     }
+
+    /// DPI wire-image: the bytes that actually go on the wire carry neither a
+    /// QUIC fingerprint nor a WireGuard-style counter tell — the whole point of
+    /// the nz carrier. (A full on-path capture is a lab/DPI-harness follow-up;
+    /// this asserts the properties on the exact bytes the framing emits.)
+    #[test]
+    fn wire_image_carries_no_quic_or_counter_fingerprint() {
+        let identity = Identity::generate();
+        let mut hs_b = NoiseHandshake::initiator(&identity.routing_key, &identity.secret).unwrap();
+        let idx_b: u32 = 0xDEAD_BEEF;
+        let noise_msg1 = hs_b.write_message(&[]).unwrap();
+
+        // Reconstruct the on-wire msg1 exactly as noise_connect frames it.
+        let mut msg1 = Vec::new();
+        msg1.extend_from_slice(&identity.routing_key);
+        msg1.extend_from_slice(&idx_b.to_be_bytes());
+        msg1.extend_from_slice(&noise_msg1);
+
+        // A QUIC v1 long-header Initial has the fixed bit set and version
+        // 0x00000001 at bytes 1..5. An on-path QUIC classifier keys on that
+        // version; nz's bytes there are the routing key's, so they are not it.
+        assert_ne!(
+            &msg1[1..5],
+            &[0x00, 0x00, 0x00, 0x01],
+            "msg1 must not present QUIC v1's version field"
+        );
+        // No leading Spora relay-control magic either (that is 0x80 'spR' 0x01).
+        assert_ne!(&msg1[0..4], b"\x80spR", "msg1 must not look like a control packet");
+
+        // Across many data packets with sequential counters, the on-wire counter
+        // field must never appear in the clear and must not advance by a constant
+        // delta (the WireGuard-family tell the design review flagged as fatal).
+        let mut hs_a = NoiseHandshake::responder(&identity).unwrap();
+        hs_a.read_message(&noise_msg1).unwrap();
+        let m2 = hs_a.write_message(&[]).unwrap();
+        hs_b.read_message(&m2).unwrap();
+        let a_sess = hs_a.into_session().unwrap();
+        let hp = derive_hp_key(&a_sess.handshake_hash);
+
+        let idx = 0x0102_0304u32;
+        let mut wire_counters: Vec<[u8; COUNTER_LEN]> = Vec::new();
+        for counter in 0u64..16 {
+            let pkt = frame_data(&a_sess, &hp, idx, counter, CH_IP, b"payload").unwrap();
+            let mut cf = [0u8; COUNTER_LEN];
+            cf.copy_from_slice(&pkt[INDEX_LEN..DATA_HEADER_LEN]);
+            assert_ne!(cf, counter.to_be_bytes(), "counter {counter} appears in the clear");
+            wire_counters.push(cf);
+        }
+        // No two on-wire counter fields collide, and no constant stride links
+        // them (a masked counter is pseudo-random, not counter+k).
+        for i in 1..wire_counters.len() {
+            assert_ne!(wire_counters[i], wire_counters[i - 1], "adjacent counters collide");
+            let delta_prev = u64::from_be_bytes(wire_counters[1]).wrapping_sub(u64::from_be_bytes(wire_counters[0]));
+            let delta_i = u64::from_be_bytes(wire_counters[i]).wrapping_sub(u64::from_be_bytes(wire_counters[i - 1]));
+            if i > 1 {
+                assert_ne!(delta_i, delta_prev, "counter field advances by a constant stride");
+            }
+        }
+    }
 }
