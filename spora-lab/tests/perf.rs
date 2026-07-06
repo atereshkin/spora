@@ -41,8 +41,11 @@ fn main() {
         spora_lab::scenarios![
             relay_saturation,
             relay_tcp_saturation,
+            relay_nz_saturation,
             relay_loss_compare,
+            relay_nz_loss,
             direct_saturation,
+            direct_nz_saturation,
             bdp_window,
             latency_overhead,
             efficiency_report,
@@ -184,6 +187,17 @@ fn tcp_relay_endpoint(addr: std::net::SocketAddr) -> spora_core::identity::Relay
     )
 }
 
+/// An `nz` (Noise UDP) relay endpoint at the WAN UDP relay — the same relay as
+/// UDP-QUIC (it routes nz by routing key). nz has no congestion control / pacer
+/// yet, so these numbers are the pre-pacer baseline.
+fn nz_relay_endpoint(addr: std::net::SocketAddr) -> spora_core::identity::RelayEndpoint {
+    spora_core::identity::RelayEndpoint::with_protocol(
+        addr.ip().to_string(),
+        addr.port(),
+        spora_core::identity::RelayProtocol::NoiseUdp,
+    )
+}
+
 /// Download then upload over an established tunnel, recording report-only
 /// `{download,upload}_mbps.<path>.<cond>`, returning `(dl_mbps, ul_mbps)`. Uses
 /// smaller transfers than the gated `shaped_saturation` so the lossy/high-delay
@@ -320,6 +334,107 @@ fn relay_loss_compare() -> Result<(), String> {
     if dl_tcp <= 0.0 {
         return Err("tcp relay produced no download throughput under loss".into());
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 1c. nz (Noise UDP) relay carrier — the A/B against UDP-QUIC and TCP/TLS
+
+/// nz-relay saturation on the SAME clean shaped link as `relay_saturation`
+/// (50 Mbit/s + 5 ms), report-only as `*.relay_nz.shaped50`. On a loss-free link
+/// the datagram carrier should track the UDP relay's goodput; any gap is the
+/// nz framing/AEAD overhead (and, under load, the missing pacer).
+fn relay_nz_saturation() -> Result<(), String> {
+    let topo = Topology::build(&TopologySpec::new(
+        NatKind::PortRestricted,
+        NatKind::PortRestricted,
+    ))?;
+    let wan = services::start_wan(&topo.wan, relay::State::default)?;
+    shape_client_leg(&topo, "rate 50mbit delay 5ms")?;
+
+    let mut opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
+    opts.enable_direct_upgrade = false;
+    opts.relays = vec![nz_relay_endpoint(wan.relay_addr())];
+
+    let (sharer, client, setup) = establish(&topo, &opts)?;
+    metrics::record("setup_time_s.relay_nz.shaped50", setup.as_secs_f64(), "s", false, 50.0);
+    let (dl, ul) = measure_saturation(&client, "relay_nz", "shaped50")?;
+    log::info!("relay_nz shaped50: download {dl:.1} Mbit/s, upload {ul:.1} Mbit/s");
+    if dl <= 0.0 || ul <= 0.0 {
+        return Err(format!("nz relay produced no throughput (dl {dl:.1}, ul {ul:.1})"));
+    }
+    client.stop();
+    sharer.stop();
+    Ok(())
+}
+
+/// nz-relay under the SAME lossy leg as `relay_loss_compare` (50 Mbit/s, 25 ms,
+/// 3% loss), report-only as `*.relay_nz.lossy`. Read alongside `*.relay.lossy`
+/// (UDP-QUIC) and `*.relay_tcp.lossy` in the metric table for the three-way
+/// carrier comparison under loss.
+fn relay_nz_loss() -> Result<(), String> {
+    let topo = Topology::build(&TopologySpec::new(
+        NatKind::PortRestricted,
+        NatKind::PortRestricted,
+    ))?;
+    let wan = services::start_wan(&topo.wan, relay::State::default)?;
+    shape_client_leg(&topo, "rate 50mbit delay 25ms loss 3%")?;
+
+    let mut opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
+    opts.enable_direct_upgrade = false;
+    opts.relays = vec![nz_relay_endpoint(wan.relay_addr())];
+
+    let (sharer, client, _setup) = establish(&topo, &opts)?;
+    // Without a pacer, nz self-inflicts loss and can stall under 3% loss — a
+    // small transfer + tolerant recording characterizes the collapse instead of
+    // hanging the suite on the bulk timeout. A stalled transfer records 0.0.
+    // (Re-run after the pacer lands to measure the recovery.)
+    const T: Duration = Duration::from_secs(30);
+    let dl = client
+        .tcp_download(svc(TCP_SOURCE_PORT), 512 * 1024, perf_opts(), T)
+        .map(|s| s.throughput_mbps())
+        .unwrap_or(0.0);
+    metrics::record("download_mbps.relay_nz.lossy", dl, "mbps", false, 0.0);
+    let ul = client
+        .tcp_upload(svc(TCP_SINK_PORT), 256 * 1024, perf_opts(), T)
+        .map(|s| s.throughput_mbps())
+        .unwrap_or(0.0);
+    metrics::record("upload_mbps.relay_nz.lossy", ul, "mbps", false, 0.0);
+    log::info!("relay_nz lossy: download {dl:.2} Mbit/s, upload {ul:.2} Mbit/s (no pacer — collapse expected)");
+    client.stop();
+    sharer.stop();
+    Ok(())
+}
+
+/// nz on the DIRECT (hole-punched) path, Open × Open, same 50 Mbit/s + 5 ms
+/// leg as `direct_saturation`. Report-only as `*.direct_nz.shaped50` — the
+/// direct-path A/B against QUIC's `*.direct.shaped50`.
+fn direct_nz_saturation() -> Result<(), String> {
+    let topo = Topology::build(&TopologySpec::new(NatKind::Open, NatKind::Open))?;
+    let wan = services::start_wan(&topo.wan, relay::State::default)?;
+    shape_client_leg(&topo, "rate 50mbit delay 5ms")?;
+
+    let mut opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
+    opts.relays = vec![nz_relay_endpoint(wan.relay_addr())];
+
+    let mut sharer = peers::start_sharer(&topo.sharer, &opts)?;
+    let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)?;
+    client
+        .wait_event(upgrade_success, EVENT_TIMEOUT)
+        .map_err(|e| format!("nz client never saw DirectUpgradeSucceeded: {e}"))?;
+    sharer
+        .wait_event(upgrade_success, Duration::from_secs(15))
+        .map_err(|e| format!("nz sharer never saw DirectUpgradeSucceeded: {e}"))?;
+    // Settle the queued transport swap before measuring (see direct_saturation).
+    let _ = client.udp_echo(svc(ECHO_UDP_PORT), 10, 200, Duration::from_secs(30))?;
+
+    let (dl, ul) = measure_saturation(&client, "direct_nz", "shaped50")?;
+    log::info!("direct_nz shaped50: download {dl:.1} Mbit/s, upload {ul:.1} Mbit/s");
+    if dl <= 0.0 || ul <= 0.0 {
+        return Err(format!("nz direct produced no throughput (dl {dl:.1}, ul {ul:.1})"));
+    }
+    client.stop();
+    sharer.stop();
     Ok(())
 }
 
