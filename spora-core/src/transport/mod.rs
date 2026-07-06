@@ -1,6 +1,7 @@
 pub mod frag;
 pub mod keepalive;
 pub mod meter;
+pub mod noise;
 pub mod quic;
 pub mod stream;
 pub mod upgradable;
