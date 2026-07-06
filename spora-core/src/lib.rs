@@ -504,7 +504,8 @@ async fn park_and_accept(
     Ok(Some(carrier::PeerSession {
         transport,
         remote_addr: relay_addr,
-        quic: None,
+        quic_conn: None,
+        signal: None,
         fixed_mtu: carrier::STREAM_TUNNEL_MTU,
     }))
 }
@@ -654,12 +655,14 @@ async fn noise_accept_dispatcher(
             let stx = session_tx.clone();
             tokio::spawn(async move {
                 match noise_accept(sock, rx, idx_a, None, id.as_ref(), hs_timeout, idle).await {
-                    Ok(transport) => {
+                    Ok(mut transport) => {
                         let remote_addr = transport.peer_addr();
+                        let signal = transport.take_signal().map(crate::signal::SignalChannel::noise);
                         let _ = stx.send(carrier::PeerSession {
                             transport: Box::new(transport),
                             remote_addr,
-                            quic: None,
+                            quic_conn: None,
+                            signal,
                             fixed_mtu: NZ_TUNNEL_MTU,
                         });
                     }
@@ -764,13 +767,10 @@ fn spawn_responder_tunnel(
     let carrier::PeerSession {
         transport,
         remote_addr,
-        quic,
+        quic_conn,
+        signal,
         fixed_mtu,
     } = session;
-    let (quic_conn, quic_signal) = match quic {
-        Some(q) => (Some(q.conn), Some(q.signal)),
-        None => (None, None),
-    };
 
     let (upgradable, upgrade_sender, router_handle) = upgradable_transport(transport);
     let keepalive_cfg = KeepAliveConfig::default();
@@ -789,7 +789,7 @@ fn spawn_responder_tunnel(
     // TcpTls (stream) session has no signal channel or UDP path; and a session
     // whose client is Direct dropped its signal, so try_direct_upgrade
     // terminates via SignalClosed before it STUNs.
-    let upgrade_task = match (config.enable_direct_upgrade, quic_signal) {
+    let upgrade_task = match (config.enable_direct_upgrade, signal) {
         (true, Some(signal)) => {
             let stun_server = config.stun_server.clone();
             let protector = config.protector.clone();
@@ -1047,15 +1047,10 @@ async fn dial_initiator(
     let carrier::PeerSession {
         transport,
         remote_addr,
-        quic,
+        quic_conn,
+        signal,
         fixed_mtu,
     } = session;
-    // Split the QUIC-only extras: the connection (dynamic PMTUD MTU) and the
-    // signal channel (hole-punch upgrade). Both are None for a stream carrier.
-    let (quic_conn, quic_signal) = match quic {
-        Some(q) => (Some(q.conn), Some(q.signal)),
-        None => (None, None),
-    };
 
     emit(
         &config.event_hook,
@@ -1106,9 +1101,9 @@ async fn dial_initiator(
     // drops the signal now, so the sharer's responder upgrade hits EOF on its
     // first recv_endpoint and stops *before* it ever STUNs.
     let attempt_upgrade =
-        config.enable_direct_upgrade && protocol.is_relayed() && quic_signal.is_some();
+        config.enable_direct_upgrade && protocol.is_relayed() && signal.is_some();
     if attempt_upgrade {
-        let signal = quic_signal.expect("attempt_upgrade requires a QUIC signal channel");
+        let signal = signal.expect("attempt_upgrade requires a signal channel");
         let role = DirectRole::Initiator {
             routing_key: token.routing_key,
             secret: token.secret,
@@ -1153,10 +1148,10 @@ async fn dial_initiator(
             // Relayed QUIC + disabled: hold it until session death (peer's
             // attempts time out instead of erroring). Stream carrier: None.
             let held_signal = if drop_signal_now {
-                drop(quic_signal);
+                drop(signal);
                 None
             } else {
-                quic_signal
+                signal
             };
             tokio::select! {
                 _ = upgrade_cancel.cancelled() => {}
@@ -1314,30 +1309,37 @@ pub(crate) async fn try_direct_upgrade(
             }
         };
         match result {
-            Ok((transport, conn, local)) => {
+            Ok((transport, path)) => {
                 info!("Direct connection established, upgrading transport");
                 if upgrade_sender.send(transport).is_err() {
                     warn!("Failed to send upgrade — tunnel already closed");
                     return;
                 }
                 if let Some(sl) = &conn_log {
-                    sl.addr(AddrKind::Verified, conn.remote_address());
+                    sl.addr(AddrKind::Verified, path.peer);
                 }
                 emit(
                     &event_hook,
                     TunnelEvent::DirectUpgradeSucceeded {
-                        local,
-                        peer: conn.remote_address(),
+                        local: path.local,
+                        peer: path.peer,
                     },
                 );
+                // MTU: a QUIC path reports its PMTUD-converged datagram size after
+                // a grace; nz reports its fixed budget immediately.
                 if let Some(cb) = mtu_callback.clone() {
-                    tokio::spawn(async move {
-                        tokio::time::sleep(Duration::from_millis(1500)).await;
-                        if let Some(mds) = conn.max_datagram_size() {
-                            info!("P2P max datagram size (post-PMTUD): {}", mds);
-                            cb(mds as u16);
+                    match path.quic_conn {
+                        Some(conn) => {
+                            tokio::spawn(async move {
+                                tokio::time::sleep(Duration::from_millis(1500)).await;
+                                if let Some(mds) = conn.max_datagram_size() {
+                                    info!("P2P max datagram size (post-PMTUD): {}", mds);
+                                    cb(mds as u16);
+                                }
+                            });
                         }
-                    });
+                        None => cb(path.fixed_mtu),
+                    }
                 }
                 return;
             }
@@ -1373,6 +1375,20 @@ pub(crate) async fn try_direct_upgrade(
 /// Initiator (B): STUN, exchange endpoint, punch, build direct QUIC client
 /// (cert-pinned to `routing_key`, sends `secret` on auth stream). On success
 /// also returns the punched socket's local address (for event reporting).
+/// The direct path a successful upgrade round produced, carrier-neutral. The
+/// old `(transport, quinn::Connection, local)` triple was QUIC-specific; nz has
+/// no `Connection`, so the MTU source is split out.
+struct DirectPath {
+    /// Verified direct peer address.
+    peer: SocketAddr,
+    /// Local address of the punched socket.
+    local: SocketAddr,
+    /// The QUIC connection, read for the post-PMTUD dynamic MTU. `None` for nz,
+    /// which reports `fixed_mtu` immediately.
+    quic_conn: Option<Connection>,
+    fixed_mtu: u16,
+}
+
 async fn try_direct_as_initiator(
     signal: &mut SignalChannel,
     stun_server: &str,
@@ -1381,7 +1397,7 @@ async fn try_direct_as_initiator(
     routing_key: [u8; ROUTING_KEY_LEN],
     secret: [u8; SECRET_LEN],
     timings: &Timings,
-) -> Result<(IpTransport, Connection, SocketAddr), DirectError> {
+) -> Result<(IpTransport, DirectPath), DirectError> {
     let (socket, external_addr) = pierce_keep_socket(stun_server, protector, path_ipv6)
         .await
         .map_err(DirectError::Transient)?;
@@ -1420,6 +1436,32 @@ async fn try_direct_as_initiator(
     let local_addr = socket
         .local_addr()
         .map_err(|e| DirectError::Transient(format!("local_addr: {}", e)))?;
+    // Rebuild the direct path with the SAME carrier as the relay path — the
+    // signal variant tells us which. nz: a fresh NNpsk0 session over the punched
+    // socket (independent keys/counters — a rebuild, not a cipher-state handoff).
+    if signal.is_noise() {
+        let socket = std::sync::Arc::new(socket);
+        let mut transport = crate::transport::noise::noise_connect(
+            socket,
+            learned_peer,
+            &routing_key,
+            &secret,
+            timings.relay_dial_timeout,
+            timings.quic_idle_timeout,
+        )
+        .await
+        .map_err(DirectError::Transient)?;
+        let _ = transport.take_signal(); // already direct — no further upgrade
+        return Ok((
+            Box::new(transport),
+            DirectPath {
+                peer: learned_peer,
+                local: local_addr,
+                quic_conn: None,
+                fixed_mtu: crate::transport::noise::NZ_TUNNEL_MTU,
+            },
+        ));
+    }
     let std_sock = socket
         .into_std()
         .map_err(|e| DirectError::Transient(format!("into_std: {}", e)))?;
@@ -1436,8 +1478,15 @@ async fn try_direct_as_initiator(
     // the connection, and building a second QuicPeerTransport here would
     // leave that reader to steal the first inbound datagram before exiting.
     let conn = session.conn;
-    let transport: IpTransport = Box::new(session.transport);
-    Ok((transport, conn, local_addr))
+    Ok((
+        Box::new(session.transport),
+        DirectPath {
+            peer: conn.remote_address(),
+            local: local_addr,
+            quic_conn: Some(conn),
+            fixed_mtu: 0,
+        },
+    ))
 }
 
 /// Responder (A): wait for peer endpoint, STUN, send own endpoint, punch,
@@ -1450,7 +1499,7 @@ async fn try_direct_as_responder(
     identity: &Identity,
     timings: &Timings,
     conn_log: Option<&SessionLog>,
-) -> Result<(IpTransport, Connection, SocketAddr), DirectError> {
+) -> Result<(IpTransport, DirectPath), DirectError> {
     let (peer_addr, socket) = {
         let mut neg = SignalNegChannel::new(signal);
         let peer_addr = neg.recv_endpoint().await.map_err(neg_err)?;
@@ -1503,6 +1552,35 @@ async fn try_direct_as_responder(
     let local_addr = socket
         .local_addr()
         .map_err(|e| DirectError::Transient(format!("local_addr: {}", e)))?;
+    // nz responder: accept a fresh NNpsk0 session on the punched socket (a pump
+    // feeds noise_accept, which waits for the initiator's msg1). Same carrier as
+    // the relay path; independent keys.
+    if signal.is_noise() {
+        let socket = std::sync::Arc::new(socket);
+        let (rx, pump) = crate::transport::noise::spawn_socket_pump(socket.clone());
+        let mut transport = crate::transport::noise::noise_accept(
+            socket,
+            rx,
+            rand::random(),
+            Some(pump),
+            identity,
+            timings.relay_dial_timeout,
+            timings.quic_idle_timeout,
+        )
+        .await
+        .map_err(DirectError::Transient)?;
+        let peer = transport.peer_addr();
+        let _ = transport.take_signal(); // already direct — no further upgrade
+        return Ok((
+            Box::new(transport),
+            DirectPath {
+                peer,
+                local: local_addr,
+                quic_conn: None,
+                fixed_mtu: crate::transport::noise::NZ_TUNNEL_MTU,
+            },
+        ));
+    }
     let std_sock = socket
         .into_std()
         .map_err(|e| DirectError::Transient(format!("into_std: {}", e)))?;
@@ -1537,8 +1615,15 @@ async fn try_direct_as_responder(
     // QuicPeerTransport would orphan the session's reader, which eats the
     // first inbound datagram on the fresh direct path.
     let conn = session.conn;
-    let transport: IpTransport = Box::new(session.transport);
-    Ok((transport, conn, local_addr))
+    Ok((
+        Box::new(session.transport),
+        DirectPath {
+            peer: conn.remote_address(),
+            local: local_addr,
+            quic_conn: Some(conn),
+            fixed_mtu: 0,
+        },
+    ))
 }
 
 // ---------- Helpers ----------

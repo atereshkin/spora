@@ -41,6 +41,7 @@ fn main() {
         "nat_matrix",
         spora_lab::scenarios![
             open_open_direct,
+            nz_open_open_direct,
             cone_cone_direct,
             fullcone_symmetric_direct,
             symmetric_cone_fallback,
@@ -130,13 +131,33 @@ enum WanLatency {
 }
 
 /// Fresh topology + wan services + both peers; returns once the relay-via
-/// session is up on both sides.
+/// session is up on both sides. Defaults to the UDP-QUIC carrier.
 fn setup(
     sharer_kind: NatKind,
     client_kind: NatKind,
     timings: Timings,
     relay_state: fn() -> relay::State,
     latency: WanLatency,
+) -> Result<(Topology, WanHandle, SharerHandle, ClientHandle), String> {
+    setup_carrier(
+        sharer_kind,
+        client_kind,
+        timings,
+        relay_state,
+        latency,
+        spora_core::identity::RelayProtocol::UdpQuic,
+    )
+}
+
+/// Like [`setup`], but pins both peers to `carrier` (on the same relay, which
+/// routes nz and QUIC alike by routing key).
+fn setup_carrier(
+    sharer_kind: NatKind,
+    client_kind: NatKind,
+    timings: Timings,
+    relay_state: fn() -> relay::State,
+    latency: WanLatency,
+    carrier: spora_core::identity::RelayProtocol,
 ) -> Result<(Topology, WanHandle, SharerHandle, ClientHandle), String> {
     let topo = Topology::build(&TopologySpec::new(sharer_kind, client_kind))?;
     match latency {
@@ -163,6 +184,15 @@ fn setup(
     let mut opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
     opts.timings = timings;
     opts.enable_direct_upgrade = true;
+    // Non-default carrier: point both peers at it on the same relay.
+    if carrier != spora_core::identity::RelayProtocol::UdpQuic {
+        let a = wan.relay_addr();
+        opts.relays = vec![spora_core::identity::RelayEndpoint::with_protocol(
+            a.ip().to_string(),
+            a.port(),
+            carrier,
+        )];
+    }
 
     let mut sharer = peers::start_sharer(&topo.sharer, &opts)?;
     let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)?;
@@ -296,6 +326,40 @@ fn direct_pair_case(
 fn open_open_direct() -> Result<(), String> {
     // No NATs anywhere: the punch is trivially symmetric, no latency needed.
     direct_pair_case(NatKind::Open, NatKind::Open, WanLatency::Zero)
+}
+
+/// The nz (Noise UDP) carrier's relay->direct upgrade: bootstrap relay-via over
+/// nz, exchange endpoints on the in-band signal channel, hole punch, then stand
+/// up a FRESH NNpsk0 session over the punched socket (a rebuild, not a
+/// cipher-state handoff). Open x Open isolates the nz-specific rebuild from NAT
+/// punch subtleties. Killing the relay proves the direct nz path is load-bearing.
+fn nz_open_open_direct() -> Result<(), String> {
+    let (_topo, wan, mut sharer, mut client) = setup_carrier(
+        NatKind::Open,
+        NatKind::Open,
+        Timings::default(),
+        relay::State::default,
+        WanLatency::Zero,
+        spora_core::identity::RelayProtocol::NoiseUdp,
+    )?;
+
+    client
+        .wait_event(is_upgrade_success, UPGRADE_TIMEOUT)
+        .map_err(|e| format!("nz: client never saw DirectUpgradeSucceeded: {e}"))?;
+    sharer
+        .wait_event(is_upgrade_success, Duration::from_secs(15))
+        .map_err(|e| format!("nz: sharer never saw DirectUpgradeSucceeded: {e}"))?;
+
+    assert_echo_works(&client, "nz: post-upgrade")?;
+
+    // The direct nz path must be load-bearing: with the relay gone, traffic
+    // would be 100% lost if the session still rode it.
+    wan.stop_relay()?;
+    assert_echo_works(&client, "nz: relay dead")?;
+
+    client.stop();
+    sharer.stop();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

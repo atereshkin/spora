@@ -43,19 +43,17 @@ pub(crate) struct PeerSession {
     /// Remote address of the bootstrap connection (the relay, or the peer for
     /// `Direct`) — used for events and the connection log.
     pub remote_addr: SocketAddr,
-    /// QUIC-only extras: the connection (for the dynamic PMTUD MTU) and the
-    /// signal channel (for the hole-punch upgrade). `None` for stream/Noise
-    /// carriers.
-    pub quic: Option<QuicSessionExt>,
+    /// The QUIC connection when the carrier is QUIC — read for the dynamic
+    /// PMTUD MTU. `None` for stream/Noise carriers, which use `fixed_mtu`.
+    pub quic_conn: Option<Connection>,
+    /// The hole-punch signal channel, when the carrier supports a direct upgrade
+    /// (QUIC or Noise). `None` for `TcpTls`. Its variant also tells the upgrade
+    /// which carrier to rebuild the direct path with.
+    pub signal: Option<SignalChannel>,
     /// Fixed tunnel MTU to report when there is no QUIC connection to read a
     /// PMTUD-converged datagram size from (stream and Noise carriers). Ignored
-    /// when `quic` is `Some` (PMTUD drives the MTU there).
+    /// when `quic_conn` is `Some` (PMTUD drives the MTU there).
     pub fixed_mtu: u16,
-}
-
-pub(crate) struct QuicSessionExt {
-    pub conn: Connection,
-    pub signal: SignalChannel,
 }
 
 impl PeerSession {
@@ -69,7 +67,8 @@ impl PeerSession {
         Self {
             remote_addr: conn.remote_address(),
             transport: Box::new(transport),
-            quic: Some(QuicSessionExt { conn, signal }),
+            quic_conn: Some(conn),
+            signal: Some(signal),
             fixed_mtu: STREAM_TUNNEL_MTU, // unused: PMTUD drives a QUIC session's MTU
         }
     }
@@ -139,7 +138,8 @@ async fn tcp_tls_dial(ctx: DialCtx<'_>) -> Result<PeerSession, String> {
     Ok(PeerSession {
         transport,
         remote_addr: ctx.target,
-        quic: None,
+        quic_conn: None,
+        signal: None,
         fixed_mtu: STREAM_TUNNEL_MTU,
     })
 }
@@ -153,7 +153,7 @@ async fn noise_dial(ctx: DialCtx<'_>) -> Result<PeerSession, String> {
     let socket = std::sync::Arc::new(
         tokio::net::UdpSocket::from_std(std_socket).map_err(|e| format!("nz socket: {e}"))?,
     );
-    let transport = crate::transport::noise::noise_connect(
+    let mut transport = crate::transport::noise::noise_connect(
         socket,
         ctx.target,
         &ctx.routing_key,
@@ -162,10 +162,13 @@ async fn noise_dial(ctx: DialCtx<'_>) -> Result<PeerSession, String> {
         ctx.timings.quic_idle_timeout,
     )
     .await?;
+    // The in-band signal channel drives the hole-punch direct upgrade.
+    let signal = transport.take_signal().map(SignalChannel::noise);
     Ok(PeerSession {
         transport: Box::new(transport),
         remote_addr: ctx.target,
-        quic: None,
+        quic_conn: None,
+        signal,
         fixed_mtu: crate::transport::noise::NZ_TUNNEL_MTU,
     })
 }

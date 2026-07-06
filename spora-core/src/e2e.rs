@@ -168,7 +168,7 @@ pub async fn authenticate_incoming(
     info!("e2e accept: authenticated peer {}", peer);
 
     let transport = QuicPeerTransport::new(conn.clone());
-    let signal = SignalChannel::new(send, recv);
+    let signal = SignalChannel::quic(send, recv);
     Ok(E2eSession {
         conn,
         transport,
@@ -288,7 +288,7 @@ pub async fn client_connect(
     };
 
     let transport = QuicPeerTransport::new(conn.clone());
-    let signal = SignalChannel::new(send, recv);
+    let signal = SignalChannel::quic(send, recv);
     Ok(E2eSession {
         conn,
         transport,

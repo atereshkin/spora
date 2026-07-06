@@ -256,15 +256,27 @@ pub(crate) fn spawn_socket_pump(
     (rx, handle)
 }
 
-async fn recv_dgram(
+/// Receive the first datagram matching `pred`, skipping any that don't — so a
+/// handshake tolerates stray packets sharing the socket (on the direct path the
+/// punched socket still carries in-flight hole-punch/verify markers, and a relay
+/// may briefly mingle flows). Skipped packets are cheap to discard; a match is
+/// validated by the caller. Times out if none matches in `within`.
+async fn recv_matching<F: Fn(&[u8]) -> bool>(
     rx: &mut mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>,
     within: Duration,
+    pred: F,
 ) -> Result<(Vec<u8>, SocketAddr), String> {
-    match timeout(within, rx.recv()).await {
-        Ok(Some(x)) => Ok(x),
-        Ok(None) => Err("nz: datagram source closed".into()),
-        Err(_) => Err("nz: handshake timed out".into()),
-    }
+    timeout(within, async {
+        loop {
+            match rx.recv().await {
+                Some((d, src)) if pred(&d) => return Ok((d, src)),
+                Some(_) => continue, // stray (punch leftover / other flow) — skip
+                None => return Err("nz: datagram source closed".to_string()),
+            }
+        }
+    })
+    .await
+    .map_err(|_| "nz: handshake timed out".to_string())?
 }
 
 // ---- handshake drivers ----------------------------------------------------
@@ -294,15 +306,13 @@ pub(crate) async fn noise_connect(
         .await
         .map_err(|e| format!("nz send msg1: {e}"))?;
 
-    // msg2: idx_B | idx_A | noise_msg2
-    let (msg2, _src) = recv_dgram(&mut rx, hs_timeout).await?;
-    if msg2.len() < 2 * INDEX_LEN {
-        return Err("nz: short msg2".into());
-    }
-    let idx_b_echo = u32::from_be_bytes(msg2[0..INDEX_LEN].try_into().unwrap());
-    if idx_b_echo != idx_b {
-        return Err("nz: msg2 session-index mismatch".into());
-    }
+    // msg2: idx_B | idx_A | noise_msg2. Filter by our idx_B echoed back, so a
+    // stray punch/verify packet on a shared socket can't be misread as msg2.
+    let idx_b_bytes = idx_b.to_be_bytes();
+    let (msg2, _src) = recv_matching(&mut rx, hs_timeout, |d| {
+        d.len() >= 2 * INDEX_LEN && d[0..INDEX_LEN] == idx_b_bytes
+    })
+    .await?;
     let idx_a = u32::from_be_bytes(msg2[INDEX_LEN..2 * INDEX_LEN].try_into().unwrap());
     hs.read_message(&msg2[2 * INDEX_LEN..])?;
     if !hs.is_finished() {
@@ -311,12 +321,21 @@ pub(crate) async fn noise_connect(
     let session = Arc::new(hs.into_session()?);
     let hp_key = derive_hp_key(&session.handshake_hash);
 
-    // cert-auth: A's first transport message (counter 0).
-    let (auth, _src) = recv_dgram(&mut rx, hs_timeout).await?;
-    let (_c, channel, auth_pt) = deframe_data(&session, &hp_key, idx_b, &auth)?;
-    if channel != CH_AUTH {
-        return Err("nz: expected cert-auth, got another frame".into());
-    }
+    // cert-auth: A's first transport message (counter 0). Skip strays until a
+    // datagram deframes as an AUTH frame under our index.
+    let auth_pt = timeout(hs_timeout, async {
+        loop {
+            let (d, _) = match rx.recv().await {
+                Some(x) => x,
+                None => return Err("nz: datagram source closed".to_string()),
+            };
+            if let Ok((_c, CH_AUTH, pt)) = deframe_data(&session, &hp_key, idx_b, &d) {
+                return Ok(pt);
+            }
+        }
+    })
+    .await
+    .map_err(|_| "nz: timed out waiting for cert-auth".to_string())??;
     verify_cert_auth(&auth_pt, routing_key, &session.handshake_hash)?;
 
     Ok(NoisePeerTransport::spawn(NoiseChannelInit {
@@ -347,13 +366,12 @@ pub(crate) async fn noise_accept(
     hs_timeout: Duration,
     idle: Duration,
 ) -> Result<NoisePeerTransport, String> {
-    let (msg1, peer_addr) = recv_dgram(&mut rx, hs_timeout).await?;
-    if msg1.len() < NZ_MSG1_MIN {
-        return Err("nz: short msg1".into());
-    }
-    if msg1[0..ROUTING_KEY_LEN] != identity.routing_key {
-        return Err("nz: msg1 routing-key mismatch".into());
-    }
+    // Filter to our own msg1 (routing_key prefix), skipping strays — on the
+    // direct path the punched socket still carries in-flight punch markers.
+    let (msg1, peer_addr) = recv_matching(&mut rx, hs_timeout, |d| {
+        d.len() >= NZ_MSG1_MIN && d[0..ROUTING_KEY_LEN] == identity.routing_key
+    })
+    .await?;
     let idx_b = u32::from_be_bytes(msg1[ROUTING_KEY_LEN..ROUTING_KEY_LEN + INDEX_LEN].try_into().unwrap());
 
     let mut hs = NoiseHandshake::responder(identity)?;
@@ -565,7 +583,7 @@ impl NoisePeerTransport {
 /// an AEAD nonce) and receives via the transport reader's `CH_SIGNAL` split.
 /// The API mirrors [`crate::signal::SignalChannel`] so the direct-upgrade code
 /// treats both carriers alike.
-pub(crate) struct NoiseSignal {
+pub struct NoiseSignal {
     sig_rx: mpsc::UnboundedReceiver<Vec<u8>>,
     session: Arc<NoiseSession>,
     hp_key: [u8; 32],
