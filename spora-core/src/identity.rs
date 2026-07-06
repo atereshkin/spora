@@ -206,6 +206,11 @@ pub enum RelayProtocol {
     /// UDP/QUIC-class blocking). Relayed, stream-native — see the `carrier`
     /// module and `e2e_tls`.
     TcpTls,
+    /// The dumb UDP relay carrying an end-to-end Noise datagram session — a
+    /// high-entropy, non-QUIC-shaped transport for networks that fingerprint or
+    /// throttle QUIC. Relayed; see the `carrier` module, `e2e_noise`, and
+    /// `transport::noise`.
+    NoiseUdp,
 }
 
 impl RelayProtocol {
@@ -214,17 +219,18 @@ impl RelayProtocol {
     /// the sharer instead binds and advertises the endpoint itself.
     pub fn is_relayed(self) -> bool {
         match self {
-            RelayProtocol::UdpQuic | RelayProtocol::TcpTls => true,
+            RelayProtocol::UdpQuic | RelayProtocol::TcpTls | RelayProtocol::NoiseUdp => true,
             RelayProtocol::Direct => false,
         }
     }
 
-    /// Whether this protocol's E2E path is QUIC datagrams (vs a byte stream).
-    /// Only QUIC carriers support the UDP hole-punch direct upgrade.
+    /// Whether this protocol's E2E path is QUIC datagrams (vs a byte stream or a
+    /// Noise datagram session). Only QUIC carriers currently support the UDP
+    /// hole-punch direct upgrade.
     pub fn is_quic(self) -> bool {
         match self {
             RelayProtocol::UdpQuic | RelayProtocol::Direct => true,
-            RelayProtocol::TcpTls => false,
+            RelayProtocol::TcpTls | RelayProtocol::NoiseUdp => false,
         }
     }
 
@@ -236,6 +242,7 @@ impl RelayProtocol {
             RelayProtocol::UdpQuic => None,
             RelayProtocol::Direct => Some("direct"),
             RelayProtocol::TcpTls => Some("tcptls"),
+            RelayProtocol::NoiseUdp => Some("nz"),
         }
     }
 
@@ -246,6 +253,7 @@ impl RelayProtocol {
             "quic" | "udpquic" => Some(RelayProtocol::UdpQuic),
             "direct" => Some(RelayProtocol::Direct),
             "tcptls" => Some(RelayProtocol::TcpTls),
+            "nz" => Some(RelayProtocol::NoiseUdp),
             _ => None,
         }
     }

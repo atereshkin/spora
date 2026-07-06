@@ -34,6 +34,12 @@ pub const FLOW_TIMEOUT: Duration = Duration::from_secs(60);
 pub const SWEEP_INTERVAL: Duration = Duration::from_secs(5);
 pub const RECV_BUF: usize = 4096;
 
+/// Smallest `nz` (Noise UDP) carrier first packet the relay will route by its
+/// leading routing-key prefix: `routing_key(20) | session index(4) | a Noise
+/// NNpsk0 msg1 (32-byte ephemeral + 16-byte tag = 48)`. The relay reads only the
+/// public 20-byte prefix — the same thing it reads from a QUIC Initial's DCID.
+pub const NZ_MSG1_MIN: usize = ROUTING_KEY_LEN + 4 + 48;
+
 /// How long after the sharer last sent toward its client the flow still counts
 /// as "actively serving" (and so blocks a new client). Must exceed the sharer's
 /// QUIC keep-alive cadence (10s) so a live but idle session stays protected
@@ -196,14 +202,34 @@ impl State {
             return Action::Forward(flow.dst);
         }
 
-        // Unmatched source — only QUIC long-header packets with a DCID equal
-        // to a registered routing key can install a new flow.
+        // Unmatched source — install a new flow if the packet carries a
+        // registered routing key. Two carriers present it two ways, and the relay
+        // treats them identically once the 20-byte key is in hand:
+        //   - UdpQuic: a QUIC Initial's DCID (at the QUIC offset).
+        //   - NoiseUdp: an nz first packet's leading routing_key prefix.
+        // The nz check runs even when classify() bucketed the (random) first byte
+        // as a QUIC long header, as long as the QUIC-DCID lookup missed — so an nz
+        // msg1 that merely looks QUIC-shaped is still routed.
+        let mut matched_rk: Option<RoutingKey> = None;
         if let Classified::QuicLongHeader { dcid } = classified
             && dcid.len() == ROUTING_KEY_LEN
         {
             let mut rk: RoutingKey = [0u8; ROUTING_KEY_LEN];
             rk.copy_from_slice(dcid);
-            if let Some((sharer_addr, reg_ts, _)) = self.registrations.get(&rk).copied() {
+            if self.registrations.contains_key(&rk) {
+                matched_rk = Some(rk);
+            }
+        }
+        if matched_rk.is_none() && pkt.len() >= NZ_MSG1_MIN {
+            let mut rk: RoutingKey = [0u8; ROUTING_KEY_LEN];
+            rk.copy_from_slice(&pkt[..ROUTING_KEY_LEN]);
+            if self.registrations.contains_key(&rk) {
+                matched_rk = Some(rk);
+            }
+        }
+        if let Some(rk) = matched_rk
+            && let Some((sharer_addr, reg_ts, _)) = self.registrations.get(&rk).copied()
+        {
                 // Refuse a self-referential or non-relayable flow *before* the
                 // one-at-a-time check, so a spoofed packet can neither bootstrap
                 // a self-sustaining loop nor occupy the sharer's flow slot.
@@ -307,7 +333,6 @@ impl State {
                 );
                 return Action::Forward(sharer_addr);
             }
-        }
 
         Action::Drop
     }

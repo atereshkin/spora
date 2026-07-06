@@ -505,7 +505,170 @@ async fn park_and_accept(
         transport,
         remote_addr: relay_addr,
         quic: None,
+        fixed_mtu: carrier::STREAM_TUNNEL_MTU,
     }))
+}
+
+/// Sharer-side Noise UDP carrier. Bind a dedicated socket, register every
+/// `NoiseUdp` relay from it (so those relays route clients here), and run a
+/// multi-client accept dispatcher that delivers each authenticated client as a
+/// session into `session_tx`. A no-op when the config lists no `NoiseUdp` relay.
+fn spawn_noise_registrar(
+    config: &Config,
+    identity: Arc<Identity>,
+    session_tx: tokio::sync::mpsc::UnboundedSender<carrier::PeerSession>,
+    cancel: CancellationToken,
+) {
+    let nz_relays: Vec<RelayEndpoint> = config
+        .relays
+        .iter()
+        .filter(|r| r.protocol == RelayProtocol::NoiseUdp)
+        .cloned()
+        .collect();
+    if nz_relays.is_empty() {
+        return;
+    }
+    let protector = config.protector.clone();
+    let token = config.relay_token.clone();
+    let cert_der = identity.cert_der_bytes.clone();
+    let key_der = identity.key_der_bytes.clone();
+    let register_interval = config.timings.register_interval;
+    let hs_timeout = config.timings.relay_dial_timeout;
+    let idle = config.timings.quic_idle_timeout;
+
+    tokio::spawn(async move {
+        let addrs: Vec<SocketAddr> = match resolve_relays(&nz_relays) {
+            Ok(a) => a.into_iter().map(|(a, _)| a).collect(),
+            Err(e) => {
+                warn!("[share] nz: cannot resolve relays: {e}");
+                return;
+            }
+        };
+        if addrs.is_empty() {
+            return;
+        }
+        let want_v6 = addrs.iter().any(|a| a.is_ipv6());
+        let std_socket = match bind_share_udp(&protector, want_v6, 0) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!("[share] nz: bind failed: {e}");
+                return;
+            }
+        };
+        if let Err(e) = std_socket.set_nonblocking(true) {
+            warn!("[share] nz: set_nonblocking: {e}");
+            return;
+        }
+        let socket = match UdpSocket::from_std(std_socket) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                warn!("[share] nz: from_std: {e}");
+                return;
+            }
+        };
+        let signer = match relay_client::protocol::RegisterSigner::new(&cert_der, &key_der) {
+            Ok(s) => s.with_token(token),
+            Err(e) => {
+                warn!("[share] nz: build register signer: {e}");
+                return;
+            }
+        };
+        info!("[share] nz carrier up, registering with {:?}", addrs);
+        let reg_socket = socket.clone();
+        tokio::select! {
+            _ = cancel.cancelled() => {}
+            _ = relay_client::register_loop(reg_socket, addrs, register_interval, signer) => {}
+            _ = noise_accept_dispatcher(socket, identity, session_tx, hs_timeout, idle, cancel.clone()) => {}
+        }
+    });
+}
+
+/// Read the shared nz socket and route each datagram: to an existing session by
+/// its `recv_index`, or — a fresh `routing_key`-prefixed msg1 — to a new
+/// `noise_accept` whose dispatcher-assigned index we record for routing. The
+/// relay is dumb, so all clients arrive from the relay's one address; demux is
+/// purely by the session index, never by source address.
+async fn noise_accept_dispatcher(
+    socket: Arc<UdpSocket>,
+    identity: Arc<Identity>,
+    session_tx: tokio::sync::mpsc::UnboundedSender<carrier::PeerSession>,
+    hs_timeout: Duration,
+    idle: Duration,
+    cancel: CancellationToken,
+) {
+    use crate::transport::noise::{DATA_MIN_LEN, NZ_MSG1_MIN, NZ_TUNNEL_MTU, noise_accept};
+    type RawTx = tokio::sync::mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>;
+    // idx_A -> that session's raw-datagram sender.
+    let mut by_index: std::collections::HashMap<u32, RawTx> = std::collections::HashMap::new();
+    // idx_B -> idx_A, so a client's retransmitted msg1 (its msg2 was lost) is
+    // re-delivered to the same session instead of spawning a duplicate.
+    let mut by_client: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
+    let mut buf = vec![0u8; 2048];
+
+    loop {
+        let (n, src) = tokio::select! {
+            _ = cancel.cancelled() => return,
+            r = socket.recv_from(&mut buf) => match r {
+                Ok(x) => x,
+                Err(e) => { warn!("[share] nz recv: {e}"); continue; }
+            },
+        };
+
+        // 1) Belongs to an existing session? Route by recv_index.
+        if n >= DATA_MIN_LEN {
+            let idx = u32::from_be_bytes(buf[0..4].try_into().unwrap());
+            if by_index.contains_key(&idx) {
+                let dead = by_index[&idx].send((buf[..n].to_vec(), src)).is_err();
+                if dead {
+                    by_index.remove(&idx);
+                    by_client.retain(|_, v| *v != idx);
+                }
+                continue;
+            }
+        }
+
+        // 2) A handshake msg1 addressed to us (routing_key prefix)?
+        if n >= NZ_MSG1_MIN && buf[0..ROUTING_KEY_LEN] == identity.routing_key {
+            let idx_b =
+                u32::from_be_bytes(buf[ROUTING_KEY_LEN..ROUTING_KEY_LEN + 4].try_into().unwrap());
+            if let Some(&idx_a) = by_client.get(&idx_b) {
+                if let Some(tx) = by_index.get(&idx_a) {
+                    let _ = tx.send((buf[..n].to_vec(), src)); // retransmit -> same session
+                }
+                continue;
+            }
+            // New client: assign the idx_A the dispatcher will route future
+            // packets by, seed the session's channel with this msg1, and drive
+            // the responder handshake in its own task.
+            let mut idx_a: u32 = rand::random();
+            while by_index.contains_key(&idx_a) {
+                idx_a = rand::random();
+            }
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<(Vec<u8>, SocketAddr)>();
+            let _ = tx.send((buf[..n].to_vec(), src));
+            by_index.insert(idx_a, tx);
+            by_client.insert(idx_b, idx_a);
+
+            let sock = socket.clone();
+            let id = identity.clone();
+            let stx = session_tx.clone();
+            tokio::spawn(async move {
+                match noise_accept(sock, rx, idx_a, None, id.as_ref(), hs_timeout, idle).await {
+                    Ok(transport) => {
+                        let remote_addr = transport.peer_addr();
+                        let _ = stx.send(carrier::PeerSession {
+                            transport: Box::new(transport),
+                            remote_addr,
+                            quic: None,
+                            fixed_mtu: NZ_TUNNEL_MTU,
+                        });
+                    }
+                    Err(e) => warn!("[share] nz accept failed: {e}"),
+                }
+            });
+        }
+        // else: unknown / garbage — drop.
+    }
 }
 
 async fn run_share_loop(
@@ -526,6 +689,11 @@ async fn run_share_loop(
     // Sharer-side TCP/TLS carrier: park connections at each TcpTls relay and
     // deliver each spliced client as a session into the same channel.
     spawn_tcp_registrars(&config, identity.clone(), session_tx.clone(), cancel.clone());
+
+    // Sharer-side Noise UDP carrier: register each NoiseUdp relay from a
+    // dedicated socket and deliver each authenticated client into the same
+    // channel. No-op when the config lists no NoiseUdp relay.
+    spawn_noise_registrar(&config, identity.clone(), session_tx.clone(), cancel.clone());
 
     info!("[share] waiting for peers");
     loop {
@@ -597,6 +765,7 @@ fn spawn_responder_tunnel(
         transport,
         remote_addr,
         quic,
+        fixed_mtu,
     } = session;
     let (quic_conn, quic_signal) = match quic {
         Some(q) => (Some(q.conn), Some(q.signal)),
@@ -675,7 +844,7 @@ fn spawn_responder_tunnel(
         }
         None => {
             if let Some(cb) = config.mtu_callback.clone() {
-                cb(carrier::STREAM_TUNNEL_MTU);
+                cb(fixed_mtu);
             }
         }
     }
@@ -879,6 +1048,7 @@ async fn dial_initiator(
         transport,
         remote_addr,
         quic,
+        fixed_mtu,
     } = session;
     // Split the QUIC-only extras: the connection (dynamic PMTUD MTU) and the
     // signal channel (hole-punch upgrade). Both are None for a stream carrier.
@@ -924,7 +1094,7 @@ async fn dial_initiator(
         }
         None => {
             if let Some(cb) = mtu_cb_relay {
-                cb(carrier::STREAM_TUNNEL_MTU);
+                cb(fixed_mtu);
             }
         }
     }

@@ -382,6 +382,87 @@ async fn udp_echo_over_tcp_tls_relay() {
     session.abort();
 }
 
+/// End-to-end over the Noise UDP (`nz`) relay carrier: the sharer registers a
+/// dedicated nz socket with the *same* dumb UDP relay (which routes nz by the
+/// routing-key prefix, exactly as it routes a QUIC Initial by DCID), the client
+/// dials the `nz/` URL, and the end-to-end Noise session carries the tunnel.
+/// Exercises the full non-QUIC datagram path — e2e_noise handshake +
+/// NoisePeerTransport + the share-side multi-client dispatcher — through the
+/// real `share()`/`connect()` composition.
+#[tokio::test(flavor = "multi_thread")]
+async fn udp_echo_over_nz_relay() {
+    let _ = env_logger::builder().is_test(true).try_init();
+
+    // In-process dumb UDP relay on loopback — unchanged; it routes nz and QUIC
+    // alike by routing key.
+    let relay_sock = tokio::net::UdpSocket::bind("127.0.0.1:0")
+        .await
+        .expect("bind relay socket");
+    let relay_addr = relay_sock.local_addr().unwrap();
+    let _relay_task = tokio::spawn(relay::serve(relay_sock, relay::State::default()));
+
+    let nz_ep = spora_core::identity::RelayEndpoint::with_protocol(
+        "127.0.0.1",
+        relay_addr.port(),
+        spora_core::identity::RelayProtocol::NoiseUdp,
+    );
+
+    // nz has no hole-punch upgrade in this stage; STUN is never hit.
+    let mut opts = LabPeerOpts::new("127.0.0.1:0".parse().unwrap(), "stun.invalid:3478");
+    opts.enable_direct_upgrade = false;
+
+    let (mut share_cfg, _share_events) = opts.config();
+    share_cfg.relays = vec![nz_ep];
+    share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
+    let session = spora_core::share(Identity::generate(), share_cfg)
+        .await
+        .expect("nz share() starts");
+    assert!(
+        session
+            .url
+            .as_str()
+            .contains(&format!("r=nz/127.0.0.1:{}", relay_addr.port())),
+        "URL must advertise the nz endpoint, got {}",
+        session.url
+    );
+
+    // Let the sharer register its nz socket with the relay before the client's
+    // first (un-retransmitted) handshake packet arrives.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (client_cfg, _client_events) = opts.config();
+    let connected = spora_core::connect(session.url.clone(), &client_cfg)
+        .await
+        .expect("connect() establishes over the nz relay");
+
+    let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel();
+    let pump = tokio::spawn(peers::drive_client(connected, cmd_rx));
+
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    cmd_tx
+        .send(TrafficCmd::UdpEcho {
+            server: FAKE_SERVER.into(),
+            count: 20,
+            payload_len: 64,
+            respond: tx,
+        })
+        .expect("pump is alive");
+    let stats = tokio::time::timeout(Duration::from_secs(30), rx)
+        .await
+        .expect("echo finishes within the deadline")
+        .expect("pump answers the command")
+        .expect("echo run succeeds");
+    assert_eq!(stats.sent, 20);
+    assert_eq!(stats.received, 20, "echo lost packets over the nz relay: {stats:?}");
+
+    drop(cmd_tx);
+    tokio::time::timeout(Duration::from_secs(5), pump)
+        .await
+        .expect("pump exits when the command channel closes")
+        .unwrap();
+    session.abort();
+}
+
 /// End-to-end authorization over the TCP/TLS relay: a gated relay (issuer key
 /// configured) parks — and thus serves — only a sharer presenting a valid
 /// capability token bound to its routing key. Without one, the sharer's REGISTER

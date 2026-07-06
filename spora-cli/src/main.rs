@@ -82,6 +82,13 @@ enum Mode {
         /// --relay to offer both (the client tries them in preference order).
         #[arg(long)]
         tcp_relay: Vec<String>,
+        /// Advertise a Noise UDP (`nz`) relay endpoint (host:port): the dumb UDP
+        /// relay carrying an end-to-end Noise datagram session — a high-entropy,
+        /// non-QUIC-shaped transport for networks that fingerprint or throttle
+        /// QUIC. Point it at a relay on a non-443 UDP port. Repeat for several;
+        /// combine with --relay to offer both (the client tries them in order).
+        #[arg(long)]
+        nz_relay: Vec<String>,
         /// Override the STUN server (host:port) used for direct-upgrade
         /// endpoint discovery.
         #[arg(long)]
@@ -255,6 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             relay,
             direct,
             tcp_relay,
+            nz_relay,
             stun,
             relay_token,
             no_conn_log,
@@ -290,6 +298,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     host,
                     port,
                     spora_core::identity::RelayProtocol::TcpTls,
+                ));
+            }
+            for z in &nz_relay {
+                let (host, port) = parse_host_port(z).map_err(|e| format!("--nz-relay: {}", e))?;
+                relays.push(spora_core::identity::RelayEndpoint::with_protocol(
+                    host,
+                    port,
+                    spora_core::identity::RelayProtocol::NoiseUdp,
                 ));
             }
             if !relays.is_empty() {

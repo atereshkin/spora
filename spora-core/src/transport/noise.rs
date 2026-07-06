@@ -67,7 +67,7 @@ const DATA_HEADER_LEN: usize = INDEX_LEN + COUNTER_LEN;
 /// Bytes of ciphertext sampled to derive the header-protection mask.
 const HP_SAMPLE_LEN: usize = 16;
 /// Smallest legal data packet: header + 1-byte channel + AEAD tag.
-const DATA_MIN_LEN: usize = DATA_HEADER_LEN + 1 + NOISE_TAG_LEN;
+pub(crate) const DATA_MIN_LEN: usize = DATA_HEADER_LEN + 1 + NOISE_TAG_LEN;
 
 /// The relay recognises an nz handshake by a `routing_key` prefix on a packet at
 /// least this long (routing_key + idx + a full NNpsk0 msg1 = 20 + 4 + 48).
@@ -226,10 +226,8 @@ impl ReplayWindow {
             self.highest = counter;
             self.set(counter);
             true
-        } else if self.highest - counter >= REPLAY_WINDOW {
-            false // too old
-        } else if self.get(counter) {
-            false // replay
+        } else if self.highest - counter >= REPLAY_WINDOW || self.get(counter) {
+            false // too old, or a replay within the window
         } else {
             self.set(counter);
             true
@@ -248,14 +246,9 @@ pub(crate) fn spawn_socket_pump(
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
-        loop {
-            match socket.recv_from(&mut buf).await {
-                Ok((n, src)) => {
-                    if tx.send((buf[..n].to_vec(), src)).is_err() {
-                        break;
-                    }
-                }
-                Err(_) => break,
+        while let Ok((n, src)) = socket.recv_from(&mut buf).await {
+            if tx.send((buf[..n].to_vec(), src)).is_err() {
+                break;
             }
         }
     });
@@ -335,7 +328,7 @@ pub(crate) async fn noise_connect(
         send_counter_start: 0,
         recv_seen: vec![0], // A's cert-auth already consumed counter 0
         rx,
-        pump,
+        pump: Some(pump),
         idle,
     }))
 }
@@ -347,7 +340,8 @@ pub(crate) async fn noise_connect(
 pub(crate) async fn noise_accept(
     socket: Arc<UdpSocket>,
     mut rx: mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>,
-    pump: JoinHandle<()>,
+    local_index: u32,
+    pump: Option<JoinHandle<()>>,
     identity: &Identity,
     hs_timeout: Duration,
     idle: Duration,
@@ -363,7 +357,9 @@ pub(crate) async fn noise_accept(
 
     let mut hs = NoiseHandshake::responder(identity)?;
     hs.read_message(&msg1[ROUTING_KEY_LEN + INDEX_LEN..])?; // wrong secret fails here
-    let idx_a: u32 = rand::random();
+    // The caller (the share-side dispatcher) assigns idx_a so it can route this
+    // session's later data packets by their recv_index without a decrypt.
+    let idx_a: u32 = local_index;
     let noise_msg2 = hs.write_message(&[])?;
     let mut msg2 = Vec::with_capacity(2 * INDEX_LEN + noise_msg2.len());
     msg2.extend_from_slice(&idx_b.to_be_bytes());
@@ -414,7 +410,7 @@ struct NoiseChannelInit {
     send_counter_start: u64,
     recv_seen: Vec<u64>,
     rx: mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>,
-    pump: JoinHandle<()>,
+    pump: Option<JoinHandle<()>>,
     idle: Duration,
 }
 
@@ -429,7 +425,9 @@ pub(crate) struct NoisePeerTransport {
     ip_id_ctr: u32,
     dec_rx: mpsc::UnboundedReceiver<io::Result<Vec<u8>>>,
     reader: JoinHandle<()>,
-    pump: JoinHandle<()>,
+    /// Some when this session owns its socket pump (client / test); None when a
+    /// shared dispatcher feeds it (the share side).
+    pump: Option<JoinHandle<()>>,
 }
 
 impl NoisePeerTransport {
@@ -468,23 +466,23 @@ impl NoisePeerTransport {
                     Ok(None) => break, // socket source gone -> Stream end
                     Ok(Some(x)) => x,
                 };
-                match deframe_data(&reader_session, &hp_key, local_index, &buf) {
-                    Ok((counter, channel, payload)) => {
-                        if !replay.check_and_set(counter) {
-                            continue; // replay or too old
-                        }
-                        match channel {
-                            CH_IP => {
-                                if dec_tx.send(Ok(payload)).is_err() {
-                                    break;
-                                }
-                            }
-                            CH_CLOSE => break, // peer closed -> Stream end
-                            // CH_SIGNAL is wired in Stage 2; CH_AUTH shouldn't recur.
-                            _ => {}
-                        }
+                // Malformed / not-ours packets deframe to Err and are dropped.
+                if let Ok((counter, channel, payload)) =
+                    deframe_data(&reader_session, &hp_key, local_index, &buf)
+                {
+                    if !replay.check_and_set(counter) {
+                        continue; // replay or too old
                     }
-                    Err(_) => {} // malformed / not ours — drop
+                    match channel {
+                        CH_IP => {
+                            if dec_tx.send(Ok(payload)).is_err() {
+                                break;
+                            }
+                        }
+                        CH_CLOSE => break, // peer closed -> Stream end
+                        // CH_SIGNAL is wired in Stage 2; CH_AUTH shouldn't recur.
+                        _ => {}
+                    }
                 }
             }
         });
@@ -601,7 +599,9 @@ impl Drop for NoisePeerTransport {
         // the reader/pump tasks so nothing keeps refreshing the relay flow.
         let _ = self.send_on(CH_CLOSE, &[]);
         self.reader.abort();
-        self.pump.abort();
+        if let Some(pump) = &self.pump {
+            pump.abort();
+        }
     }
 }
 
@@ -624,7 +624,16 @@ mod tests {
         let (rx_a, pump_a) = spawn_socket_pump(a_sock.clone());
         let id = identity.clone();
         let accept = tokio::spawn(async move {
-            noise_accept(a_sock, rx_a, pump_a, &id, Duration::from_secs(5), DEFAULT_IDLE).await
+            noise_accept(
+                a_sock,
+                rx_a,
+                rand::random(),
+                Some(pump_a),
+                &id,
+                Duration::from_secs(5),
+                DEFAULT_IDLE,
+            )
+            .await
         });
         let rk = identity.routing_key;
         let secret = identity.secret;

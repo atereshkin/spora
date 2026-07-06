@@ -44,8 +44,13 @@ pub(crate) struct PeerSession {
     /// `Direct`) — used for events and the connection log.
     pub remote_addr: SocketAddr,
     /// QUIC-only extras: the connection (for the dynamic PMTUD MTU) and the
-    /// signal channel (for the hole-punch upgrade). `None` for stream carriers.
+    /// signal channel (for the hole-punch upgrade). `None` for stream/Noise
+    /// carriers.
     pub quic: Option<QuicSessionExt>,
+    /// Fixed tunnel MTU to report when there is no QUIC connection to read a
+    /// PMTUD-converged datagram size from (stream and Noise carriers). Ignored
+    /// when `quic` is `Some` (PMTUD drives the MTU there).
+    pub fixed_mtu: u16,
 }
 
 pub(crate) struct QuicSessionExt {
@@ -65,6 +70,7 @@ impl PeerSession {
             remote_addr: conn.remote_address(),
             transport: Box::new(transport),
             quic: Some(QuicSessionExt { conn, signal }),
+            fixed_mtu: STREAM_TUNNEL_MTU, // unused: PMTUD drives a QUIC session's MTU
         }
     }
 }
@@ -98,6 +104,7 @@ pub(crate) fn relay_client_for(protocol: RelayProtocol) -> Box<dyn RelayClient> 
         RelayProtocol::UdpQuic => Box::new(UdpQuicRelayClient),
         RelayProtocol::Direct => Box::new(DirectRelayClient),
         RelayProtocol::TcpTls => Box::new(TcpTlsRelayClient),
+        RelayProtocol::NoiseUdp => Box::new(NoiseUdpRelayClient),
     }
 }
 
@@ -133,6 +140,33 @@ async fn tcp_tls_dial(ctx: DialCtx<'_>) -> Result<PeerSession, String> {
         transport,
         remote_addr: ctx.target,
         quic: None,
+        fixed_mtu: STREAM_TUNNEL_MTU,
+    })
+}
+
+/// Noise UDP relay dial: bind a local UDP socket in the relay's family, run the
+/// NNpsk0 handshake to the sharer through the relay (routed by `routing_key` on
+/// the first packet), verify A's cert-auth, and hand back the data-plane
+/// transport. Non-QUIC-shaped on the wire; the relay stays dumb and keyless.
+async fn noise_dial(ctx: DialCtx<'_>) -> Result<PeerSession, String> {
+    let std_socket = bind_local_udp(ctx.protector, ctx.target)?;
+    let socket = std::sync::Arc::new(
+        tokio::net::UdpSocket::from_std(std_socket).map_err(|e| format!("nz socket: {e}"))?,
+    );
+    let transport = crate::transport::noise::noise_connect(
+        socket,
+        ctx.target,
+        &ctx.routing_key,
+        &ctx.secret,
+        ctx.timings.relay_dial_timeout,
+        ctx.timings.quic_idle_timeout,
+    )
+    .await?;
+    Ok(PeerSession {
+        transport: Box::new(transport),
+        remote_addr: ctx.target,
+        quic: None,
+        fixed_mtu: crate::transport::noise::NZ_TUNNEL_MTU,
     })
 }
 
@@ -176,5 +210,17 @@ impl RelayClient for TcpTlsRelayClient {
     }
     fn dial<'a>(&'a self, ctx: DialCtx<'a>) -> SessionFut<'a> {
         Box::pin(tcp_tls_dial(ctx))
+    }
+}
+
+/// A dumb UDP relay carrying an end-to-end Noise datagram session — the
+/// non-QUIC-shaped carrier for censored networks.
+pub(crate) struct NoiseUdpRelayClient;
+impl RelayClient for NoiseUdpRelayClient {
+    fn protocol(&self) -> RelayProtocol {
+        RelayProtocol::NoiseUdp
+    }
+    fn dial<'a>(&'a self, ctx: DialCtx<'a>) -> SessionFut<'a> {
+        Box::pin(noise_dial(ctx))
     }
 }
