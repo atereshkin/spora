@@ -608,11 +608,26 @@ async fn noise_accept_dispatcher(
     // shaping before we inspect recv_index/routing_key at fixed offsets; the
     // clean bytes are what we route AND forward to the per-session channels.
     let shaper = crate::transport::shaper::nz_shaper(&identity.routing_key, &identity.secret);
+    // The `routing_key` prefix is cleartext on the wire (a passive censor learns
+    // it), so an attacker can forge msg1-shaped packets. We insert routing entries
+    // BEFORE the psk-gated handshake completes (they're needed to route msg1
+    // retransmits), so a failed accept must reap its entries or the tables grow
+    // unbounded (memory-exhaustion DoS). Failed-accept tasks report back here; a
+    // hard cap backstops any burst faster than the reap.
+    const MAX_INFLIGHT: usize = 4096;
+    let (reap_tx, mut reap_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u32)>();
     let mut buf = vec![0u8; 2048];
 
     loop {
         let (n, src) = tokio::select! {
             _ = cancel.cancelled() => return,
+            // A spawned accept task failed to authenticate — drop its pre-auth
+            // routing entries so a forged-msg1 spray can't leak the tables.
+            Some((ia, ib)) = reap_rx.recv() => {
+                by_index.remove(&ia);
+                by_client.remove(&ib);
+                continue;
+            }
             r = socket.recv_from(&mut buf) => match r {
                 Ok(x) => x,
                 Err(e) => { warn!("[share] nz recv: {e}"); continue; }
@@ -647,6 +662,12 @@ async fn noise_accept_dispatcher(
                 }
                 continue;
             }
+            // Shed load past the cap so a forged-msg1 burst can't exhaust memory
+            // faster than failed accepts reap themselves.
+            if by_index.len() >= MAX_INFLIGHT {
+                warn!("[share] nz dispatcher at capacity ({MAX_INFLIGHT}); dropping new handshake");
+                continue;
+            }
             // New client: assign the idx_A the dispatcher will route future
             // packets by, seed the session's channel with this msg1, and drive
             // the responder handshake in its own task.
@@ -662,6 +683,7 @@ async fn noise_accept_dispatcher(
             let sock = socket.clone();
             let id = identity.clone();
             let stx = session_tx.clone();
+            let reap = reap_tx.clone();
             tokio::spawn(async move {
                 match noise_accept(sock, rx, idx_a, None, id.as_ref(), hs_timeout, idle).await {
                     Ok(mut transport) => {
@@ -675,7 +697,12 @@ async fn noise_accept_dispatcher(
                             fixed_mtu: NZ_TUNNEL_MTU,
                         });
                     }
-                    Err(e) => warn!("[share] nz accept failed: {e}"),
+                    // Reap the pre-auth routing entries; the live-session case is
+                    // covered by the reactive cleanup on a dead by_index sender.
+                    Err(e) => {
+                        warn!("[share] nz accept failed: {e}");
+                        let _ = reap.send((idx_a, idx_b));
+                    }
                 }
             });
         }
