@@ -3,6 +3,7 @@ mod neg;
 mod reassembly;
 pub mod connlog;
 pub mod e2e;
+pub mod e2e_noise;
 pub mod e2e_tls;
 pub mod identity;
 pub mod server;
