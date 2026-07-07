@@ -2,7 +2,6 @@
 members = [
     "spora-core", "spora-cli",
     "relay", "relay-client", "spora-ffi",
-    "spora-wincore", "spora-winui",
     "spora-lab",
 ]
 # Vendored third-party fork (netstack-smoltcp); built as a path dependency of
