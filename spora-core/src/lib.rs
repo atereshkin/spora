@@ -113,6 +113,13 @@ pub struct Timings {
     pub reconnect_delay: Duration,
     /// Initiator retry delay after a failed direct-upgrade attempt.
     pub upgrade_retry_delay: Duration,
+    /// How long the transport router holds the current transport's death
+    /// waiting for an in-flight direct-upgrade swap before propagating it
+    /// (see `transport::upgradable`). Must cover the responder's conclusion
+    /// racing the initiator's close of the old path — which can trail by a
+    /// QUIC PTO or two (hundreds of ms) on high-RTT paths, not just a
+    /// reordered flight.
+    pub upgrade_rescue_grace: Duration,
     /// Timeout for each of the two punch phases (punch exchange + verify).
     pub punch_phase_timeout: Duration,
     /// Interval between punch/verify packets within a phase.
@@ -140,6 +147,7 @@ impl Default for Timings {
             quic_keep_alive: Duration::from_secs(10),
             reconnect_delay: transport::RECONNECT_DELAY, // 5s
             upgrade_retry_delay: Duration::from_secs(15),
+            upgrade_rescue_grace: Duration::from_secs(2),
             punch_phase_timeout: Duration::from_secs(5),
             punch_send_interval: Duration::from_millis(300),
             endpoint_exchange_timeout: Duration::from_secs(10),
@@ -808,7 +816,8 @@ fn spawn_responder_tunnel(
         fixed_mtu,
     } = session;
 
-    let (upgradable, upgrade_sender, router_handle) = upgradable_transport(transport);
+    let (upgradable, upgrade_sender, router_handle) =
+        upgradable_transport(transport, config.timings.upgrade_rescue_grace);
     let keepalive_cfg = KeepAliveConfig::default();
     // The meter (Custom exit mode) must ignore the synthetic keepalive pings
     // riding the tunnel; tell it which inner address pair they use.
@@ -1093,7 +1102,8 @@ async fn dial_initiator(
         TunnelEvent::RelaySessionEstablished { peer: remote_addr },
     );
 
-    let (upgradable, upgrade_sender, router_handle) = upgradable_transport(transport);
+    let (upgradable, upgrade_sender, router_handle) =
+        upgradable_transport(transport, config.timings.upgrade_rescue_grace);
     let upgrade_knob = keepalive_knob.clone();
     let keepalive_cfg = KeepAliveConfig {
         mode: KeepAliveMode::Adaptive {
@@ -2076,8 +2086,10 @@ mod tests {
         drop(b_signal);
 
         // A live UpgradeSender (router task running over A's transport).
-        let (_upgradable, upgrade_sender, _router_handle) =
-            upgradable_transport(Box::new(a_session.transport));
+        let (_upgradable, upgrade_sender, _router_handle) = upgradable_transport(
+            Box::new(a_session.transport),
+            Timings::default().upgrade_rescue_grace,
+        );
         assert!(!upgrade_sender.is_closed());
 
         let cancel = CancellationToken::new();

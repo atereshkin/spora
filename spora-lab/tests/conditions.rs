@@ -149,6 +149,22 @@ fn start_padding_responder(wan: &Netns, port: u16, pad_len: usize) -> Result<Hos
 /// whichever path resulted (both cross the same four netem hops, so the
 /// latency expectations are identical).
 ///
+/// SECOND PRODUCT BUG (found via this scenario's ~10% flake, fixed
+/// 2026-07-07): when the initiator's upgrade succeeds, its dropped relay-via
+/// transport closes the old connection immediately; on the sharer that
+/// CONNECTION_CLOSE races the auth secret concluding the responder's build —
+/// and at this RTT the secret can trail by a full jitter-reorder PTO
+/// (hundreds of ms). The transport router's rescue grace was a flat 250ms;
+/// when it lost, the sharer tore the session down, ABORTING its responder
+/// mid-conclusion (so no `DirectUpgrade*` event ever fired — the sharer wait
+/// below saw only SessionEnded/RelaySessionEstablished pairs) and closing
+/// the fresh direct connection, forcing a ~22s relay→direct→die→reconnect
+/// cycle; three consecutive losses exhausted UPGRADE_TIMEOUT. Failure
+/// signature: "Transport read error" exactly one grace after the peer's
+/// close of the old connection ("transport dropped"). Fix: the grace is now
+/// `Timings::upgrade_rescue_grace` (default 2s, covers a PTO or two);
+/// baseline 250ms failed 3/30 runs, 2s failed 0.
+///
 /// The warmup batch below: a post-upgrade 18/20-then-20/20 first-batch loss
 /// observed during development turned out to be the since-fixed zombie-reader
 /// bug (one stolen inbound datagram per side; see nat_matrix.rs, fixed in

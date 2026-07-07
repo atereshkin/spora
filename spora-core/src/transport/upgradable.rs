@@ -11,28 +11,38 @@ use tokio::task::JoinHandle;
 use super::IpTransport;
 
 /// How long the router waits for an in-flight upgrade after the inner
-/// transport dies before propagating the failure.
+/// transport dies before propagating the failure
+/// (`Timings::upgrade_rescue_grace`, default 2s).
 ///
 /// The initiator swaps to the direct path and drops its relay-via transport
 /// the moment its QUIC client handshake completes, but the responder only
 /// learns the new path is good when the auth-stream secret arrives — and
 /// that secret races the old connection's CONNECTION_CLOSE, both one flight
-/// behind the initiator's swap. Whichever loses by microseconds, the old
-/// transport's error must not kill the tunnel that the (imminent) upgrade is
-/// about to save: the share side tears the whole session down on a transport
-/// error, which closes the fresh direct connection too and forces a full
-/// reconnect cycle. A genuinely dead transport just propagates its error
-/// this much later, which every consumer (reconnect dialer, session
-/// teardown) is indifferent to.
-const UPGRADE_WAIT_AFTER_INNER_DEATH: Duration = Duration::from_millis(250);
-
-/// Wait briefly for an upgrade after the inner transport died. `None` means
-/// no upgrade arrived (channel closed or grace elapsed) — propagate the
-/// death as before.
+/// behind the initiator's swap. The old transport's error must not kill the
+/// tunnel that the (imminent) upgrade is about to save: the share side
+/// tears the whole session down on a transport error — aborting its own
+/// responder mid-conclusion, so no `DirectUpgrade*` event ever fires —
+/// which closes the fresh direct connection too and forces a full reconnect
+/// cycle that then repeats every ~20s.
+///
+/// The loser's margin is NOT microseconds: on a jittery high-RTT path the
+/// secret's flight gets reorder-PTO'd, arriving a full PTO (~ RTT + 4×rttvar,
+/// i.e. hundreds of ms) behind the CONNECTION_CLOSE. The lab's
+/// `conditions::latency_jitter` (200ms RTT, ±10ms/hop) failed ~10% of runs
+/// with a 250ms grace — three consecutive rescue losses — and 0/17 with 2s.
+/// A genuinely dead transport just propagates its error this much later,
+/// which every consumer (reconnect dialer, session teardown) is indifferent
+/// to; the no-upgrade-possible path (channel closed) still propagates
+/// immediately.
+///
+/// Wait for an upgrade after the inner transport died. `None` means no
+/// upgrade arrived (channel closed or grace elapsed) — propagate the death
+/// as before.
 async fn upgrade_within_grace(
     upgrade_rx: &mut mpsc::UnboundedReceiver<IpTransport>,
+    grace: Duration,
 ) -> Option<IpTransport> {
-    match tokio::time::timeout(UPGRADE_WAIT_AFTER_INNER_DEATH, upgrade_rx.recv()).await {
+    match tokio::time::timeout(grace, upgrade_rx.recv()).await {
         Ok(Some(new_transport)) => Some(new_transport),
         _ => None,
     }
@@ -43,18 +53,29 @@ pub type UpgradeSender = mpsc::UnboundedSender<IpTransport>;
 
 /// Create an upgradable transport backed by channel indirection.
 ///
+/// `rescue_grace` is how long the router holds the inner transport's death
+/// for an in-flight upgrade (`Timings::upgrade_rescue_grace`; see
+/// [`upgrade_within_grace`]).
+///
 /// Returns:
 /// - `UpgradableTransport` — implements `Stream + Sink`, hand this to `run_tunnel`
 /// - `UpgradeSender` — send a new `IpTransport` here to hot-swap the inner transport
 /// - `JoinHandle` — the background router task; abort it when the tunnel ends
 pub fn upgradable_transport(
     initial: IpTransport,
+    rescue_grace: Duration,
 ) -> (UpgradableTransport, UpgradeSender, JoinHandle<()>) {
     let (in_tx, in_rx) = mpsc::unbounded_channel::<io::Result<Vec<u8>>>();
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
     let (upgrade_tx, upgrade_rx) = mpsc::unbounded_channel::<IpTransport>();
 
-    let handle = tokio::spawn(transport_router(initial, upgrade_rx, in_tx, out_rx));
+    let handle = tokio::spawn(transport_router(
+        initial,
+        rescue_grace,
+        upgrade_rx,
+        in_tx,
+        out_rx,
+    ));
 
     let transport = UpgradableTransport { in_rx, out_tx };
 
@@ -68,13 +89,14 @@ pub fn upgradable_transport(
 /// is unaware of the swap.
 async fn transport_router(
     initial: IpTransport,
+    rescue_grace: Duration,
     mut upgrade_rx: mpsc::UnboundedReceiver<IpTransport>,
     in_tx: mpsc::UnboundedSender<io::Result<Vec<u8>>>,
     mut out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
     let mut current = initial;
     loop {
-        match route_one(current, &mut upgrade_rx, &in_tx, &mut out_rx).await {
+        match route_one(current, rescue_grace, &mut upgrade_rx, &in_tx, &mut out_rx).await {
             RouteResult::Upgraded(new_transport) => {
                 info!("Transport upgraded to direct connection");
                 current = new_transport;
@@ -98,6 +120,7 @@ enum RouteResult {
 /// tunnel should end (stream closed, channels closed, etc).
 async fn route_one(
     transport: IpTransport,
+    rescue_grace: Duration,
     upgrade_rx: &mut mpsc::UnboundedReceiver<IpTransport>,
     in_tx: &mpsc::UnboundedSender<io::Result<Vec<u8>>>,
     out_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
@@ -137,7 +160,9 @@ async fn route_one(
                         // about to save (see UPGRADE_WAIT_AFTER_INNER_DEATH),
                         // so give the queued OR in-flight upgrade a grace
                         // window and switch instead.
-                        if let Some(new_transport) = upgrade_within_grace(upgrade_rx).await {
+                        if let Some(new_transport) =
+                            upgrade_within_grace(upgrade_rx, rescue_grace).await
+                        {
                             debug!(
                                 "Inner transport errored but an upgrade arrived; \
                                  switching: {e}"
@@ -153,7 +178,9 @@ async fn route_one(
                         // The inner stream ended — same situation as the
                         // error arm: a simultaneous (or one-flight-behind)
                         // upgrade must win over the old path's death.
-                        if let Some(new_transport) = upgrade_within_grace(upgrade_rx).await {
+                        if let Some(new_transport) =
+                            upgrade_within_grace(upgrade_rx, rescue_grace).await
+                        {
                             debug!("Inner stream ended but an upgrade arrived; switching");
                             return RouteResult::Upgraded(new_transport);
                         }
@@ -170,7 +197,9 @@ async fn route_one(
                             // sending side: an outbound packet hitting the
                             // just-closed old transport must not outrun an
                             // upgrade that is about to replace it.
-                            if let Some(new_transport) = upgrade_within_grace(upgrade_rx).await {
+                            if let Some(new_transport) =
+                                upgrade_within_grace(upgrade_rx, rescue_grace).await
+                            {
                                 debug!("Router sink errored but an upgrade arrived; switching: {e}");
                                 return RouteResult::Upgraded(new_transport);
                             }
@@ -275,6 +304,11 @@ mod tests {
     use futures_util::{SinkExt, StreamExt};
     use std::time::Duration;
 
+    /// Rescue grace for the tests below: long enough for a deliberately-late
+    /// upgrade to land inside it, short enough to keep the tests fast. The
+    /// production default lives in `Timings::upgrade_rescue_grace`.
+    const GRACE: Duration = Duration::from_millis(250);
+
     #[tokio::test]
     async fn upgrade_survives_simultaneous_inner_close() {
         // Stage an inner-close and a pending upgrade so the router sees both in
@@ -284,7 +318,7 @@ mod tests {
         // fix every iteration must deliver data on the upgraded transport.
         for _ in 0..16 {
             let (local, handle) = mock_transport();
-            let (mut transport, upgrade_tx, _router) = upgradable_transport(Box::new(local));
+            let (mut transport, upgrade_tx, _router) = upgradable_transport(Box::new(local), GRACE);
             let (local2, handle2) = mock_transport();
 
             // Both staged before the router can run (current-thread runtime).
@@ -312,7 +346,7 @@ mod tests {
         // session down; the router must take the upgrade and discard it.
         for _ in 0..16 {
             let (local, handle) = mock_transport();
-            let (mut transport, upgrade_tx, _router) = upgradable_transport(Box::new(local));
+            let (mut transport, upgrade_tx, _router) = upgradable_transport(Box::new(local), GRACE);
             let (local2, handle2) = mock_transport();
 
             handle.inject_error(io::Error::other("relay-via connection died"));
@@ -331,10 +365,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn late_upgrade_within_grace_is_rescued() {
+        // The production race that flaked conditions::latency_jitter: the old
+        // transport dies FIRST (the peer swapped and closed it), and the
+        // upgrade arrives only later — in-flight, not queued — because its
+        // concluding flight was PTO-delayed. The router must sit out the
+        // grace and take the late upgrade instead of propagating the death.
+        let (local, handle) = mock_transport();
+        let (mut transport, upgrade_tx, _router) = upgradable_transport(Box::new(local), GRACE);
+        let (local2, handle2) = mock_transport();
+
+        handle.inject_error(io::Error::other("relay-via connection died"));
+        // Let the router enter the grace wait before the upgrade exists.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        upgrade_tx.send(Box::new(local2)).unwrap();
+
+        handle2.send(vec![7, 8, 9]).unwrap();
+        let got = tokio::time::timeout(GRACE, transport.next()).await;
+        assert!(
+            matches!(got, Ok(Some(Ok(ref p))) if p == &vec![7, 8, 9]),
+            "a late (in-flight) upgrade was not rescued: {got:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn upgradable_passes_through() {
         let (local, mut handle) = mock_transport();
         let (mut transport, _upgrade_tx, _router_handle) =
-            upgradable_transport(Box::new(local));
+            upgradable_transport(Box::new(local), GRACE);
 
         // Inbound: handle → transport
         handle.send(vec![1, 2, 3]).unwrap();
@@ -364,7 +422,7 @@ mod tests {
     async fn upgradable_switches_on_upgrade() {
         let (local1, handle1) = mock_transport();
         let (mut transport, upgrade_tx, _router_handle) =
-            upgradable_transport(Box::new(local1));
+            upgradable_transport(Box::new(local1), GRACE);
 
         // Initial transport works
         handle1.send(vec![1, 2, 3]).unwrap();
@@ -413,16 +471,16 @@ mod tests {
     async fn upgradable_ends_on_stream_close() {
         let (local, handle) = mock_transport();
         let (mut transport, _upgrade_tx, _router_handle) =
-            upgradable_transport(Box::new(local));
+            upgradable_transport(Box::new(local), GRACE);
 
         // Close the inner transport. The upgrade sender is still alive, so
-        // the router holds the close for UPGRADE_WAIT_AFTER_INNER_DEATH
-        // before giving up on a rescue — the timeout must cover that grace.
+        // the router holds the close for the rescue grace before giving up —
+        // the timeout must cover that grace.
         handle.close();
 
         // The UpgradableTransport stream should end
         let result = tokio::time::timeout(
-            UPGRADE_WAIT_AFTER_INNER_DEATH + std::time::Duration::from_millis(200),
+            GRACE + std::time::Duration::from_millis(200),
             transport.next(),
         )
         .await
@@ -438,7 +496,7 @@ mod tests {
         // sessions that never upgrade).
         let (local, handle) = mock_transport();
         let (mut transport, upgrade_tx, _router_handle) =
-            upgradable_transport(Box::new(local));
+            upgradable_transport(Box::new(local), GRACE);
         drop(upgrade_tx);
         // Let the router enter drain mode (upgrade channel closed).
         tokio::time::sleep(Duration::from_millis(5)).await;
