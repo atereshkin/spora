@@ -174,7 +174,39 @@ pub async fn start(mut transport: IpTransport, mut tun: impl AsyncReadExt+AsyncW
 /// We share a single fd via `Arc<File>` rather than `try_clone()` (which calls
 /// `dup()`), because Android TUN fds don't work correctly after dup.
 #[cfg(unix)]
-pub async fn start_fd(mut transport: IpTransport, fd: std::os::fd::OwnedFd) -> io::Result<()> {
+pub async fn start_fd(transport: IpTransport, fd: std::os::fd::OwnedFd) -> io::Result<()> {
+    start_fd_inner(transport, fd, false).await
+}
+
+/// Like [`start_fd`], but for Apple `utun` descriptors, which frame every
+/// packet with a 4-byte protocol-family header (`AF_INET`/`AF_INET6` in
+/// network byte order). Reads strip the header; writes prepend it, choosing
+/// the family from the IP version nibble. Used by the macOS/iOS
+/// NetworkExtension packet tunnel, whose provider hands us a `utun` fd.
+#[cfg(unix)]
+pub async fn start_fd_utun(transport: IpTransport, fd: std::os::fd::OwnedFd) -> io::Result<()> {
+    start_fd_inner(transport, fd, true).await
+}
+
+/// utun's per-packet protocol-family header, chosen from the IP version.
+/// Darwin expects the family as a 4-byte big-endian value (e.g. `[0,0,0,2]`
+/// for `AF_INET`); the header must be written in the same `write()` as the
+/// packet body.
+#[cfg(unix)]
+fn utun_af_header(pkt: &[u8]) -> [u8; 4] {
+    let af = match pkt.first().map(|b| b >> 4) {
+        Some(6) => libc::AF_INET6 as u32,
+        _ => libc::AF_INET as u32,
+    };
+    af.to_be_bytes()
+}
+
+#[cfg(unix)]
+async fn start_fd_inner(
+    mut transport: IpTransport,
+    fd: std::os::fd::OwnedFd,
+    utun_prefix: bool,
+) -> io::Result<()> {
     use std::io::{Read, Write};
     use std::sync::Arc;
     use tokio::sync::mpsc;
@@ -194,7 +226,8 @@ pub async fn start_fd(mut transport: IpTransport, fd: std::os::fd::OwnedFd) -> i
         .spawn(move || {
             use std::os::fd::AsRawFd;
             let raw_fd = reader_file.as_raw_fd();
-            let mut buf = vec![0u8; 1500];
+            // Room for a 1500-byte MTU plus utun's 4-byte AF header.
+            let mut buf = vec![0u8; 2048];
             loop {
                 // Wait for the fd to become readable instead of busy-looping
                 // on WouldBlock.  The 100ms timeout lets us detect shutdown
@@ -223,7 +256,15 @@ pub async fn start_fd(mut transport: IpTransport, fd: std::os::fd::OwnedFd) -> i
                 match (&*reader_file).read(&mut buf) {
                     Ok(0) => break, // TUN closed
                     Ok(n) => {
-                        if tun_read_tx.blocking_send(buf[..n].to_vec()).is_err() {
+                        // utun frames every packet with a 4-byte AF header;
+                        // strip it so the transport carries bare IP packets.
+                        let payload = if utun_prefix {
+                            if n <= 4 { continue; }
+                            &buf[4..n]
+                        } else {
+                            &buf[..n]
+                        };
+                        if tun_read_tx.blocking_send(payload.to_vec()).is_err() {
                             break; // receiver dropped
                         }
                     }
@@ -246,8 +287,18 @@ pub async fn start_fd(mut transport: IpTransport, fd: std::os::fd::OwnedFd) -> i
         .spawn({
             let mut tun_write_rx = tun_write_rx;
             move || {
+                // Reused framing buffer for utun (AF header + packet in one write).
+                let mut framed = Vec::with_capacity(2048);
                 while let Some(pkt) = tun_write_rx.blocking_recv() {
-                    if let Err(e) = (&*writer_file).write(&pkt) {
+                    let out: &[u8] = if utun_prefix {
+                        framed.clear();
+                        framed.extend_from_slice(&utun_af_header(&pkt));
+                        framed.extend_from_slice(&pkt);
+                        &framed
+                    } else {
+                        &pkt
+                    };
+                    if let Err(e) = (&*writer_file).write(out) {
                         if e.kind() != io::ErrorKind::WouldBlock {
                             error!("TUN write error: {}", e);
                         }
