@@ -75,13 +75,29 @@ impl QuicPeerTransport {
                         }
                     }
                     Err(e) => {
+                        // An orderly close is part of normal lifecycle, not a
+                        // failure: every deliberate close in this codebase is
+                        // an application close with code 0 (the `Drop` impl's
+                        // "transport dropped" on an upgrade swap / session
+                        // replacement / teardown, `poll_close`'s "close"), and
+                        // `LocallyClosed` is our own side going first. Logging
+                        // those at ERROR buries the closes that DO matter —
+                        // timeouts, resets, transport errors, unexpected close
+                        // codes — which keep ERROR severity.
+                        let orderly = matches!(&e, quinn::ConnectionError::LocallyClosed)
+                            || matches!(
+                                &e,
+                                quinn::ConnectionError::ApplicationClosed(c)
+                                    if c.error_code == quinn::VarInt::from_u32(0)
+                            );
                         let stats = read_conn.stats();
-                        error!(
-                            "P2P QUIC connection died: {}. \
+                        let msg = format!(
+                            "P2P QUIC connection {}: {}. \
                              Stats: mtu={}, mds={:?}, rtt={:?}, \
                              sent_pkts={}, lost_pkts={}, lost_bytes={}, \
                              pmtud_sent={}, pmtud_lost={}, black_holes={}, \
                              datagrams_tx={}, datagrams_rx={}",
+                            if orderly { "closed" } else { "died" },
                             e,
                             stats.path.current_mtu,
                             read_conn.max_datagram_size(),
@@ -95,6 +111,11 @@ impl QuicPeerTransport {
                             stats.frame_tx.datagram,
                             stats.frame_rx.datagram,
                         );
+                        if orderly {
+                            info!("{msg}");
+                        } else {
+                            error!("{msg}");
+                        }
                         let _ = tx.send(Err(io::Error::other(format!(
                             "QUIC read_datagram error: {}",
                             e
