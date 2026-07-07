@@ -31,6 +31,19 @@ defaults); lifecycle events via `Config.event_hook` (`TunnelEvent`); the direct
 upgrade can be disabled via `Config.enable_direct_upgrade` — these exist for the
 lab but are usable by the apps (e.g. path-state display).
 
+**Reading suite results reliably.** ERROR log lines interleave between a
+scenario's name and its verdict, so `scenario X ... FAILED` is often NOT one
+line — never line-grep for that shape. The reliable signals are the per-suite
+summary line (`<suite>: ok. N passed` / `<suite>: FAILED. N passed; M failed`)
+and the process exit code. Piping `cargo test` through `tail`/`grep` replaces
+`$?` with the filter's status (use `pipefail`/`PIPESTATUS`, or write the full
+log to a file and inspect that), and a `tail -N` window silently hides
+early-suite failures under `--no-fail-fast` — check the whole log. Timing
+scenarios (e.g. `conditions::latency_jitter`) are load-sensitive and can flake
+at low single-digit percentages: to confirm or chase one, loop the single suite
+filtered (`cargo test -p spora-lab --test conditions -- latency`) 20-30×
+serially on a quiet machine rather than re-running the full suite a few times.
+
 ## Workspace Structure
 
 Workspace members (resolver v3):
