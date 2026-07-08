@@ -1,0 +1,10 @@
+{
+  "applinks": {
+    "details": [
+      {
+        "appIDs": ["7DKT5HWLP2.to.spora.mac"],
+        "components": [{ "/": "/s/*", "comment": "Spora share links" }]
+      }
+    ]
+  }
+}
