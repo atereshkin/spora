@@ -349,9 +349,11 @@ pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCal
 
 /// Apple counterpart to [`connect`]. Establishes a tunnel and pumps packets
 /// against an Apple `utun` descriptor (4-byte AF framing, unlike Android's raw
-/// TUN). No socket protector is taken: on Darwin, NetworkExtension
-/// provider-originated sockets already bypass the tunnel. An optional
-/// [`EventCallback`] surfaces lifecycle events for status UI.
+/// TUN). A `protector` (bind sockets to the physical interface via
+/// `IP_BOUND_IF`) is required on macOS: unlike iOS, the OS does not auto-bypass
+/// provider sockets, so without it the relay dial loops back into the tunnel and
+/// dead-locks. An optional [`EventCallback`] surfaces lifecycle events for
+/// status UI.
 ///
 /// Blocks until the relay session is established, then spawns the tunnel loop
 /// and returns a handle. The `tun_fd` ownership is transferred to Rust, which
@@ -361,6 +363,7 @@ pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCal
 pub fn connect_utun(
     url: String,
     tun_fd: RawFd,
+    protector: Option<Box<dyn SocketProtectorCallback>>,
     mtu_callback: Option<Box<dyn MtuCallback>>,
     event_callback: Option<Box<dyn EventCallback>>,
 ) -> Result<i32, ConnectError> {
@@ -378,8 +381,13 @@ pub fn connect_utun(
         }) as Arc<dyn Fn(u16) + Send + Sync>
     });
 
+    // On Darwin the OS does NOT auto-bypass provider-originated sockets, and
+    // NEPacketTunnelNetworkSettings.excludedRoutes are unreliable for a packet
+    // tunnel — so the Apple client passes a protector that binds each socket to
+    // the physical interface (IP_BOUND_IF). Without it the relay dial routes back
+    // into the tunnel and dead-locks.
     let config = spora_core::Config {
-        protector: None,
+        protector: protector.and_then(wrap_protector),
         mtu_callback: mtu_cb,
         event_hook: wrap_event_hook(event_callback),
         ..spora_core::Config::default()
