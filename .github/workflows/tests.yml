@@ -6,6 +6,25 @@ on:
   pull_request:
 
 jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  deny:
+    # licenses / advisories / bans / sources (config: deny.toml). A new RUSTSEC
+    # advisory can turn this red without a code change — that is intentional.
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+      - uses: EmbarkStudios/cargo-deny-action@v2
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45
