@@ -1,61 +1,71 @@
 #!/bin/bash
-
-set -e # abort on error
-
-# Preparation:
+# Cross-compile spora-ffi for Android and generate the Kotlin bindings.
 #
-# 1. Add linkers from NDK to ~/.cargo/config.toml:
+# Prerequisites:
+#   rustup target add aarch64-linux-android armv7-linux-androideabi \
+#                     i686-linux-android x86_64-linux-android
+#   cargo install cargo-ndk
+#   An Android NDK, located via (in order): $ANDROID_NDK_HOME,
+#   $ANDROID_NDK_LATEST_HOME (GitHub runners), newest under ~/Android/Sdk/ndk.
 #
-#[target.x86_64-linux-android]
-#linker = ".../Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/x86_64-linux-android35-clang"
-#
-#[target.i686-linux-android]
-#linker = ".../Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/i686-linux-android35-clang"
-#
-#[target.armv7-linux-androideabi]
-#linker = ".../Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/armv7a-linux-androideabi35-clang"
-#
-#[target.aarch64-linux-android]
-#linker = ".../Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android35-clang"
-#
-# 2. Install support for Android targets:
-#
-# $ rustup target add x86_64-linux-android i686-linux-android armv7-linux-androideabi aarch64-linux-android
-#
+# Usage:
+#   ./build-ffi.sh                    debug build, copied into ../spora-android
+#   ./build-ffi.sh --release         release build, copied into ../spora-android
+#   ./build-ffi.sh --release --out D  assemble a distributable bundle under D
+#                                     (D/jniLibs/<abi>/libspora_ffi.so,
+#                                      D/kotlin/uniffi/...) and skip the app copy
 
-# Set CC for each Android target so ring's build script can find the NDK compiler
-NDK_BIN="$HOME/Android/Sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/linux-x86_64/bin"
-export CC_aarch64_linux_android="$NDK_BIN/aarch64-linux-android35-clang"
-export CC_armv7_linux_androideabi="$NDK_BIN/armv7a-linux-androideabi35-clang"
-export CC_i686_linux_android="$NDK_BIN/i686-linux-android35-clang"
-export CC_x86_64_linux_android="$NDK_BIN/x86_64-linux-android35-clang"
-export AR_aarch64_linux_android="$NDK_BIN/llvm-ar"
-export AR_armv7_linux_androideabi="$NDK_BIN/llvm-ar"
-export AR_i686_linux_android="$NDK_BIN/llvm-ar"
-export AR_x86_64_linux_android="$NDK_BIN/llvm-ar"
+set -euo pipefail
+cd "$(dirname "$0")"
 
-# build the library
-cargo build --lib --target x86_64-linux-android --target i686-linux-android --target armv7-linux-androideabi --target aarch64-linux-android
+PROFILE=debug
+OUT=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --release) PROFILE=release ;;
+    --out) OUT="${2:?--out needs a directory}"; shift ;;
+    *) echo "unknown argument: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
 
-# generate scaffolding
-#cargo run --bin uniffi-bindgen generate --library target/debug/libspora_ffi.so --language kotlin --out-dir out
-cargo run --bin uniffi-bindgen generate --library target/aarch64-linux-android/debug/libspora_ffi.so --language kotlin --out-dir out
+if [ -z "${ANDROID_NDK_HOME:-}" ]; then
+  if [ -n "${ANDROID_NDK_LATEST_HOME:-}" ]; then
+    export ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME"
+  else
+    ANDROID_NDK_HOME="$(ls -d "$HOME"/Android/Sdk/ndk/* 2>/dev/null | sort -V | tail -1 || true)"
+    [ -n "$ANDROID_NDK_HOME" ] || { echo "no NDK found; set ANDROID_NDK_HOME" >&2; exit 1; }
+    export ANDROID_NDK_HOME
+  fi
+fi
+command -v cargo-ndk >/dev/null || { echo "cargo-ndk missing: cargo install cargo-ndk" >&2; exit 1; }
 
-# copy the binaries to a structure suitable for Android app build
-mkdir -p jniLibs/arm64-v8a/ || true
-cp target/aarch64-linux-android/debug/libspora_ffi.so jniLibs/arm64-v8a/
+JNIDIR="${OUT:+$OUT/jniLibs}"; JNIDIR="${JNIDIR:-jniLibs}"
+KOUT="${OUT:+$OUT/kotlin}"; KOUT="${KOUT:-out}"
 
-mkdir -p jniLibs/armeabi-v7a/ || true
-cp target/armv7-linux-androideabi/debug/libspora_ffi.so jniLibs/armeabi-v7a/
+FLAGS=()
+[ "$PROFILE" = release ] && FLAGS+=(--release)
 
-mkdir -p jniLibs/x86/ || true
-cp target/i686-linux-android/debug/libspora_ffi.so jniLibs/x86/
+# cargo-ndk resolves per-ABI clang/sysroot from ANDROID_NDK_HOME and lays the
+# .so files out as $JNIDIR/<abi>/libspora_ffi.so.
+cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 \
+  -o "$JNIDIR" build -p spora-ffi "${FLAGS[@]}"
 
-mkdir -p jniLibs/x86_64/
-cp target/x86_64-linux-android/debug/libspora_ffi.so jniLibs/x86_64/
+for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+  [ -f "$JNIDIR/$abi/libspora_ffi.so" ] || { echo "missing $JNIDIR/$abi/libspora_ffi.so" >&2; exit 1; }
+done
 
-# copy the library binaries to Andoid app
-cp -r jniLibs/ ../spora-android/app/src/main/
+# generate the Kotlin scaffolding from the built library
+cargo run --bin uniffi-bindgen generate \
+  --library "target/aarch64-linux-android/$PROFILE/libspora_ffi.so" \
+  --language kotlin --out-dir "$KOUT"
+[ -s "$KOUT/uniffi/spora_ffi/spora_ffi.kt" ] || { echo "bindgen produced no spora_ffi.kt" >&2; exit 1; }
 
-# copy scaffolding to Android app sources
-cp -r out/uniffi ../spora-android/app/src/main/java/
+if [ -z "$OUT" ]; then
+  # dev loop: install straight into the sibling Android app checkout
+  cp -r "$JNIDIR"/ ../spora-android/app/src/main/
+  cp -r "$KOUT"/uniffi ../spora-android/app/src/main/java/
+  echo "installed $PROFILE jniLibs + bindings into ../spora-android"
+else
+  echo "bundle assembled under $OUT"
+fi
