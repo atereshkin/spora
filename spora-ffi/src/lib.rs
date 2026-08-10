@@ -13,9 +13,7 @@ use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
-extern crate android_logger;
-use log::{info, LevelFilter};
-use android_logger::FilterBuilder;
+use log::info;
 
 /// Callback interface that Kotlin implements to protect sockets from VPN routing.
 #[uniffi::export(callback_interface)]
@@ -31,6 +29,68 @@ pub trait SocketProtectorCallback: Send + Sync {
 #[uniffi::export(callback_interface)]
 pub trait MtuCallback: Send + Sync {
     fn on_mtu(&self, mtu: i32);
+}
+
+/// Tunnel lifecycle events surfaced to the host (used by the Apple client to
+/// drive status UI: reconnecting, direct-path upgrade, session ended). Mirrors
+/// [`spora_core::TunnelEvent`] with string-typed socket addresses so it lowers
+/// cleanly over UniFFI.
+#[derive(uniffi::Enum)]
+pub enum SporaEvent {
+    /// A relay-via session is up. `peer` is the remote address (the relay's
+    /// address when the path goes through it).
+    RelaySessionEstablished { peer: String },
+    /// A direct (hole-punched) connection was established and handed to the
+    /// transport router; the actual swap applies shortly after.
+    DirectUpgradeSucceeded { local: String, peer: String },
+    /// One direct-upgrade attempt failed (the upgrade task may retry).
+    DirectUpgradeFailed { reason: String },
+    /// Client only: a re-dial is starting after the transport died.
+    Reconnecting,
+    /// Client only: the re-dial succeeded.
+    Reconnected,
+    /// The active session ended (peer replaced, cancelled, or transport closed).
+    SessionEnded { reason: String },
+    /// Share side: the connection log could not be written.
+    ConnLogDegraded { detail: String },
+}
+
+impl From<spora_core::TunnelEvent> for SporaEvent {
+    fn from(e: spora_core::TunnelEvent) -> Self {
+        use spora_core::TunnelEvent as T;
+        match e {
+            T::RelaySessionEstablished { peer } => {
+                SporaEvent::RelaySessionEstablished { peer: peer.to_string() }
+            }
+            T::DirectUpgradeSucceeded { local, peer } => SporaEvent::DirectUpgradeSucceeded {
+                local: local.to_string(),
+                peer: peer.to_string(),
+            },
+            T::DirectUpgradeFailed { reason } => SporaEvent::DirectUpgradeFailed { reason },
+            T::Reconnecting => SporaEvent::Reconnecting,
+            T::Reconnected => SporaEvent::Reconnected,
+            T::SessionEnded { reason } => SporaEvent::SessionEnded { reason },
+            T::ConnLogDegraded { detail } => SporaEvent::ConnLogDegraded { detail },
+        }
+    }
+}
+
+/// Callback interface for tunnel lifecycle events. Implementations MUST be
+/// non-blocking (enqueue and return) — the callback is invoked inline from the
+/// tunnel's async tasks (see [`spora_core::EventHook`]).
+#[uniffi::export(callback_interface)]
+pub trait EventCallback: Send + Sync {
+    fn on_event(&self, event: SporaEvent);
+}
+
+/// Wrap a UniFFI event callback into the non-blocking hook spora-core expects.
+fn wrap_event_hook(cb: Option<Box<dyn EventCallback>>) -> spora_core::EventHook {
+    cb.map(|cb| {
+        let cb = Arc::new(cb);
+        Arc::new(move |ev: spora_core::TunnelEvent| {
+            cb.on_event(ev.into());
+        }) as Arc<dyn Fn(spora_core::TunnelEvent) + Send + Sync>
+    })
 }
 
 static RUNTIME: Lazy<Runtime> = Lazy::new(|| {
@@ -65,8 +125,11 @@ pub struct ShareResult {
     pub url: String,
 }
 
+#[cfg(target_os = "android")]
 #[uniffi::export]
 pub fn init_android_logging() {
+    use android_logger::FilterBuilder;
+    use log::LevelFilter;
     let filter = FilterBuilder::new()
         .filter_module("quinn", LevelFilter::Warn)
         .filter_module("quinn_proto", LevelFilter::Warn)
@@ -81,6 +144,27 @@ pub fn init_android_logging() {
             .with_max_level(LevelFilter::Trace)
             .with_filter(filter),
     );
+}
+
+/// Initialize logging on Apple platforms. Routes the `log` crate into the
+/// unified logging system (visible in Console.app and `log stream --predicate
+/// 'subsystem == "to.spora"'`). Safe to call more than once. This is the
+/// Apple counterpart to [`init_android_logging`]; a macOS/iOS client calls it
+/// once at startup (and again from the tunnel extension process, which is
+/// separate).
+#[cfg(any(target_os = "macos", target_os = "ios"))]
+#[uniffi::export]
+pub fn init_apple_logging() {
+    use log::LevelFilter;
+    // Ignore the error if a logger is already installed (idempotent across the
+    // app and extension calling in, and across repeated starts).
+    let _ = oslog::OsLogger::new("to.spora")
+        .level_filter(LevelFilter::Debug)
+        .category_level_filter("quinn", LevelFilter::Warn)
+        .category_level_filter("quinn_proto", LevelFilter::Warn)
+        .category_level_filter("quinn_udp", LevelFilter::Warn)
+        .category_level_filter("smoltcp", LevelFilter::Warn)
+        .init();
 }
 
 #[derive(Debug, uniffi::Error)]
@@ -255,6 +339,82 @@ pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCal
 
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     info!("FFI connect(): returning handle={}", handle);
+    SESSIONS
+        .lock()
+        .unwrap()
+        .insert(handle, TunnelSession { cancel, task, keepalive_knob, keepalive_waker });
+
+    Ok(handle)
+}
+
+/// Apple counterpart to [`connect`]. Establishes a tunnel and pumps packets
+/// against an Apple `utun` descriptor (4-byte AF framing, unlike Android's raw
+/// TUN). A `protector` (bind sockets to the physical interface via
+/// `IP_BOUND_IF`) is required on macOS: unlike iOS, the OS does not auto-bypass
+/// provider sockets, so without it the relay dial loops back into the tunnel and
+/// dead-locks. An optional [`EventCallback`] surfaces lifecycle events for
+/// status UI.
+///
+/// Blocks until the relay session is established, then spawns the tunnel loop
+/// and returns a handle. The `tun_fd` ownership is transferred to Rust, which
+/// closes it when the tunnel ends (the caller must hand over a `dup()` of the
+/// provider's utun fd and not use it afterward).
+#[uniffi::export]
+pub fn connect_utun(
+    url: String,
+    tun_fd: RawFd,
+    protector: Option<Box<dyn SocketProtectorCallback>>,
+    mtu_callback: Option<Box<dyn MtuCallback>>,
+    event_callback: Option<Box<dyn EventCallback>>,
+) -> Result<i32, ConnectError> {
+    info!("FFI connect_utun() called with tun_fd={}", tun_fd);
+
+    let url = Url::parse(&url).map_err(|_| InvalidUrl)?;
+    if url.scheme() != "https" {
+        return Err(InvalidUrl);
+    }
+
+    let mtu_cb: spora_core::MtuCallback = mtu_callback.map(|cb| {
+        let cb = Arc::new(cb);
+        Arc::new(move |mtu: u16| {
+            cb.on_mtu(mtu as i32);
+        }) as Arc<dyn Fn(u16) + Send + Sync>
+    });
+
+    // On Darwin the OS does NOT auto-bypass provider-originated sockets, and
+    // NEPacketTunnelNetworkSettings.excludedRoutes are unreliable for a packet
+    // tunnel — so the Apple client passes a protector that binds each socket to
+    // the physical interface (IP_BOUND_IF). Without it the relay dial routes back
+    // into the tunnel and dead-locks.
+    let config = spora_core::Config {
+        protector: protector.and_then(wrap_protector),
+        mtu_callback: mtu_cb,
+        event_hook: wrap_event_hook(event_callback),
+        ..spora_core::Config::default()
+    };
+
+    let result = RUNTIME.block_on(async {
+        spora_core::connect(url, &config)
+            .await
+            .map_err(ConnectError::Generic)
+    })?;
+
+    let cancel = result.cancel;
+    let keepalive_knob = result.keepalive_knob;
+    let keepalive_waker = result.keepalive_waker;
+    info!("FFI connect_utun(): relay established");
+
+    let task = RUNTIME.spawn(async move {
+        info!("FFI utun tunnel task: starting with tun_fd={}", tun_fd);
+        let tun = unsafe { OwnedFd::from_raw_fd(tun_fd) };
+        match tun_util::start_fd_utun(result.transport, tun).await {
+            Ok(()) => info!("FFI utun tunnel task: exited normally"),
+            Err(e) => log::error!("FFI utun tunnel task: exited with error: {}", e),
+        }
+    });
+
+    let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
+    info!("FFI connect_utun(): returning handle={}", handle);
     SESSIONS
         .lock()
         .unwrap()
