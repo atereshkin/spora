@@ -1,0 +1,44 @@
+# cargo-deny configuration (cargo-deny 0.20.x schema): license allowlist,
+# security advisories, duplicate/wildcard bans, and registry sources.
+# Run locally with `cargo deny check`; CI runs it via EmbarkStudios/cargo-deny-action.
+
+[licenses]
+# Explicit allowlist covering exactly what the current dependency tree uses.
+# Crates with OR expressions (e.g. fiat-crypto "MIT OR Apache-2.0 OR BSD-1-Clause",
+# r-efi "MIT OR Apache-2.0 OR LGPL-2.1-or-later") are satisfied via MIT/Apache-2.0,
+# so BSD-1-Clause and LGPL are deliberately NOT allowed.
+allow = [
+    "0BSD",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CDLA-Permissive-2.0", # webpki-root-certs (Mozilla CA bundle data)
+    "ISC",
+    "MIT",
+    "MPL-2.0",     # uniffi family
+    "Unicode-3.0", # ICU4X crates
+    "Unlicense",
+    "Zlib",
+]
+# The workspace's own crates are GPL-3.0-only and publish = false; they are not
+# subject to the allowlist above (which governs external dependencies).
+private = { ignore = true }
+
+[advisories]
+# No blanket ignores: if an advisory fires, the fix is a dependency update, and
+# an ignore entry needs an inline comment explaining why no fix is possible.
+yanked = "warn"
+ignore = []
+
+[bans]
+multiple-versions = "warn"
+# All workspace path-dependencies are publish = false, so wildcard versions on
+# them are exempt; any other wildcard is a real mistake.
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
