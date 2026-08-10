@@ -26,7 +26,9 @@ impl Netns {
     /// `ip netns add <name>` — requires the harness namespaces to be set up.
     pub fn add(name: &str) -> Result<Netns, String> {
         run_checked(Command::new("ip").args(["netns", "add", name]))?;
-        let ns = Netns { name: name.to_string() };
+        let ns = Netns {
+            name: name.to_string(),
+        };
         // Every namespace gets loopback up; lots of tools assume it.
         ns.run("ip link set lo up")?;
         Ok(ns)
@@ -121,7 +123,11 @@ impl Netns {
                 });
             })
             .map_err(|e| format!("spawn host thread: {e}"))?;
-        Ok(HostHandle { cancel, thread: Some(thread), tid })
+        Ok(HostHandle {
+            cancel,
+            thread: Some(thread),
+            tid,
+        })
     }
 }
 
@@ -182,12 +188,20 @@ fn enter_by_path(path: &str) -> Result<(), String> {
     let cpath = CString::new(path).unwrap();
     let fd = unsafe { libc::open(cpath.as_ptr(), libc::O_RDONLY | libc::O_CLOEXEC) };
     if fd < 0 {
-        return Err(format!("open {}: {}", path, std::io::Error::last_os_error()));
+        return Err(format!(
+            "open {}: {}",
+            path,
+            std::io::Error::last_os_error()
+        ));
     }
     let r = unsafe { libc::setns(fd, libc::CLONE_NEWNET) };
     unsafe { libc::close(fd) };
     if r != 0 {
-        return Err(format!("setns {}: {}", path, std::io::Error::last_os_error()));
+        return Err(format!(
+            "setns {}: {}",
+            path,
+            std::io::Error::last_os_error()
+        ));
     }
     Ok(())
 }

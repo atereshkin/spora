@@ -238,7 +238,9 @@ fn latency_jitter() -> Result<(), String> {
     // race outcome.
     let stats = client.udp_echo(svc(ECHO_UDP_PORT), 20, 200, Duration::from_secs(30))?;
     if stats.received != 20 {
-        return fail(format!("udp echo lost packets under latency/jitter: {stats:?}"));
+        return fail(format!(
+            "udp echo lost packets under latency/jitter: {stats:?}"
+        ));
     }
     if stats.rtt_avg < Duration::from_millis(180) {
         return fail(format!(
@@ -255,7 +257,9 @@ fn latency_jitter() -> Result<(), String> {
 
     let bulk = client.tcp_bulk(svc(ECHO_TCP_PORT), 256 * 1024, Duration::from_secs(120))?;
     if bulk.bytes != 256 * 1024 {
-        return fail(format!("tcp bulk incomplete under latency/jitter: {bulk:?}"));
+        return fail(format!(
+            "tcp bulk incomplete under latency/jitter: {bulk:?}"
+        ));
     }
     log::info!(
         "latency_jitter: echo {stats:?}, bulk {:.2} Mbps",

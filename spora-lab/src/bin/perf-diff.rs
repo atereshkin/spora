@@ -37,10 +37,10 @@ struct Side {
 
 impl Side {
     fn load(&mut self, path: &Path) -> Result<(), String> {
-        let body = std::fs::read_to_string(path)
-            .map_err(|e| format!("read {}: {e}", path.display()))?;
-        let v: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| format!("parse {}: {e}", path.display()))?;
+        let body =
+            std::fs::read_to_string(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+        let v: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| format!("parse {}: {e}", path.display()))?;
         let obj = v
             .get("metrics")
             .and_then(|m| m.as_object())
@@ -54,7 +54,10 @@ impl Side {
                 .get("higher_is_better")
                 .and_then(|v| v.as_bool())
                 .ok_or_else(|| {
-                    format!("{}: metric {name}: bad \"higher_is_better\"", path.display())
+                    format!(
+                        "{}: metric {name}: bad \"higher_is_better\"",
+                        path.display()
+                    )
                 })?;
             let unit = m
                 .get("unit")
@@ -79,7 +82,11 @@ fn median(samples: &[f64]) -> f64 {
     let mut s = samples.to_vec();
     s.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
     let n = s.len();
-    if n % 2 == 1 { s[n / 2] } else { (s[n / 2 - 1] + s[n / 2]) / 2.0 }
+    if n % 2 == 1 {
+        s[n / 2]
+    } else {
+        (s[n / 2 - 1] + s[n / 2]) / 2.0
+    }
 }
 
 struct Args {
@@ -141,7 +148,11 @@ fn parse_args() -> Result<Args, String> {
     if baseline.is_empty() || current.is_empty() {
         return Err(USAGE.to_string());
     }
-    Ok(Args { tolerance_pct, baseline, current })
+    Ok(Args {
+        tolerance_pct,
+        baseline,
+        current,
+    })
 }
 
 fn run() -> Result<bool, String> {
@@ -221,11 +232,36 @@ fn run() -> Result<bool, String> {
         }
     }
 
-    let w_name = rows.iter().map(|r| r.name.len()).max().unwrap_or(0).max("metric".len());
-    let w_base = rows.iter().map(|r| r.base.len()).max().unwrap_or(0).max("baseline".len());
-    let w_cur = rows.iter().map(|r| r.cur.len()).max().unwrap_or(0).max("current".len());
-    let w_delta = rows.iter().map(|r| r.delta.len()).max().unwrap_or(0).max("delta".len());
-    let w_tol = rows.iter().map(|r| r.tol.len()).max().unwrap_or(0).max("tol".len());
+    let w_name = rows
+        .iter()
+        .map(|r| r.name.len())
+        .max()
+        .unwrap_or(0)
+        .max("metric".len());
+    let w_base = rows
+        .iter()
+        .map(|r| r.base.len())
+        .max()
+        .unwrap_or(0)
+        .max("baseline".len());
+    let w_cur = rows
+        .iter()
+        .map(|r| r.cur.len())
+        .max()
+        .unwrap_or(0)
+        .max("current".len());
+    let w_delta = rows
+        .iter()
+        .map(|r| r.delta.len())
+        .max()
+        .unwrap_or(0)
+        .max("delta".len());
+    let w_tol = rows
+        .iter()
+        .map(|r| r.tol.len())
+        .max()
+        .unwrap_or(0)
+        .max("tol".len());
     println!(
         "{:<w_name$}  {:>w_base$}  {:>w_cur$}  {:>w_delta$}  {:>w_tol$}  unit",
         "metric", "baseline", "current", "delta", "tol"

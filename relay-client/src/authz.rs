@@ -328,7 +328,10 @@ mod tests {
         // A token from the restored key verifies under the original's pubkey.
         let subject = rk(0x66);
         let token = restored.issue(&subject);
-        assert_eq!(verify_token(&token, &subject, &[issuer.public_key()]), Ok(()));
+        assert_eq!(
+            verify_token(&token, &subject, &[issuer.public_key()]),
+            Ok(())
+        );
     }
 
     #[test]

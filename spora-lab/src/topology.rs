@@ -86,7 +86,12 @@ pub struct TopologySpec {
 
 impl TopologySpec {
     pub fn new(sharer: NatKind, client: NatKind) -> Self {
-        Self { sharer, client, client_alt_gateway: false, ipv6: false }
+        Self {
+            sharer,
+            client,
+            client_alt_gateway: false,
+            ipv6: false,
+        }
     }
 }
 
@@ -129,7 +134,9 @@ impl Topology {
         wan.run("ip link add svc0 type dummy")?;
         wan.run(&format!("ip addr add {WAN_SERVICES_IP}/32 dev svc0"))?;
         if spec.ipv6 {
-            wan.run(&format!("ip addr add {WAN_SERVICES_IP6}/128 dev svc0 nodad"))?;
+            wan.run(&format!(
+                "ip addr add {WAN_SERVICES_IP6}/128 dev svc0 nodad"
+            ))?;
         }
         wan.run("ip link set svc0 up")?;
 
@@ -155,7 +162,9 @@ impl Topology {
                     FW_LAN_A,
                 )?;
                 let ip6 = if spec.ipv6 {
-                    Some(firewalled_side6(&wan, &gw, &sharer, &dev, LEG6_A, FW_LAN6_A)?)
+                    Some(firewalled_side6(
+                        &wan, &gw, &sharer, &dev, LEG6_A, FW_LAN6_A,
+                    )?)
                 } else {
                     None
                 };
@@ -203,7 +212,9 @@ impl Topology {
                     FW_LAN_B,
                 )?;
                 let ip6 = if spec.ipv6 {
-                    Some(firewalled_side6(&wan, &gw, &client, &dev, LEG6_B, FW_LAN6_B)?)
+                    Some(firewalled_side6(
+                        &wan, &gw, &client, &dev, LEG6_B, FW_LAN6_B,
+                    )?)
                 } else {
                     None
                 };
@@ -276,8 +287,9 @@ impl Topology {
         self.client
             .run("ip route replace default via 192.168.2.3 dev lan1")?;
         if self.ipv6 {
-            self.client
-                .run(&format!("ip -6 route replace default via {LAN6_B}::3 dev lan1"))?;
+            self.client.run(&format!(
+                "ip -6 route replace default via {LAN6_B}::3 dev lan1"
+            ))?;
         }
         Ok(())
     }
@@ -288,7 +300,9 @@ impl Topology {
 /// plus the far side's v6 default route. `prefix` is the /64 (wan `::1`,
 /// far `::2`). Returns the far side's address.
 fn leg6(wan: &Netns, far: &Netns, wan_dev: &str, prefix: &str) -> Result<Ipv6Addr, String> {
-    wan.run(&format!("ip -6 addr add {prefix}::1/64 dev {wan_dev} nodad"))?;
+    wan.run(&format!(
+        "ip -6 addr add {prefix}::1/64 dev {wan_dev} nodad"
+    ))?;
     far.run(&format!("ip -6 addr add {prefix}::2/64 dev wan0 nodad"))?;
     far.run(&format!("ip -6 route add default via {prefix}::1"))?;
     format!("{prefix}::2")
@@ -349,7 +363,9 @@ fn firewalled_side(
     peer.run("ip link set lan0 up")?;
     peer.run(&format!("ip route add default via {lan_gw}"))?;
 
-    let ext: Ipv4Addr = lan_peer.parse().map_err(|e| format!("fw lan peer addr: {e}"))?;
+    let ext: Ipv4Addr = lan_peer
+        .parse()
+        .map_err(|e| format!("fw lan peer addr: {e}"))?;
     apply_nat(&gw, NatKind::Firewalled, "wan0", ext)?;
     wan.run(&format!(
         "ip route add {lan_net} via {} src {WAN_SERVICES_IP}",

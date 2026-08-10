@@ -79,7 +79,11 @@ const BULK_TIMEOUT: Duration = Duration::from_secs(120);
 /// 512 KiB buffers + cubic: the client-side stack is deliberately NOT the
 /// bottleneck for the saturation/BDP measurements.
 fn perf_opts() -> TcpOpts {
-    TcpOpts { recv_buf: 512 * 1024, send_buf: 512 * 1024, cubic: true }
+    TcpOpts {
+        recv_buf: 512 * 1024,
+        send_buf: 512 * 1024,
+        cubic: true,
+    }
 }
 
 fn svc_ip() -> Ipv4Addr {
@@ -156,13 +160,25 @@ fn shaped_saturation(client: &ClientHandle, path: &str) -> Result<(), String> {
 
     let dl = client.tcp_download(svc(TCP_SOURCE_PORT), 16 * MIB, perf_opts(), BULK_TIMEOUT)?;
     let dl_mbps = dl.throughput_mbps();
-    metrics::record(&format!("download_mbps.{path}.shaped50"), dl_mbps, "mbps", true, 15.0);
+    metrics::record(
+        &format!("download_mbps.{path}.shaped50"),
+        dl_mbps,
+        "mbps",
+        true,
+        15.0,
+    );
 
     // The upload sender is the lab's own smoltcp stack (not the production
     // netstack), hence the slightly laxer gate.
     let ul = client.tcp_upload(svc(TCP_SINK_PORT), 8 * MIB, perf_opts(), BULK_TIMEOUT)?;
     let ul_mbps = ul.throughput_mbps();
-    metrics::record(&format!("upload_mbps.{path}.shaped50"), ul_mbps, "mbps", true, 15.0);
+    metrics::record(
+        &format!("upload_mbps.{path}.shaped50"),
+        ul_mbps,
+        "mbps",
+        true,
+        15.0,
+    );
 
     log::info!("{path} shaped50: download {dl_mbps:.1} Mbit/s, upload {ul_mbps:.1} Mbit/s");
     if dl_mbps < DOWNLOAD_GATE {
@@ -203,17 +219,25 @@ fn nz_relay_endpoint(addr: std::net::SocketAddr) -> spora_core::identity::RelayE
 /// `{download,upload}_mbps.<path>.<cond>`, returning `(dl_mbps, ul_mbps)`. Uses
 /// smaller transfers than the gated `shaped_saturation` so the lossy/high-delay
 /// A/B stays inside the timeout.
-fn measure_saturation(
-    client: &ClientHandle,
-    path: &str,
-    cond: &str,
-) -> Result<(f64, f64), String> {
+fn measure_saturation(client: &ClientHandle, path: &str, cond: &str) -> Result<(f64, f64), String> {
     let dl = client.tcp_download(svc(TCP_SOURCE_PORT), 8 * MIB, perf_opts(), BULK_TIMEOUT)?;
     let dl_mbps = dl.throughput_mbps();
-    metrics::record(&format!("download_mbps.{path}.{cond}"), dl_mbps, "mbps", false, 0.0);
+    metrics::record(
+        &format!("download_mbps.{path}.{cond}"),
+        dl_mbps,
+        "mbps",
+        false,
+        0.0,
+    );
     let ul = client.tcp_upload(svc(TCP_SINK_PORT), 4 * MIB, perf_opts(), BULK_TIMEOUT)?;
     let ul_mbps = ul.throughput_mbps();
-    metrics::record(&format!("upload_mbps.{path}.{cond}"), ul_mbps, "mbps", false, 0.0);
+    metrics::record(
+        &format!("upload_mbps.{path}.{cond}"),
+        ul_mbps,
+        "mbps",
+        false,
+        0.0,
+    );
     Ok((dl_mbps, ul_mbps))
 }
 
@@ -242,7 +266,13 @@ fn relay_saturation() -> Result<(), String> {
     opts.enable_direct_upgrade = false;
 
     let (sharer, client, setup) = establish(&topo, &opts)?;
-    metrics::record("setup_time_s.relay.shaped50", setup.as_secs_f64(), "s", false, 50.0);
+    metrics::record(
+        "setup_time_s.relay.shaped50",
+        setup.as_secs_f64(),
+        "s",
+        false,
+        50.0,
+    );
     log::info!("relay_saturation: setup {:.3}s", setup.as_secs_f64());
     if setup > SETUP_GATE {
         return Err(format!(
@@ -279,11 +309,19 @@ fn relay_tcp_saturation() -> Result<(), String> {
     opts.relays = vec![tcp_relay_endpoint(wan.tcp_relay_addr())];
 
     let (sharer, client, setup) = establish(&topo, &opts)?;
-    metrics::record("setup_time_s.relay_tcp.shaped50", setup.as_secs_f64(), "s", false, 50.0);
+    metrics::record(
+        "setup_time_s.relay_tcp.shaped50",
+        setup.as_secs_f64(),
+        "s",
+        false,
+        50.0,
+    );
     let (dl, ul) = measure_saturation(&client, "relay_tcp", "shaped50")?;
     log::info!("relay_tcp shaped50: download {dl:.1} Mbit/s, upload {ul:.1} Mbit/s");
     if dl <= 0.0 || ul <= 0.0 {
-        return Err(format!("tcp relay produced no throughput (dl {dl:.1}, ul {ul:.1})"));
+        return Err(format!(
+            "tcp relay produced no throughput (dl {dl:.1}, ul {ul:.1})"
+        ));
     }
     client.stop();
     sharer.stop();
@@ -326,7 +364,13 @@ fn relay_loss_compare() -> Result<(), String> {
             .tcp_download(svc(TCP_SOURCE_PORT), MIB, perf_opts(), T)
             .map(|s| s.throughput_mbps())
             .unwrap_or(0.0);
-        metrics::record(&format!("download_mbps.{path}.lossy"), dl, "mbps", false, 0.0);
+        metrics::record(
+            &format!("download_mbps.{path}.lossy"),
+            dl,
+            "mbps",
+            false,
+            0.0,
+        );
         let ul = client
             .tcp_upload(svc(TCP_SINK_PORT), 512 * 1024, perf_opts(), T)
             .map(|s| s.throughput_mbps())
@@ -340,9 +384,23 @@ fn relay_loss_compare() -> Result<(), String> {
     let (dl_udp, ul_udp) = measure(false)?;
     let (dl_tcp, ul_tcp) = measure(true)?;
 
-    let dl_ratio = if dl_tcp > 0.01 { dl_udp / dl_tcp } else { f64::INFINITY };
-    let ul_ratio = if ul_tcp > 0.01 { ul_udp / ul_tcp } else { f64::INFINITY };
-    metrics::record("loss_download_ratio.udp_over_tcp", dl_ratio, "x", false, 0.0);
+    let dl_ratio = if dl_tcp > 0.01 {
+        dl_udp / dl_tcp
+    } else {
+        f64::INFINITY
+    };
+    let ul_ratio = if ul_tcp > 0.01 {
+        ul_udp / ul_tcp
+    } else {
+        f64::INFINITY
+    };
+    metrics::record(
+        "loss_download_ratio.udp_over_tcp",
+        dl_ratio,
+        "x",
+        false,
+        0.0,
+    );
     metrics::record("loss_upload_ratio.udp_over_tcp", ul_ratio, "x", false, 0.0);
     log::info!(
         "LOSS A/B ({SPEC}): download UDP {dl_udp:.1} vs TCP {dl_tcp:.1} Mbit/s ({dl_ratio:.1}x); \
@@ -371,11 +429,19 @@ fn relay_nz_saturation() -> Result<(), String> {
     opts.relays = vec![nz_relay_endpoint(wan.relay_addr())];
 
     let (sharer, client, setup) = establish(&topo, &opts)?;
-    metrics::record("setup_time_s.relay_nz.shaped50", setup.as_secs_f64(), "s", false, 50.0);
+    metrics::record(
+        "setup_time_s.relay_nz.shaped50",
+        setup.as_secs_f64(),
+        "s",
+        false,
+        50.0,
+    );
     let (dl, ul) = measure_saturation(&client, "relay_nz", "shaped50")?;
     log::info!("relay_nz shaped50: download {dl:.1} Mbit/s, upload {ul:.1} Mbit/s");
     if dl <= 0.0 || ul <= 0.0 {
-        return Err(format!("nz relay produced no throughput (dl {dl:.1}, ul {ul:.1})"));
+        return Err(format!(
+            "nz relay produced no throughput (dl {dl:.1}, ul {ul:.1})"
+        ));
     }
     client.stop();
     sharer.stop();
@@ -414,7 +480,9 @@ fn relay_nz_loss() -> Result<(), String> {
         .map(|s| s.throughput_mbps())
         .unwrap_or(0.0);
     metrics::record("upload_mbps.relay_nz.lossy", ul, "mbps", false, 0.0);
-    log::info!("relay_nz lossy: download {dl:.2} Mbit/s, upload {ul:.2} Mbit/s (no pacer — collapse expected)");
+    log::info!(
+        "relay_nz lossy: download {dl:.2} Mbit/s, upload {ul:.2} Mbit/s (no pacer — collapse expected)"
+    );
     client.stop();
     sharer.stop();
     Ok(())
@@ -445,7 +513,9 @@ fn direct_nz_saturation() -> Result<(), String> {
     let (dl, ul) = measure_saturation(&client, "direct_nz", "shaped50")?;
     log::info!("direct_nz shaped50: download {dl:.1} Mbit/s, upload {ul:.1} Mbit/s");
     if dl <= 0.0 || ul <= 0.0 {
-        return Err(format!("nz direct produced no throughput (dl {dl:.1}, ul {ul:.1})"));
+        return Err(format!(
+            "nz direct produced no throughput (dl {dl:.1}, ul {ul:.1})"
+        ));
     }
     client.stop();
     sharer.stop();
@@ -477,8 +547,17 @@ fn direct_saturation() -> Result<(), String> {
         .wait_event(upgrade_success, EVENT_TIMEOUT)
         .map_err(|e| format!("client never saw DirectUpgradeSucceeded: {e}"))?;
     let upgrade = started.elapsed();
-    metrics::record("upgrade_time_s.direct.shaped50", upgrade.as_secs_f64(), "s", false, 50.0);
-    log::info!("direct_saturation: upgrade {:.3}s after start_client", upgrade.as_secs_f64());
+    metrics::record(
+        "upgrade_time_s.direct.shaped50",
+        upgrade.as_secs_f64(),
+        "s",
+        false,
+        50.0,
+    );
+    log::info!(
+        "direct_saturation: upgrade {:.3}s after start_client",
+        upgrade.as_secs_f64()
+    );
     if upgrade > UPGRADE_GATE {
         return Err(format!(
             "direct upgrade took {:.2}s from start_client, over the {UPGRADE_GATE:?} gate",
@@ -544,9 +623,20 @@ fn bdp_window() -> Result<(), String> {
 
     // 8 MiB (not 16) for the window-limited control: at its ~13 Mbit/s
     // ceiling it already takes ~5 s; the value is a ceiling, not a race.
-    let dl64 = client.tcp_download(svc(TCP_SOURCE_PORT), 8 * MIB, TcpOpts::default(), BULK_TIMEOUT)?;
+    let dl64 = client.tcp_download(
+        svc(TCP_SOURCE_PORT),
+        8 * MIB,
+        TcpOpts::default(),
+        BULK_TIMEOUT,
+    )?;
     let dl64_mbps = dl64.throughput_mbps();
-    metrics::record("download_mbps.relay.bdp40ms.win64k", dl64_mbps, "mbps", true, 15.0);
+    metrics::record(
+        "download_mbps.relay.bdp40ms.win64k",
+        dl64_mbps,
+        "mbps",
+        true,
+        15.0,
+    );
 
     // HARD methodology self-check, window-arithmetic-pinned: 64 KiB of
     // receive window over a 40 ms RTT cannot exceed ~13.1 Mbit/s — unless
@@ -644,7 +734,13 @@ fn latency_overhead() -> Result<(), String> {
         return Err(format!("unshaped echo lost packets: {unshaped:?}"));
     }
     let unshaped_p50_ms = unshaped.rtt_p50.as_secs_f64() * 1000.0;
-    metrics::record("echo_rtt_p50_ms.unshaped", unshaped_p50_ms, "ms", false, 60.0);
+    metrics::record(
+        "echo_rtt_p50_ms.unshaped",
+        unshaped_p50_ms,
+        "ms",
+        false,
+        60.0,
+    );
     log::info!("latency_overhead: unshaped (tunnel-added) p50 {unshaped_p50_ms:.3} ms");
 
     client2.stop();
@@ -681,15 +777,32 @@ fn nz_efficiency() -> Result<(), String> {
 
     let client_cpu0 = client.pump_cpu_time(Duration::from_secs(10))?;
     let sharer_cpu0 = sharer.cpu_time();
-    let dl = client.tcp_download(svc(TCP_SOURCE_PORT), DOWNLOAD_BYTES, perf_opts(), BULK_TIMEOUT)?;
+    let dl = client.tcp_download(
+        svc(TCP_SOURCE_PORT),
+        DOWNLOAD_BYTES,
+        perf_opts(),
+        BULK_TIMEOUT,
+    )?;
     let client_cpu1 = client.pump_cpu_time(Duration::from_secs(10))?;
     let sharer_cpu1 = sharer.cpu_time();
 
     let dl_mbps = dl.throughput_mbps();
-    metrics::record("download_mbps.direct_nz.unshaped", dl_mbps, "mbps", false, 35.0);
+    metrics::record(
+        "download_mbps.direct_nz.unshaped",
+        dl_mbps,
+        "mbps",
+        false,
+        35.0,
+    );
     let gib = DOWNLOAD_BYTES as f64 / GIB;
     let client_ms_per_gb = client_cpu1.saturating_sub(client_cpu0).as_secs_f64() / gib * 1000.0;
-    metrics::record("cpu_ms_per_gib.client_nz", client_ms_per_gb, "ms/GiB", false, 35.0);
+    metrics::record(
+        "cpu_ms_per_gib.client_nz",
+        client_ms_per_gb,
+        "ms/GiB",
+        false,
+        35.0,
+    );
     let sharer_ms_per_gb = match (sharer_cpu0, sharer_cpu1) {
         (Some(c0), Some(c1)) => {
             let v = c1.saturating_sub(c0).as_secs_f64() / gib * 1000.0;
@@ -701,14 +814,22 @@ fn nz_efficiency() -> Result<(), String> {
 
     let ul = client.tcp_upload(svc(TCP_SINK_PORT), UPLOAD_BYTES, perf_opts(), BULK_TIMEOUT)?;
     let ul_mbps = ul.throughput_mbps();
-    metrics::record("upload_mbps.direct_nz.unshaped", ul_mbps, "mbps", false, 35.0);
+    metrics::record(
+        "upload_mbps.direct_nz.unshaped",
+        ul_mbps,
+        "mbps",
+        false,
+        35.0,
+    );
 
     log::info!(
         "nz_efficiency (unshaped): download {dl_mbps:.1} Mbit/s, upload {ul_mbps:.1} Mbit/s, \
          cpu {client_ms_per_gb:.0}/{sharer_ms_per_gb:.0} ms/GiB (client/sharer)"
     );
     if dl_mbps <= 0.0 || ul_mbps <= 0.0 {
-        return Err(format!("nz efficiency produced no throughput (dl {dl_mbps:.1}, ul {ul_mbps:.1})"));
+        return Err(format!(
+            "nz efficiency produced no throughput (dl {dl_mbps:.1}, ul {ul_mbps:.1})"
+        ));
     }
     client.stop();
     sharer.stop();
@@ -747,8 +868,20 @@ fn efficiency_report() -> Result<(), String> {
     // Settle the queued transport swap before measuring (see direct_saturation).
     let _ = client.udp_echo(svc(ECHO_UDP_PORT), 10, 200, Duration::from_secs(30))?;
 
-    metrics::record("download_mib.efficiency", (DOWNLOAD_BYTES / MIB) as f64, "MiB", true, 0.0);
-    metrics::record("upload_mib.efficiency", (UPLOAD_BYTES / MIB) as f64, "MiB", true, 0.0);
+    metrics::record(
+        "download_mib.efficiency",
+        (DOWNLOAD_BYTES / MIB) as f64,
+        "MiB",
+        true,
+        0.0,
+    );
+    metrics::record(
+        "upload_mib.efficiency",
+        (UPLOAD_BYTES / MIB) as f64,
+        "MiB",
+        true,
+        0.0,
+    );
 
     // CPU per GiB, sampled around the download. pump_cpu_time is the client
     // host thread (the whole client tunnel runs on it, current-thread
@@ -757,7 +890,12 @@ fn efficiency_report() -> Result<(), String> {
     let client_cpu0 = client.pump_cpu_time(Duration::from_secs(10))?;
     let sharer_cpu0 = sharer.cpu_time();
 
-    let dl = client.tcp_download(svc(TCP_SOURCE_PORT), DOWNLOAD_BYTES, perf_opts(), BULK_TIMEOUT)?;
+    let dl = client.tcp_download(
+        svc(TCP_SOURCE_PORT),
+        DOWNLOAD_BYTES,
+        perf_opts(),
+        BULK_TIMEOUT,
+    )?;
 
     let client_cpu1 = client.pump_cpu_time(Duration::from_secs(10))?;
     let sharer_cpu1 = sharer.cpu_time();
@@ -766,9 +904,14 @@ fn efficiency_report() -> Result<(), String> {
     metrics::record("download_mbps.direct.unshaped", dl_mbps, "mbps", true, 35.0);
 
     let gib = DOWNLOAD_BYTES as f64 / GIB;
-    let client_ms_per_gb =
-        client_cpu1.saturating_sub(client_cpu0).as_secs_f64() / gib * 1000.0;
-    metrics::record("cpu_ms_per_gib.client", client_ms_per_gb, "ms/GiB", false, 35.0);
+    let client_ms_per_gb = client_cpu1.saturating_sub(client_cpu0).as_secs_f64() / gib * 1000.0;
+    metrics::record(
+        "cpu_ms_per_gib.client",
+        client_ms_per_gb,
+        "ms/GiB",
+        false,
+        35.0,
+    );
     let sharer_ms_per_gb = match (sharer_cpu0, sharer_cpu1) {
         (Some(c0), Some(c1)) => {
             let v = c1.saturating_sub(c0).as_secs_f64() / gib * 1000.0;

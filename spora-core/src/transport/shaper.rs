@@ -148,7 +148,11 @@ impl Shaper for ScrambleV1 {
     fn obfuscate(&self, framed: &[u8], is_first: bool) -> Vec<u8> {
         if is_first {
             // msg1: routing_key(20) | nonce(8) | mask(body[52]) | pad.
-            debug_assert_eq!(framed.len(), MSG1_FRAMED_LEN, "shaped msg1 must be framed msg1");
+            debug_assert_eq!(
+                framed.len(),
+                MSG1_FRAMED_LEN,
+                "shaped msg1 must be framed msg1"
+            );
             let nonce: [u8; MSG1_NONCE] = rand::random();
             let ks = self.msg1_keystream(&nonce, MSG1_BODY);
             let mut out = Vec::with_capacity(MSG1_WIRE_MIN + MSG1_PAD_MAX);
@@ -225,7 +229,11 @@ mod tests {
         let framed: Vec<u8> = (0..40u8).collect();
         let wire = s.obfuscate(&framed, false);
         assert_eq!(wire.len(), framed.len(), "data class adds no bytes");
-        assert_ne!(&wire[..4], &framed[..4], "demux field is masked on the wire");
+        assert_ne!(
+            &wire[..4],
+            &framed[..4],
+            "demux field is masked on the wire"
+        );
         assert_eq!(&wire[4..], &framed[4..], "only the leading 4 bytes change");
         assert_eq!(s.deobfuscate(&wire).unwrap(), framed, "round-trips");
     }
@@ -240,7 +248,11 @@ mod tests {
         b[7] = 7; // different counter byte
         let wa = s.obfuscate(&a, false);
         let wb = s.obfuscate(&b, false);
-        assert_ne!(&wa[..4], &wb[..4], "same index, different counter -> different masked prefix");
+        assert_ne!(
+            &wa[..4],
+            &wb[..4],
+            "same index, different counter -> different masked prefix"
+        );
         // sanity: both still round-trip
         assert_eq!(&s.deobfuscate(&wa).unwrap()[..4], &[9, 9, 9, 9]);
         a[0] = 9; // silence unused-mut in some toolchains
@@ -257,12 +269,24 @@ mod tests {
         }
         let w1 = s.obfuscate(&framed, true);
         let w2 = s.obfuscate(&framed, true);
-        assert_eq!(&w1[..ROUTING_KEY_LEN], &rk(), "routing_key stays cleartext for the relay");
+        assert_eq!(
+            &w1[..ROUTING_KEY_LEN],
+            &rk(),
+            "routing_key stays cleartext for the relay"
+        );
         assert!(w1.len() >= MSG1_WIRE_MIN, "at least routing_key+nonce+body");
         // Fresh nonce + pad each call -> different wire bytes and (usually) length.
         assert_ne!(w1, w2, "retransmits differ (fresh nonce/pad)");
-        assert_ne!(&w1[ROUTING_KEY_LEN + MSG1_NONCE..MSG1_WIRE_MIN], &framed[ROUTING_KEY_LEN..], "body is masked");
-        assert_eq!(s.deobfuscate(&w1).unwrap(), framed, "round-trips to the exact framed msg1");
+        assert_ne!(
+            &w1[ROUTING_KEY_LEN + MSG1_NONCE..MSG1_WIRE_MIN],
+            &framed[ROUTING_KEY_LEN..],
+            "body is masked"
+        );
+        assert_eq!(
+            s.deobfuscate(&w1).unwrap(),
+            framed,
+            "round-trips to the exact framed msg1"
+        );
         assert_eq!(s.deobfuscate(&w2).unwrap(), framed);
     }
 
@@ -271,7 +295,11 @@ mod tests {
         let a = ScrambleV1::new(&rk(), &[1u8; 16]);
         let b = ScrambleV1::new(&rk(), &[2u8; 16]); // same routing_key, different secret
         let framed: Vec<u8> = (0..40u8).collect();
-        assert_ne!(a.obfuscate(&framed, false), b.obfuscate(&framed, false), "different secret -> different wire");
+        assert_ne!(
+            a.obfuscate(&framed, false),
+            b.obfuscate(&framed, false),
+            "different secret -> different wire"
+        );
     }
 
     #[test]

@@ -1,25 +1,25 @@
 pub mod frag;
 pub mod keepalive;
 pub mod meter;
+#[cfg(test)]
+pub mod mock;
 pub mod noise;
 pub mod quic;
 pub mod shaper;
 pub mod stream;
 pub mod upgradable;
-#[cfg(test)]
-pub mod mock;
 
-use std::future::Future;
 use futures_util::{Sink, Stream};
+use log::{debug, info, warn};
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::{Context, Poll};
 use std::task::Poll::Ready;
-use log::{debug, info, warn};
+use std::task::{Context, Poll};
 use tokio::net::UdpSocket;
-use tokio::time::{sleep, Sleep};
+use tokio::time::{Sleep, sleep};
 
 pub type IpTransport = Box<dyn Transport + Send + Unpin>;
 
@@ -64,7 +64,8 @@ impl Stream for UdpTransport {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        loop { // it's only in a loop to repeat polling the socket if we get a packet from the wrong peer
+        loop {
+            // it's only in a loop to repeat polling the socket if we get a packet from the wrong peer
             let mut buf = tokio::io::ReadBuf::new(&mut this.recv_buffer);
             match this.socket.poll_recv_from(cx, &mut buf) {
                 Poll::Ready(Ok(addr)) => {
@@ -80,11 +81,9 @@ impl Stream for UdpTransport {
                 Poll::Pending => {}
             }
             return match this.timeout_timer.as_mut().poll(cx) {
-                Poll::Ready(_) => {
-                    Poll::Ready(None)
-                }
+                Poll::Ready(_) => Poll::Ready(None),
                 Poll::Pending => Poll::Pending,
-            }
+            };
         }
     }
 }
@@ -108,7 +107,6 @@ impl Sink<Vec<u8>> for UdpTransport {
         self.inner_sink.as_mut().poll_close(cx)
     }
 }
-
 
 /// Default sleep after a failed dial (see `Timings::reconnect_delay`).
 pub(crate) const RECONNECT_DELAY: std::time::Duration = std::time::Duration::from_secs(5);
@@ -148,7 +146,10 @@ impl ReconnectTransport {
     }
 
     fn begin_sleep(&mut self) {
-        debug!("Sleeping for {} seconds before reconnecting.", self.delay.as_secs());
+        debug!(
+            "Sleeping for {} seconds before reconnecting.",
+            self.delay.as_secs()
+        );
         self.state = ReconnectState::Sleeping(Box::pin(sleep(self.delay)));
     }
 
@@ -231,7 +232,7 @@ impl Sink<Vec<u8>> for ReconnectTransport {
                     this.begin_sleep();
                 }
                 Ok(())
-            },
+            }
             ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Ok(()), // drop policy
         }
     }
@@ -239,15 +240,13 @@ impl Sink<Vec<u8>> for ReconnectTransport {
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
         match &mut this.state {
-            ReconnectState::Connected(inner) => {
-                match Pin::new(inner).poll_flush(cx) {
-                    Ready(Err(e)) => {
-                        warn!("poll_flush failed: {}. Reconnecting...", e);
-                        this.begin_dial();
-                        Ready(Ok(()))
-                    },
-                    p => p
+            ReconnectState::Connected(inner) => match Pin::new(inner).poll_flush(cx) {
+                Ready(Err(e)) => {
+                    warn!("poll_flush failed: {}. Reconnecting...", e);
+                    this.begin_dial();
+                    Ready(Ok(()))
                 }
+                p => p,
             },
             ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
         }
@@ -256,15 +255,13 @@ impl Sink<Vec<u8>> for ReconnectTransport {
     fn poll_close(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
         let this = self.get_mut();
         match &mut this.state {
-            ReconnectState::Connected(inner) => {
-                match Pin::new(inner).poll_close(cx) {
-                    Ready(Err(e)) => {
-                        warn!("poll_close failed: {}. Reconnecting...", e);
-                        this.begin_dial();
-                        Ready(Ok(()))
-                    },
-                    p => p
+            ReconnectState::Connected(inner) => match Pin::new(inner).poll_close(cx) {
+                Ready(Err(e)) => {
+                    warn!("poll_close failed: {}. Reconnecting...", e);
+                    this.begin_dial();
+                    Ready(Ok(()))
                 }
+                p => p,
             },
             ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
         }
@@ -273,12 +270,14 @@ impl Sink<Vec<u8>> for ReconnectTransport {
 
 #[cfg(test)]
 mod tests {
+    use super::mock::{
+        MockTransportHandle, is_icmp_echo_request, mock_transport, mock_transport_pair,
+    };
     use super::*;
-    use super::mock::{mock_transport, mock_transport_pair, is_icmp_echo_request, MockTransportHandle};
     use crate::transport::keepalive::{KeepAliveConfig, KeepAliveMode, KeepAliveTransport};
     use futures_util::{SinkExt, StreamExt};
-    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[tokio::test]
     async fn reconnect_passes_packets_through() {
@@ -322,7 +321,9 @@ mod tests {
         let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
 
         // First poll sees None and enters the paced sleep — it must NOT dial yet.
-        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
+            .await
+            .ok();
         assert_eq!(
             dial_count.load(Ordering::SeqCst),
             0,
@@ -331,8 +332,13 @@ mod tests {
 
         // After the delay, the dial fires.
         tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_millis(100)).await;
-        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
-        assert!(dial_count.load(Ordering::SeqCst) >= 1, "dialer should have been called");
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
+            .await
+            .ok();
+        assert!(
+            dial_count.load(Ordering::SeqCst) >= 1,
+            "dialer should have been called"
+        );
     }
 
     #[tokio::test]
@@ -361,7 +367,9 @@ mod tests {
         let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
 
         // The stream error enters the paced sleep — no immediate redial.
-        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
+            .await
+            .ok();
         assert_eq!(
             dial_count.load(Ordering::SeqCst),
             0,
@@ -370,7 +378,9 @@ mod tests {
 
         // After the delay, it redials.
         tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_millis(100)).await;
-        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
+            .await
+            .ok();
         assert!(
             dial_count.load(Ordering::SeqCst) >= 1,
             "dialer should have been called after a stream error"
@@ -396,7 +406,10 @@ mod tests {
             Box::pin(async move {
                 let n = dc.fetch_add(1, Ordering::SeqCst);
                 if n < 2 {
-                    Err(io::Error::new(io::ErrorKind::ConnectionRefused, "test failure"))
+                    Err(io::Error::new(
+                        io::ErrorKind::ConnectionRefused,
+                        "test failure",
+                    ))
                 } else {
                     let (new_local, new_handle) = mock_transport();
                     handles.lock().unwrap().push(new_handle);
@@ -416,13 +429,18 @@ mod tests {
                 // Advance time past the reconnect delay
                 tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_millis(100)).await;
                 // Poll to drive state machine
-                tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+                tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
+                    .await
+                    .ok();
             }
         })
         .await
         .expect("should complete within timeout");
 
-        assert!(dial_count.load(Ordering::SeqCst) >= 3, "dialer should have been called at least 3 times");
+        assert!(
+            dial_count.load(Ordering::SeqCst) >= 3,
+            "dialer should have been called at least 3 times"
+        );
     }
 
     // --- Sink tests ---
@@ -453,10 +471,17 @@ mod tests {
         let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
 
         // Drive past the None; the redial is paced, so advance past the delay.
-        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
+            .await
+            .ok();
         tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_millis(100)).await;
-        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
-        assert!(dial_count.load(Ordering::SeqCst) >= 1, "dialer should have been called from stream close");
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
+            .await
+            .ok();
+        assert!(
+            dial_count.load(Ordering::SeqCst) >= 1,
+            "dialer should have been called from stream close"
+        );
 
         // Now close the new handle to make the Sink fail
         {
@@ -473,9 +498,14 @@ mod tests {
 
         // The sink-error reconnect is paced too: advance past the delay, then dial.
         tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_millis(100)).await;
-        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
+            .await
+            .ok();
 
-        assert!(dial_count.load(Ordering::SeqCst) >= 1, "dialer should have been called after sink error");
+        assert!(
+            dial_count.load(Ordering::SeqCst) >= 1,
+            "dialer should have been called after sink error"
+        );
     }
 
     #[tokio::test]
@@ -488,18 +518,26 @@ mod tests {
         // Dialer always fails, so we stay in Sleeping state
         let dialer: Dialer = Box::new(|| {
             Box::pin(async {
-                Err(io::Error::new(io::ErrorKind::ConnectionRefused, "always fails"))
+                Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "always fails",
+                ))
             })
         });
 
         let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
 
         // Poll to drive: None → Sleeping (the paced reconnect delay)
-        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
+            .await
+            .ok();
 
         // Now in Sleeping state — send should succeed (drop policy)
         let result = Pin::new(&mut rt).send(vec![1, 2, 3]).await;
-        assert!(result.is_ok(), "send should succeed (drop policy) while sleeping");
+        assert!(
+            result.is_ok(),
+            "send should succeed (drop policy) while sleeping"
+        );
     }
 
     #[tokio::test]
@@ -509,20 +547,25 @@ mod tests {
         handle.close(); // trigger reconnect
 
         // Dialer hangs forever
-        let dialer: Dialer = Box::new(|| {
-            Box::pin(futures_util::future::pending())
-        });
+        let dialer: Dialer = Box::new(|| Box::pin(futures_util::future::pending()));
 
         let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
 
         // None → Sleeping → (advance past the delay) → begin_dial → Dialing (hangs)
-        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
+            .await
+            .ok();
         tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_millis(100)).await;
-        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next()).await.ok();
+        tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
+            .await
+            .ok();
 
         // Now in Dialing state — send should succeed (drop policy)
         let result = Pin::new(&mut rt).send(vec![1, 2, 3]).await;
-        assert!(result.is_ok(), "send should succeed (drop policy) while dialing");
+        assert!(
+            result.is_ok(),
+            "send should succeed (drop policy) while dialing"
+        );
     }
 
     // --- Full transport stack integration tests ---
@@ -534,7 +577,11 @@ mod tests {
         let (local, mut handle) = mock_transport();
 
         let dialer: Dialer = Box::new(|| Box::pin(async { unreachable!("should not dial") }));
-        let reconnect = Box::new(ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY)) as IpTransport;
+        let reconnect = Box::new(ReconnectTransport::new(
+            Box::new(local),
+            dialer,
+            RECONNECT_DELAY,
+        )) as IpTransport;
 
         let ka_cfg = KeepAliveConfig {
             mode: KeepAliveMode::Periodic {
@@ -595,7 +642,11 @@ mod tests {
             })
         });
 
-        let reconnect = Box::new(ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY)) as IpTransport;
+        let reconnect = Box::new(ReconnectTransport::new(
+            Box::new(local),
+            dialer,
+            RECONNECT_DELAY,
+        )) as IpTransport;
 
         let ka_cfg = KeepAliveConfig {
             mode: KeepAliveMode::Periodic {
@@ -616,11 +667,18 @@ mod tests {
 
         // Drive the state machine: poll_next sees None and enters the paced
         // sleep; advance past the reconnect delay so the dial fires.
-        tokio::time::timeout(std::time::Duration::from_millis(10), stack.next()).await.ok();
+        tokio::time::timeout(std::time::Duration::from_millis(10), stack.next())
+            .await
+            .ok();
         tokio::time::advance(RECONNECT_DELAY + std::time::Duration::from_secs(1)).await;
-        tokio::time::timeout(std::time::Duration::from_millis(100), stack.next()).await.ok();
+        tokio::time::timeout(std::time::Duration::from_millis(100), stack.next())
+            .await
+            .ok();
 
-        assert!(dial_count.load(Ordering::SeqCst) >= 1, "dialer should have been called");
+        assert!(
+            dial_count.load(Ordering::SeqCst) >= 1,
+            "dialer should have been called"
+        );
 
         // Send data via the new handle's transport
         {

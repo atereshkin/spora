@@ -396,25 +396,19 @@ mod tests {
 
         // Inbound: handle → transport
         handle.send(vec![1, 2, 3]).unwrap();
-        let pkt = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            transport.next(),
-        )
-        .await
-        .expect("timeout")
-        .unwrap()
-        .unwrap();
+        let pkt = tokio::time::timeout(std::time::Duration::from_millis(100), transport.next())
+            .await
+            .expect("timeout")
+            .unwrap()
+            .unwrap();
         assert_eq!(pkt, vec![1, 2, 3]);
 
         // Outbound: transport → handle
         Pin::new(&mut transport).send(vec![4, 5, 6]).await.unwrap();
-        let pkt = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            handle.recv(),
-        )
-        .await
-        .expect("timeout")
-        .unwrap();
+        let pkt = tokio::time::timeout(std::time::Duration::from_millis(100), handle.recv())
+            .await
+            .expect("timeout")
+            .unwrap();
         assert_eq!(pkt, vec![4, 5, 6]);
     }
 
@@ -426,14 +420,11 @@ mod tests {
 
         // Initial transport works
         handle1.send(vec![1, 2, 3]).unwrap();
-        let pkt = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            transport.next(),
-        )
-        .await
-        .expect("timeout")
-        .unwrap()
-        .unwrap();
+        let pkt = tokio::time::timeout(std::time::Duration::from_millis(100), transport.next())
+            .await
+            .expect("timeout")
+            .unwrap()
+            .unwrap();
         assert_eq!(pkt, vec![1, 2, 3]);
 
         // Upgrade to new transport
@@ -445,25 +436,19 @@ mod tests {
 
         // Data on new handle should arrive
         handle2.send(vec![7, 8, 9]).unwrap();
-        let pkt = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            transport.next(),
-        )
-        .await
-        .expect("timeout")
-        .unwrap()
-        .unwrap();
+        let pkt = tokio::time::timeout(std::time::Duration::from_millis(100), transport.next())
+            .await
+            .expect("timeout")
+            .unwrap()
+            .unwrap();
         assert_eq!(pkt, vec![7, 8, 9]);
 
         // Outbound goes to new handle
         Pin::new(&mut transport).send(vec![10, 11]).await.unwrap();
-        let pkt = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            handle2.recv(),
-        )
-        .await
-        .expect("timeout")
-        .unwrap();
+        let pkt = tokio::time::timeout(std::time::Duration::from_millis(100), handle2.recv())
+            .await
+            .expect("timeout")
+            .unwrap();
         assert_eq!(pkt, vec![10, 11]);
     }
 

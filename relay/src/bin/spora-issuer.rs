@@ -16,7 +16,11 @@ use clap::{Parser, Subcommand};
 use relay_client::authz::{self, IssuerKeyPair};
 
 #[derive(Parser)]
-#[command(name = "spora-issuer", version, about = "Generate a relay issuer key and mint capability tokens")]
+#[command(
+    name = "spora-issuer",
+    version,
+    about = "Generate a relay issuer key and mint capability tokens"
+)]
 struct Args {
     #[command(subcommand)]
     cmd: Cmd,
@@ -48,7 +52,10 @@ fn main() {
         Cmd::Gen { out } => {
             let issuer = IssuerKeyPair::generate().unwrap_or_else(|e| die(&e));
             write_private(&out, &authz::encode_b64(issuer.pkcs8_bytes()));
-            eprintln!("Issuer secret written to {} — keep it private.", out.display());
+            eprintln!(
+                "Issuer secret written to {} — keep it private.",
+                out.display()
+            );
             eprintln!("Configure the relay with:");
             eprintln!();
             println!("--issuer-key {}", authz::encode_b64(&issuer.public_key()));

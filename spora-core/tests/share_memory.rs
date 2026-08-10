@@ -13,7 +13,7 @@ use std::time::{Duration, Instant};
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::UdpSocket as TokioUdp;
 
-use spora_core::e2e::{client_connect, client_endpoint, E2eSession};
+use spora_core::e2e::{E2eSession, client_connect, client_endpoint};
 use spora_core::identity::{Identity, Token};
 use spora_core::{Config, Timings, share};
 
@@ -44,7 +44,10 @@ async fn start_share() -> (std::net::SocketAddr, Token, spora_core::ShareSession
     let relay_addr = start_relay().await;
     let identity = Identity::generate();
     let config = Config {
-        relays: vec![spora_core::identity::RelayEndpoint::new("127.0.0.1", relay_addr.port())],
+        relays: vec![spora_core::identity::RelayEndpoint::new(
+            "127.0.0.1",
+            relay_addr.port(),
+        )],
         ..Config::default()
     };
     let session = share(identity, config).await.expect("share()");
@@ -136,7 +139,11 @@ async fn share_icmp_flood_30s() {
             tokio::task::yield_now().await;
         }
         if last_report.elapsed() >= Duration::from_secs(5) {
-            print_sample(&format!("t≈+{}s sent={}", last_report.elapsed().as_secs(), sent), rss_kb(), baseline);
+            print_sample(
+                &format!("t≈+{}s sent={}", last_report.elapsed().as_secs(), sent),
+                rss_kb(),
+                baseline,
+            );
             last_report = Instant::now();
         }
     }

@@ -140,8 +140,11 @@ impl QuicPeerTransport {
                     break;
                 }
                 let s = stats_conn.stats();
-                let (txd, rxd, lost) =
-                    (s.frame_tx.datagram, s.frame_rx.datagram, s.path.lost_packets);
+                let (txd, rxd, lost) = (
+                    s.frame_tx.datagram,
+                    s.frame_rx.datagram,
+                    s.path.lost_packets,
+                );
                 debug!(
                     "QUIC path stats: rtt={:?} cwnd={} mtu={} mds={:?} | \
                      datagrams tx={} (+{}) rx={} (+{}) | lost_pkts={} (+{}) black_holes={}",
@@ -299,7 +302,10 @@ const DATAGRAM_SEND_BUFFER: usize = 512 * 1024;
 
 /// Build the shared QUIC transport config. `idle_timeout` / `keep_alive`
 /// come from [`crate::Timings`] (defaults: 30s / 10s).
-pub fn build_transport_config(idle_timeout: Duration, keep_alive: Duration) -> quinn::TransportConfig {
+pub fn build_transport_config(
+    idle_timeout: Duration,
+    keep_alive: Duration,
+) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(idle_timeout.try_into().unwrap()));
     transport.keep_alive_interval(Some(keep_alive));
@@ -334,11 +340,10 @@ pub fn build_transport_config(idle_timeout: Duration, keep_alive: Duration) -> q
     transport
 }
 
-
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::frag::ipv4_header_checksum;
+    use super::*;
 
     /// Build a valid IPv4/UDP packet with `payload_len` bytes of UDP payload.
     fn ipv4_udp(payload_len: usize) -> Vec<u8> {
@@ -403,7 +408,11 @@ mod tests {
             let frags = fragment_ipv4(&pkt, 1414, id).unwrap();
             assert!(frags.len() >= 2);
             for f in &frags {
-                assert_eq!(u16::from_be_bytes([f[4], f[5]]), id, "fragment must carry id {id:#x}");
+                assert_eq!(
+                    u16::from_be_bytes([f[4], f[5]]),
+                    id,
+                    "fragment must carry id {id:#x}"
+                );
             }
         }
     }
@@ -505,7 +514,11 @@ mod tests {
         for f in &frags[..frags.len() - 1] {
             assert_eq!((f.len() - 48) % 8, 0);
         }
-        assert_eq!(reassemble_v6(&frags), pkt, "fragments reassemble to the original");
+        assert_eq!(
+            reassemble_v6(&frags),
+            pkt,
+            "fragments reassemble to the original"
+        );
     }
 
     #[test]
@@ -579,7 +592,12 @@ mod tests {
             c: &CertificateDer<'_>,
             d: &rustls::DigitallySignedStruct,
         ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+            rustls::crypto::verify_tls12_signature(
+                m,
+                c,
+                d,
+                &self.0.signature_verification_algorithms,
+            )
         }
         fn verify_tls13_signature(
             &self,
@@ -587,7 +605,12 @@ mod tests {
             c: &CertificateDer<'_>,
             d: &rustls::DigitallySignedStruct,
         ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+            rustls::crypto::verify_tls13_signature(
+                m,
+                c,
+                d,
+                &self.0.signature_verification_algorithms,
+            )
         }
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
             self.0.signature_verification_algorithms.supported_schemes()
@@ -678,12 +701,21 @@ mod tests {
                 .expect("fragment should arrive")
                 .expect("stream open")
                 .expect("no transport error");
-            assert!(frag.len() <= mds, "fragment {} exceeds mds {}", frag.len(), mds);
+            assert!(
+                frag.len() <= mds,
+                "fragment {} exceeds mds {}",
+                frag.len(),
+                mds
+            );
             reassembled += frag.len() - ((frag[0] & 0x0f) as usize) * 4;
             frags.push(frag);
         }
         assert!(frags.len() >= 2, "packet should have been split");
-        assert_eq!(reassemble(&frags), pkt[20..], "fragments reassemble to original");
+        assert_eq!(
+            reassemble(&frags),
+            pkt[20..],
+            "fragments reassemble to original"
+        );
     }
 
     // Dropping a QuicPeerTransport must close its connection, so a superseded

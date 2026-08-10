@@ -241,7 +241,13 @@ fn parse_client_hello(tls: &[u8]) -> Option<ClientHelloInfo> {
         }
     }
 
-    let ja4 = ja4_q(&cipher_suites, &extensions, &alpns, &sig_algs, sni.is_some());
+    let ja4 = ja4_q(
+        &cipher_suites,
+        &extensions,
+        &alpns,
+        &sig_algs,
+        sni.is_some(),
+    );
     Some(ClientHelloInfo {
         sni,
         alpns,
@@ -299,7 +305,11 @@ fn ja4_q(
     has_sni: bool,
 ) -> String {
     let live_ciphers: Vec<u16> = ciphers.iter().copied().filter(|c| !is_grease(*c)).collect();
-    let live_exts: Vec<u16> = extensions.iter().copied().filter(|e| !is_grease(*e)).collect();
+    let live_exts: Vec<u16> = extensions
+        .iter()
+        .copied()
+        .filter(|e| !is_grease(*e))
+        .collect();
 
     let sni_char = if has_sni { 'd' } else { 'i' };
     let alpn_pair = match alpns.first() {
@@ -341,7 +351,10 @@ fn ja4_q(
 
 fn sha256_hex12(data: &[u8]) -> String {
     let digest = ring::digest::digest(&ring::digest::SHA256, data);
-    digest.as_ref()[..6].iter().map(|b| format!("{b:02x}")).collect()
+    digest.as_ref()[..6]
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -362,13 +375,19 @@ pub fn udp_payloads_from_pcap(pcap: &[u8]) -> Vec<Vec<u8>> {
     };
     let rd_u32 = |b: &[u8]| -> u32 {
         let a = [b[0], b[1], b[2], b[3]];
-        if le { u32::from_le_bytes(a) } else { u32::from_be_bytes(a) }
+        if le {
+            u32::from_le_bytes(a)
+        } else {
+            u32::from_be_bytes(a)
+        }
     };
     let mut pos = 24;
     while pos + 16 <= pcap.len() {
         let caplen = rd_u32(&pcap[pos + 8..pos + 12]) as usize;
         pos += 16;
-        let Some(frame) = pcap.get(pos..pos + caplen) else { break };
+        let Some(frame) = pcap.get(pos..pos + caplen) else {
+            break;
+        };
         pos += caplen;
         if let Ok(sliced) = etherparse::SlicedPacket::from_ethernet(frame)
             && let Some(etherparse::TransportSlice::Udp(udp)) = sliced.transport

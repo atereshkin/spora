@@ -112,9 +112,7 @@ fn censor_available(wan: &Netns) -> Result<bool, String> {
         return Ok(true);
     }
     if std::env::var("SPORA_LAB").as_deref() == Ok("require") {
-        return Err(
-            "iptables `string` match (xt_string) unavailable but SPORA_LAB=require".into(),
-        );
+        return Err("iptables `string` match (xt_string) unavailable but SPORA_LAB=require".into());
     }
     log::warn!("censorship: SKIPPED scenario — iptables xt_string module unavailable");
     Ok(false)
@@ -213,9 +211,11 @@ fn quic_v1_wholesale() -> Result<(), String> {
     match peers::start_client(&topo.client, sharer.url().clone(), &opts) {
         Ok(client) => {
             client.stop();
-            return Err("client connected while QUIC v1 Initials were dropped — expected \
+            return Err(
+                "client connected while QUIC v1 Initials were dropped — expected \
                         failure (documents the missing outer TCP fallback)"
-                .into());
+                    .into(),
+            );
         }
         Err(e) if e.contains("connect() failed") => {
             log::info!("quic-v1 block: connect failed as expected — no TCP fallback: {e}");
@@ -293,7 +293,9 @@ fn upgrade_survives_drop(sig_hex: &str, what: &str) -> Result<(), String> {
     client
         .wait_event(is_upgrade_success, UPGRADE_TIMEOUT)
         .map_err(|e| {
-            format!("{what}: direct upgrade never succeeded under the drop — reintroduced literal? {e}")
+            format!(
+                "{what}: direct upgrade never succeeded under the drop — reintroduced literal? {e}"
+            )
         })?;
     expect_clean_echo(&client, &format!("{what}: post-upgrade echo"))?;
 

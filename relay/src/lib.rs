@@ -230,109 +230,115 @@ impl State {
         if let Some(rk) = matched_rk
             && let Some((sharer_addr, reg_ts, _)) = self.registrations.get(&rk).copied()
         {
-                // Refuse a self-referential or non-relayable flow *before* the
-                // one-at-a-time check, so a spoofed packet can neither bootstrap
-                // a self-sustaining loop nor occupy the sharer's flow slot.
-                // flows.insert(src, ...) and flows.insert(sharer_addr, ...)
-                // collapse to flows[X] = (X) when src == sharer_addr, which
-                // would make the relay forward every packet from X back to X
-                // forever from a single (spoofed) packet.
-                if src == sharer_addr || !is_relayable(&src) {
-                    debug!(
-                        "refusing self-referential/non-relayable flow for {} (rk {:x?})",
-                        src,
-                        &rk[..4]
-                    );
-                    return Action::Drop;
-                }
-                // Sweep only runs when packets arrive, so a quiet relay can
-                // still hold a registration well past its timeout. Treat an
-                // expired one as absent (and drop it now) — otherwise we'd
-                // forward to a dead sharer and, worse, install a flow keyed
-                // to its address that blocks its one-flow slot until the
-                // flow itself times out.
-                if now.duration_since(reg_ts) >= self.registration_timeout {
-                    self.registrations.remove(&rk);
-                    debug!("ignoring expired registration rk {:x?} for client {}", &rk[..4], src);
-                    return Action::Drop;
-                }
-                // One-at-a-time, but only against an *actively serving* sharer.
-                // A flow counts as serving only while the sharer is returning
-                // traffic to its current client (within REVERSE_ACTIVITY_GRACE).
-                // A party that merely knows the (public) routing key can install
-                // a flow and keep sending client→sharer packets, but the sharer
-                // never returns sustained traffic to an unauthenticated peer (it
-                // closes the QUIC connection on auth failure/timeout), so that
-                // flow falls idle and a genuine client can displace it. Without
-                // this, a single Initial-shaped packet refreshed every <60s would
-                // hold the slot and lock out every real client.
-                let mut preserved_reverse = None;
-                let mut reused_session: Option<Arc<SessionState>> = None;
-                if let Some(existing) = self.flows.get(&sharer_addr).cloned() {
-                    if existing.dst == src {
-                        // Same client re-sending (e.g. an Initial retransmit):
-                        // keep its established serving state AND its session, so
-                        // a retransmit refreshes rather than opening a duplicate.
-                        preserved_reverse = existing.reverse;
-                        reused_session = existing.session.clone();
-                    } else {
-                        let serving = existing
-                            .reverse
-                            .is_some_and(|t| now.duration_since(t) < REVERSE_ACTIVITY_GRACE);
-                        if serving {
-                            debug!(
-                                "dropping client {} for actively-serving sharer {} (rk {:x?})",
-                                src, sharer_addr, &rk[..4]
-                            );
-                            return Action::Drop;
-                        }
-                        // Idle/abandoned incumbent — close its session and
-                        // displace it for this client.
-                        if let (Some(log), Some(s)) = (&self.session_log, &existing.session) {
-                            log.close_session(s, "displaced");
-                        }
-                        self.flows.remove(&existing.dst);
-                    }
-                }
-                // Open (or reuse, on retransmit) the session for this flow. Only
-                // allocated when logging is on, so the no-log path stays free.
-                let session = match (reused_session, &self.session_log) {
-                    (Some(s), _) => Some(s),
-                    (None, Some(log)) => Some(log.open_session(&rk, src, sharer_addr)),
-                    (None, None) => None,
-                };
-                if let Some(s) = &session {
-                    // Count the client Initial that installed the flow.
-                    s.add_c2s(pkt.len() as u64);
-                }
-                self.flows.insert(
+            // Refuse a self-referential or non-relayable flow *before* the
+            // one-at-a-time check, so a spoofed packet can neither bootstrap
+            // a self-sustaining loop nor occupy the sharer's flow slot.
+            // flows.insert(src, ...) and flows.insert(sharer_addr, ...)
+            // collapse to flows[X] = (X) when src == sharer_addr, which
+            // would make the relay forward every packet from X back to X
+            // forever from a single (spoofed) packet.
+            if src == sharer_addr || !is_relayable(&src) {
+                debug!(
+                    "refusing self-referential/non-relayable flow for {} (rk {:x?})",
                     src,
-                    Flow {
-                        dst: sharer_addr,
-                        ts: now,
-                        from_sharer: false,
-                        reverse: None,
-                        session: session.clone(),
-                    },
-                );
-                self.flows.insert(
-                    sharer_addr,
-                    Flow {
-                        dst: src,
-                        ts: now,
-                        from_sharer: true,
-                        reverse: preserved_reverse,
-                        session,
-                    },
-                );
-                info!(
-                    "matched client {} <-> sharer {} on rk {:x?}",
-                    src,
-                    sharer_addr,
                     &rk[..4]
                 );
-                return Action::Forward(sharer_addr);
+                return Action::Drop;
             }
+            // Sweep only runs when packets arrive, so a quiet relay can
+            // still hold a registration well past its timeout. Treat an
+            // expired one as absent (and drop it now) — otherwise we'd
+            // forward to a dead sharer and, worse, install a flow keyed
+            // to its address that blocks its one-flow slot until the
+            // flow itself times out.
+            if now.duration_since(reg_ts) >= self.registration_timeout {
+                self.registrations.remove(&rk);
+                debug!(
+                    "ignoring expired registration rk {:x?} for client {}",
+                    &rk[..4],
+                    src
+                );
+                return Action::Drop;
+            }
+            // One-at-a-time, but only against an *actively serving* sharer.
+            // A flow counts as serving only while the sharer is returning
+            // traffic to its current client (within REVERSE_ACTIVITY_GRACE).
+            // A party that merely knows the (public) routing key can install
+            // a flow and keep sending client→sharer packets, but the sharer
+            // never returns sustained traffic to an unauthenticated peer (it
+            // closes the QUIC connection on auth failure/timeout), so that
+            // flow falls idle and a genuine client can displace it. Without
+            // this, a single Initial-shaped packet refreshed every <60s would
+            // hold the slot and lock out every real client.
+            let mut preserved_reverse = None;
+            let mut reused_session: Option<Arc<SessionState>> = None;
+            if let Some(existing) = self.flows.get(&sharer_addr).cloned() {
+                if existing.dst == src {
+                    // Same client re-sending (e.g. an Initial retransmit):
+                    // keep its established serving state AND its session, so
+                    // a retransmit refreshes rather than opening a duplicate.
+                    preserved_reverse = existing.reverse;
+                    reused_session = existing.session.clone();
+                } else {
+                    let serving = existing
+                        .reverse
+                        .is_some_and(|t| now.duration_since(t) < REVERSE_ACTIVITY_GRACE);
+                    if serving {
+                        debug!(
+                            "dropping client {} for actively-serving sharer {} (rk {:x?})",
+                            src,
+                            sharer_addr,
+                            &rk[..4]
+                        );
+                        return Action::Drop;
+                    }
+                    // Idle/abandoned incumbent — close its session and
+                    // displace it for this client.
+                    if let (Some(log), Some(s)) = (&self.session_log, &existing.session) {
+                        log.close_session(s, "displaced");
+                    }
+                    self.flows.remove(&existing.dst);
+                }
+            }
+            // Open (or reuse, on retransmit) the session for this flow. Only
+            // allocated when logging is on, so the no-log path stays free.
+            let session = match (reused_session, &self.session_log) {
+                (Some(s), _) => Some(s),
+                (None, Some(log)) => Some(log.open_session(&rk, src, sharer_addr)),
+                (None, None) => None,
+            };
+            if let Some(s) = &session {
+                // Count the client Initial that installed the flow.
+                s.add_c2s(pkt.len() as u64);
+            }
+            self.flows.insert(
+                src,
+                Flow {
+                    dst: sharer_addr,
+                    ts: now,
+                    from_sharer: false,
+                    reverse: None,
+                    session: session.clone(),
+                },
+            );
+            self.flows.insert(
+                sharer_addr,
+                Flow {
+                    dst: src,
+                    ts: now,
+                    from_sharer: true,
+                    reverse: preserved_reverse,
+                    session,
+                },
+            );
+            info!(
+                "matched client {} <-> sharer {} on rk {:x?}",
+                src,
+                sharer_addr,
+                &rk[..4]
+            );
+            return Action::Forward(sharer_addr);
+        }
 
         Action::Drop
     }
@@ -366,7 +372,9 @@ impl State {
                 {
                     warn!(
                         "rejecting unauthorized REGISTER for rk {:x?} from {}: {:?}",
-                        &rk[..4], src, e
+                        &rk[..4],
+                        src,
+                        e
                     );
                     return;
                 }
@@ -380,7 +388,10 @@ impl State {
                 {
                     debug!(
                         "rejecting stale/replayed REGISTER for rk {:x?} from {} (ts {} <= {})",
-                        &rk[..4], src, ts, last_ts
+                        &rk[..4],
+                        src,
+                        ts,
+                        last_ts
                     );
                     return;
                 }
@@ -411,9 +422,7 @@ impl State {
         let log = self.session_log.as_ref();
         self.flows.retain(|_, flow| {
             let alive = now.duration_since(flow.ts) < flow_timeout;
-            if !alive
-                && let (Some(log), Some(s)) = (log, &flow.session)
-            {
+            if !alive && let (Some(log), Some(s)) = (log, &flow.session) {
                 log.close_session(s, "idle");
             }
             alive
@@ -512,11 +521,17 @@ mod tests {
 
         let mut a = registrar();
         let key = a.routing_key();
-        assert_eq!(s.handle_packet(a_addr, &a.next_register_packet(), now), Action::Drop);
+        assert_eq!(
+            s.handle_packet(a_addr, &a.next_register_packet(), now),
+            Action::Drop
+        );
         assert_eq!(s.registration_count(), 1);
 
         let initial = initial_with_dcid(&key);
-        assert_eq!(s.handle_packet(b_addr, &initial, now), Action::Forward(a_addr));
+        assert_eq!(
+            s.handle_packet(b_addr, &initial, now),
+            Action::Forward(a_addr)
+        );
         assert_eq!(s.flow_count(), 2);
 
         let pkt = short_header();
@@ -559,7 +574,10 @@ mod tests {
         s.handle_packet(b1, &initial_with_dcid(&key), now);
         assert_eq!(s.flow_count(), 2);
         // The sharer returns traffic to b1, so the flow is actively serving.
-        assert_eq!(s.handle_packet(a, &short_header(), now), Action::Forward(b1));
+        assert_eq!(
+            s.handle_packet(a, &short_header(), now),
+            Action::Forward(b1)
+        );
 
         // A second client is now dropped while b1 is actively served.
         assert_eq!(
@@ -568,7 +586,10 @@ mod tests {
         );
         assert_eq!(s.flow_count(), 2);
 
-        assert_eq!(s.handle_packet(b1, &short_header(), now), Action::Forward(a));
+        assert_eq!(
+            s.handle_packet(b1, &short_header(), now),
+            Action::Forward(a)
+        );
     }
 
     #[test]
@@ -587,13 +608,25 @@ mod tests {
         s.handle_packet(a, &reg.next_register_packet(), now);
 
         // Attacker installs a flow but the sharer never returns traffic to it.
-        assert_eq!(s.handle_packet(attacker, &initial_with_dcid(&key), now), Action::Forward(a));
+        assert_eq!(
+            s.handle_packet(attacker, &initial_with_dcid(&key), now),
+            Action::Forward(a)
+        );
         // A genuine client displaces the idle flow.
-        assert_eq!(s.handle_packet(client, &initial_with_dcid(&key), now), Action::Forward(a));
+        assert_eq!(
+            s.handle_packet(client, &initial_with_dcid(&key), now),
+            Action::Forward(a)
+        );
         // The sharer now routes to the genuine client, and the attacker's stale
         // entry is gone (its packets no longer match a flow).
-        assert_eq!(s.handle_packet(a, &short_header(), now), Action::Forward(client));
-        assert_eq!(s.handle_packet(attacker, &short_header(), now), Action::Drop);
+        assert_eq!(
+            s.handle_packet(a, &short_header(), now),
+            Action::Forward(client)
+        );
+        assert_eq!(
+            s.handle_packet(attacker, &short_header(), now),
+            Action::Drop
+        );
     }
 
     #[test]
@@ -615,12 +648,21 @@ mod tests {
 
         // Within the grace window, b2 is refused.
         let mid = t0 + REVERSE_ACTIVITY_GRACE / 2;
-        assert_eq!(s.handle_packet(b2, &initial_with_dcid(&key), mid), Action::Drop);
+        assert_eq!(
+            s.handle_packet(b2, &initial_with_dcid(&key), mid),
+            Action::Drop
+        );
 
         // After the grace window with no further return traffic, b2 displaces b1.
         let late = t0 + REVERSE_ACTIVITY_GRACE + Duration::from_secs(1);
-        assert_eq!(s.handle_packet(b2, &initial_with_dcid(&key), late), Action::Forward(a));
-        assert_eq!(s.handle_packet(a, &short_header(), late), Action::Forward(b2));
+        assert_eq!(
+            s.handle_packet(b2, &initial_with_dcid(&key), late),
+            Action::Forward(a)
+        );
+        assert_eq!(
+            s.handle_packet(a, &short_header(), late),
+            Action::Forward(b2)
+        );
     }
 
     #[test]
@@ -661,10 +703,16 @@ mod tests {
 
         let mut reg = registrar();
         let key = reg.routing_key();
-        assert_eq!(s.handle_packet(a, &reg.next_register_packet(), now), Action::Drop);
+        assert_eq!(
+            s.handle_packet(a, &reg.next_register_packet(), now),
+            Action::Drop
+        );
         assert_eq!(s.registration_count(), 1);
 
-        assert_eq!(s.handle_packet(b, &initial_with_dcid(&key), now), Action::Forward(a));
+        assert_eq!(
+            s.handle_packet(b, &initial_with_dcid(&key), now),
+            Action::Forward(a)
+        );
         assert_eq!(s.handle_packet(a, &short_header(), now), Action::Forward(b));
         assert_eq!(s.handle_packet(b, &short_header(), now), Action::Forward(a));
     }
@@ -792,8 +840,16 @@ mod tests {
             s.handle_packet(b, &initial_with_dcid(&key), late),
             Action::Drop
         );
-        assert_eq!(s.flow_count(), 0, "no flow installed off a stale registration");
-        assert_eq!(s.registration_count(), 0, "stale registration dropped on access");
+        assert_eq!(
+            s.flow_count(),
+            0,
+            "no flow installed off a stale registration"
+        );
+        assert_eq!(
+            s.registration_count(),
+            0,
+            "stale registration dropped on access"
+        );
     }
 
     #[test]
@@ -845,7 +901,11 @@ mod tests {
         let mut s = State::default();
         assert!(!s.requires_authorization());
         let mut reg = registrar();
-        s.handle_packet(addr("10.0.0.1:1"), &reg.next_register_packet(), Instant::now());
+        s.handle_packet(
+            addr("10.0.0.1:1"),
+            &reg.next_register_packet(),
+            Instant::now(),
+        );
         assert_eq!(s.registration_count(), 1);
     }
 
@@ -856,8 +916,16 @@ mod tests {
         assert!(s.requires_authorization());
         // A perfectly valid signed registration, but with no capability token.
         let mut reg = registrar();
-        s.handle_packet(addr("10.0.0.1:1"), &reg.next_register_packet(), Instant::now());
-        assert_eq!(s.registration_count(), 0, "tokenless register must be refused when gated");
+        s.handle_packet(
+            addr("10.0.0.1:1"),
+            &reg.next_register_packet(),
+            Instant::now(),
+        );
+        assert_eq!(
+            s.registration_count(),
+            0,
+            "tokenless register must be refused when gated"
+        );
     }
 
     #[test]
@@ -874,7 +942,10 @@ mod tests {
         assert_eq!(s.registration_count(), 1, "valid token must be accepted");
 
         // ...and the authorized sharer routes a client normally.
-        assert_eq!(s.handle_packet(b, &initial_with_dcid(&key), now), Action::Forward(a));
+        assert_eq!(
+            s.handle_packet(b, &initial_with_dcid(&key), now),
+            Action::Forward(a)
+        );
     }
 
     #[test]
@@ -884,8 +955,16 @@ mod tests {
         let mut s = State::default().with_issuer_keys(vec![trusted.public_key()]);
         // Token signed by an issuer the relay does not trust.
         let mut reg = authorized_registrar(&rogue);
-        s.handle_packet(addr("10.0.0.1:1"), &reg.next_register_packet(), Instant::now());
-        assert_eq!(s.registration_count(), 0, "untrusted-issuer token must be refused");
+        s.handle_packet(
+            addr("10.0.0.1:1"),
+            &reg.next_register_packet(),
+            Instant::now(),
+        );
+        assert_eq!(
+            s.registration_count(),
+            0,
+            "untrusted-issuer token must be refused"
+        );
     }
 
     #[test]
@@ -900,8 +979,16 @@ mod tests {
         let token = issuer.issue(&foreign_key);
         let mut reg = registrar().with_token(Some(token));
         assert_ne!(reg.routing_key(), foreign_key);
-        s.handle_packet(addr("10.0.0.1:1"), &reg.next_register_packet(), Instant::now());
-        assert_eq!(s.registration_count(), 0, "token bound to another key must be refused");
+        s.handle_packet(
+            addr("10.0.0.1:1"),
+            &reg.next_register_packet(),
+            Instant::now(),
+        );
+        assert_eq!(
+            s.registration_count(),
+            0,
+            "token bound to another key must be refused"
+        );
     }
 
     #[test]
@@ -1006,7 +1093,10 @@ mod tests {
             {
                 return;
             }
-            assert!(Instant::now() < deadline, "session log condition not met within 5s");
+            assert!(
+                Instant::now() < deadline,
+                "session log condition not met within 5s"
+            );
             std::thread::sleep(Duration::from_millis(25));
         }
     }
@@ -1025,7 +1115,10 @@ mod tests {
 
         s.handle_packet(a, &reg.next_register_packet(), now);
         // Client Initial installs the flow (counted as the first c2s packet).
-        assert_eq!(s.handle_packet(b, &initial_with_dcid(&key), now), Action::Forward(a));
+        assert_eq!(
+            s.handle_packet(b, &initial_with_dcid(&key), now),
+            Action::Forward(a)
+        );
         // One sharer→client packet (s2c) and one more client→sharer (c2s).
         s.handle_packet(a, &short_header(), now);
         s.handle_packet(b, &short_header(), now);
@@ -1079,9 +1172,15 @@ mod tests {
 
         s.handle_packet(a, &reg.next_register_packet(), now);
         // Attacker installs a flow; the sharer never serves it (stays idle).
-        assert_eq!(s.handle_packet(attacker, &initial_with_dcid(&key), now), Action::Forward(a));
+        assert_eq!(
+            s.handle_packet(attacker, &initial_with_dcid(&key), now),
+            Action::Forward(a)
+        );
         // A genuine client displaces the idle incumbent.
-        assert_eq!(s.handle_packet(client, &initial_with_dcid(&key), now), Action::Forward(a));
+        assert_eq!(
+            s.handle_packet(client, &initial_with_dcid(&key), now),
+            Action::Forward(a)
+        );
         drop(s);
 
         wait_session(&path, |db| {

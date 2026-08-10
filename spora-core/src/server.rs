@@ -1,3 +1,9 @@
+use crate::SocketProtector;
+use crate::connlog::{FlowGuard, SessionLog};
+use crate::transport::IpTransport;
+use futures_util::{Sink, SinkExt, Stream, StreamExt};
+use log::{error, info, trace, warn};
+use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
 use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -10,12 +16,6 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
-use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
-use log::{error, info, trace, warn};
-use futures_util::{Sink, Stream, SinkExt, StreamExt};
-use crate::connlog::{FlowGuard, SessionLog};
-use crate::transport::IpTransport;
-use crate::SocketProtector;
 
 const PROTO_TCP: u8 = 6;
 const PROTO_UDP: u8 = 17;
@@ -62,7 +62,10 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
                 }
             }
         }
-        info!("Transport stream closed. Ingress packets received: {}", count);
+        info!(
+            "Transport stream closed. Ingress packets received: {}",
+            count
+        );
     });
 
     // Task 2 — Stack driver: polls both Stream (egress) and Sink (ingress) on
@@ -70,24 +73,25 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
     // two directions and works around a waker bug in the upstream Sink impl
     // (poll_ready / poll_flush return Pending without registering a waker when
     // the internal tcp_tx channel is full, which permanently parks the caller).
-    let stack_driver = tokio::spawn(async move {
-        use std::future::Future;
-        use std::pin::Pin;
-        use std::task::Poll;
+    let stack_driver =
+        tokio::spawn(async move {
+            use std::future::Future;
+            use std::pin::Pin;
+            use std::task::Poll;
 
-        let mut pending_ingress: Option<Vec<u8>> = None;
+            let mut pending_ingress: Option<Vec<u8>> = None;
 
-        // --- Diagnostic counters ---
-        let mut ingress_delivered: u64 = 0; // packets pushed into stack
-        let mut ingress_flush_pending: u64 = 0; // times poll_flush returned Pending
-        let mut ingress_ready_pending: u64 = 0; // times poll_ready returned Pending
-        let mut egress_produced: u64 = 0; // packets emitted by stack
-        let mut egress_dropped: u64 = 0; // egress_tx.try_send failures
+            // --- Diagnostic counters ---
+            let mut ingress_delivered: u64 = 0; // packets pushed into stack
+            let mut ingress_flush_pending: u64 = 0; // times poll_flush returned Pending
+            let mut ingress_ready_pending: u64 = 0; // times poll_ready returned Pending
+            let mut egress_produced: u64 = 0; // packets emitted by stack
+            let mut egress_dropped: u64 = 0; // egress_tx.try_send failures
 
-        let stats_timer = tokio::time::sleep(std::time::Duration::from_secs(10));
-        tokio::pin!(stats_timer);
+            let stats_timer = tokio::time::sleep(std::time::Duration::from_secs(10));
+            tokio::pin!(stats_timer);
 
-        futures_util::future::poll_fn(|cx| {
+            futures_util::future::poll_fn(|cx| {
             // --- Periodic stats ---
             if stats_timer.as_mut().poll(cx).is_ready() {
                 info!(
@@ -195,13 +199,16 @@ pub(crate) async fn run_tunnel(transport: IpTransport, mut stack: Stack) {
             Poll::Pending
         })
         .await;
-        info!(
-            "Stack driver ended. Final stats: ingress_delivered={}, egress_produced={}, \
+            info!(
+                "Stack driver ended. Final stats: ingress_delivered={}, egress_produced={}, \
              egress_dropped={}, flush_pending={}, ready_pending={}",
-            ingress_delivered, egress_produced, egress_dropped,
-            ingress_flush_pending, ingress_ready_pending,
-        );
-    });
+                ingress_delivered,
+                egress_produced,
+                egress_dropped,
+                ingress_flush_pending,
+                ingress_ready_pending,
+            );
+        });
 
     // Task 3 — Egress writer: bounded channel → transport.
     let egress = tokio::spawn(async move {
@@ -245,7 +252,7 @@ pub fn is_local_address(addr: IpAddr) -> bool {
                 || (o[0] == 172 && (o[1] & 0xF0) == 16)        // 172.16.0.0/12
                 || (o[0] == 192 && o[1] == 168)                 // 192.168.0.0/16
                 || (o[0] & 0xF0) == 224                         // 224.0.0.0/4 multicast
-                || (o[0] & 0xF0) == 240                         // 240.0.0.0/4 reserved + broadcast
+                || (o[0] & 0xF0) == 240 // 240.0.0.0/4 reserved + broadcast
         }
         IpAddr::V6(ip) => {
             // A v4-mapped destination (::ffff:a.b.c.d) reaches the v4 network
@@ -259,7 +266,7 @@ pub fn is_local_address(addr: IpAddr) -> bool {
                 || ip == Ipv6Addr::UNSPECIFIED                   // ::
                 || (ip.segments()[0] & 0xFE00) == 0xFC00        // fc00::/7  (ULA)
                 || (ip.segments()[0] & 0xFFC0) == 0xFE80        // fe80::/10 (link-local)
-                || (ip.segments()[0] & 0xFF00) == 0xFF00        // ff00::/8  multicast
+                || (ip.segments()[0] & 0xFF00) == 0xFF00 // ff00::/8  multicast
         }
     }
 }
@@ -329,7 +336,10 @@ async fn handle_tcp_streams(
 ) {
     while let Some((mut stream, local, remote)) = tcp_listener.next().await {
         if block_local && is_local_address(remote.ip()) {
-            warn!("blocked TCP connection to local address: {:?} => {:?}", local, remote);
+            warn!(
+                "blocked TCP connection to local address: {:?} => {:?}",
+                local, remote
+            );
             if let Some(sl) = &slog {
                 sl.flow_blocked(PROTO_TCP, local, remote);
             }
@@ -397,8 +407,11 @@ async fn new_tcp_stream(
     addr: SocketAddr,
     protector: &SocketProtector,
 ) -> std::io::Result<(TcpStream, SocketAddr)> {
-    let socket =
-        socket2::Socket::new(socket2::Domain::for_address(addr), socket2::Type::STREAM, None)?;
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::STREAM,
+        None,
+    )?;
     socket.set_keepalive(true)?;
     socket.set_nodelay(true)?;
     socket.set_nonblocking(true)?;
@@ -585,7 +598,12 @@ async fn handle_inbound_datagram(
 /// the table is at `cap`. Bounds fds/tasks against a client spraying distinct
 /// destination tuples; live flows refresh `last_activity` so a flood sheds idle
 /// entries rather than active ones.
-fn insert_bounded(entries: &mut HashMap<NATKey, NATEntry>, key: NATKey, entry: NATEntry, cap: usize) {
+fn insert_bounded(
+    entries: &mut HashMap<NATKey, NATEntry>,
+    key: NATKey,
+    entry: NATEntry,
+    cap: usize,
+) {
     if !entries.contains_key(&key)
         && entries.len() >= cap
         && let Some(oldest) = entries
@@ -596,14 +614,23 @@ fn insert_bounded(entries: &mut HashMap<NATKey, NATEntry>, key: NATKey, entry: N
     {
         evicted.close_flow("evicted");
         evicted.task.abort();
-        trace!("UDP NAT table full, evicted {:?} => {:?}", oldest.0, oldest.1);
+        trace!(
+            "UDP NAT table full, evicted {:?} => {:?}",
+            oldest.0, oldest.1
+        );
     }
     entries.insert(key, entry);
 }
 
-async fn new_udp_packet(addr: SocketAddr, protector: &SocketProtector) -> std::io::Result<tokio::net::UdpSocket> {
-    let socket =
-        socket2::Socket::new(socket2::Domain::for_address(addr), socket2::Type::DGRAM, None)?;
+async fn new_udp_packet(
+    addr: SocketAddr,
+    protector: &SocketProtector,
+) -> std::io::Result<tokio::net::UdpSocket> {
+    let socket = socket2::Socket::new(
+        socket2::Domain::for_address(addr),
+        socket2::Type::DGRAM,
+        None,
+    )?;
     socket.set_nonblocking(true)?;
 
     #[cfg(unix)]
@@ -710,7 +737,7 @@ pub(crate) async fn start_tunnel(
 mod tests {
     use super::*;
     use crate::transport::IpTransport;
-    use crate::transport::mock::{mock_transport, MockTransportHandle};
+    use crate::transport::mock::{MockTransportHandle, mock_transport};
     use std::time::Duration;
 
     #[test]
@@ -755,19 +782,42 @@ mod tests {
         let mut entries: HashMap<NATKey, NATEntry> = HashMap::new();
         // Fill to the (small) cap; key(10) is the least recently active.
         insert_bounded(&mut entries, key(10), entry(t0).await, 3);
-        insert_bounded(&mut entries, key(11), entry(t0 + Duration::from_secs(1)).await, 3);
-        insert_bounded(&mut entries, key(12), entry(t0 + Duration::from_secs(2)).await, 3);
+        insert_bounded(
+            &mut entries,
+            key(11),
+            entry(t0 + Duration::from_secs(1)).await,
+            3,
+        );
+        insert_bounded(
+            &mut entries,
+            key(12),
+            entry(t0 + Duration::from_secs(2)).await,
+            3,
+        );
         assert_eq!(entries.len(), 3);
 
         // A distinct new tuple at the cap evicts the oldest, not a live one.
-        insert_bounded(&mut entries, key(13), entry(t0 + Duration::from_secs(3)).await, 3);
+        insert_bounded(
+            &mut entries,
+            key(13),
+            entry(t0 + Duration::from_secs(3)).await,
+            3,
+        );
         assert_eq!(entries.len(), 3, "table stays bounded");
-        assert!(!entries.contains_key(&key(10)), "least-recently-active evicted");
+        assert!(
+            !entries.contains_key(&key(10)),
+            "least-recently-active evicted"
+        );
         assert!(entries.contains_key(&key(13)), "new flow inserted");
         assert!(entries.contains_key(&key(11)) && entries.contains_key(&key(12)));
 
         // Refreshing an existing key never evicts.
-        insert_bounded(&mut entries, key(11), entry(t0 + Duration::from_secs(4)).await, 3);
+        insert_bounded(
+            &mut entries,
+            key(11),
+            entry(t0 + Duration::from_secs(4)).await,
+            3,
+        );
         assert_eq!(entries.len(), 3);
     }
 
@@ -847,7 +897,9 @@ mod tests {
         // 1. Tunnel is alive: ICMP echo gets a reply.
         handle.send(icmp_echo_request(0x1111, 1)).unwrap();
         assert!(
-            recv_icmp_reply(&mut handle, Duration::from_secs(3)).await.is_some(),
+            recv_icmp_reply(&mut handle, Duration::from_secs(3))
+                .await
+                .is_some(),
             "tunnel should answer ICMP before the bad packet"
         );
 
@@ -873,4 +925,3 @@ mod tests {
         cancel.cancel();
     }
 }
-

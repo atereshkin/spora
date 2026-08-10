@@ -1,6 +1,6 @@
-#[cfg(not(windows))]
-use spora_core::{connect, identity::Identity, share, tun_util, Config, ExitMode};
 use clap::{Parser, Subcommand};
+#[cfg(not(windows))]
+use spora_core::{Config, ExitMode, connect, identity::Identity, share, tun_util};
 use std::path::PathBuf;
 use tokio_tun::Tun;
 use url::Url;
@@ -375,14 +375,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             #[cfg(windows)]
             {
                 let _ = (url, stun); // silence unused warning
-                return Err("The 'use' mode is not supported on Windows yet (requires a TUN device).".into());
+                return Err(
+                    "The 'use' mode is not supported on Windows yet (requires a TUN device)."
+                        .into(),
+                );
             }
 
             #[cfg(not(windows))]
             {
                 let url = Url::parse(&url)?;
                 if url.scheme() != "https" {
-                    panic!("Unsupported scheme {}. Expected an https:// URL", url.scheme());
+                    panic!(
+                        "Unsupported scheme {}. Expected an https:// URL",
+                        url.scheme()
+                    );
                 }
                 let mut config = Config::default();
                 if let Some(stun) = stun {
@@ -467,8 +473,12 @@ fn run_log_cmd(cmd: LogCmd) -> Result<(), Box<dyn std::error::Error>> {
             } => {
                 let dir = resolve_connlog_dir(dir, identity_file)?;
                 let db = connlog::open_readwrite(&dir)?;
-                let id = connlog::add_hold(&db, parse_time(&from)?, parse_time(&to)?, note.as_deref())?;
-                println!("hold {} added: records in [{}, {}] are pinned against retention", id, from, to);
+                let id =
+                    connlog::add_hold(&db, parse_time(&from)?, parse_time(&to)?, note.as_deref())?;
+                println!(
+                    "hold {} added: records in [{}, {}] are pinned against retention",
+                    id, from, to
+                );
             }
             HoldCmd::List { dir, identity_file } => {
                 let dir = resolve_connlog_dir(dir, identity_file)?;
@@ -584,7 +594,11 @@ fn print_session(s: &spora_core::connlog::SessionRow) {
         };
         println!("  {}  {} {}{}", fmt_ms(*ts), kind, addr, caveat);
     }
-    if !s.addrs.iter().any(|(_, k, _)| k == "verified" || k == "punch_verified") {
+    if !s
+        .addrs
+        .iter()
+        .any(|(_, k, _)| k == "verified" || k == "punch_verified")
+    {
         println!("  note: relay-via only — the client's outer address was never directly observed");
     }
 }
@@ -704,7 +718,12 @@ fn parse_time(s: &str) -> Result<i64, String> {
         s.to_string()
     };
     humantime::parse_rfc3339(&attempt)
-        .map_err(|e| format!("'{}' is not a recognized time ({}); use RFC3339, YYYY-MM-DD, or unix seconds", s, e))
+        .map_err(|e| {
+            format!(
+                "'{}' is not a recognized time ({}); use RFC3339, YYYY-MM-DD, or unix seconds",
+                s, e
+            )
+        })
         .map(|t| {
             t.duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
@@ -744,9 +763,7 @@ fn default_connlog_dir(identity: &spora_core::identity::Identity) -> PathBuf {
 fn connlog_base_dir() -> PathBuf {
     std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
-        .or_else(|| {
-            std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state"))
-        })
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state")))
         .unwrap_or_else(|| PathBuf::from("."))
         .join("spora")
         .join("connlog")
@@ -767,7 +784,7 @@ fn connlog_base_dir() -> PathBuf {
 async fn wait_for_shutdown() -> std::io::Result<()> {
     #[cfg(unix)]
     {
-        use tokio::signal::unix::{signal, SignalKind};
+        use tokio::signal::unix::{SignalKind, signal};
         let mut term = signal(SignalKind::terminate())?;
         tokio::select! {
             r = tokio::signal::ctrl_c() => r,
@@ -805,9 +822,7 @@ fn load_or_create_identity(
     path: &std::path::Path,
     fresh: bool,
 ) -> Result<Identity, Box<dyn std::error::Error>> {
-    if !fresh
-        && let Ok(bytes) = std::fs::read(path)
-    {
+    if !fresh && let Ok(bytes) = std::fs::read(path) {
         return Ok(Identity::from_bytes(&bytes)?);
     }
     let identity = Identity::generate();
@@ -831,10 +846,7 @@ fn load_or_create_identity(
 /// either the old file or the complete new one, never a truncated mix, and the
 /// key bytes are never group/world-readable.
 #[cfg(unix)]
-fn write_identity_atomically(
-    path: &std::path::Path,
-    bytes: &[u8],
-) -> std::io::Result<()> {
+fn write_identity_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -878,11 +890,8 @@ mod identity_persistence_tests {
 
     /// A unique scratch dir under the temp dir (no tempfile dependency).
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "spora-cli-test-{}-{}",
-            std::process::id(),
-            tag
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("spora-cli-test-{}-{}", std::process::id(), tag));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
@@ -919,7 +928,10 @@ mod identity_persistence_tests {
         write_identity_atomically(&path, b"second-version-which-is-longer").unwrap();
 
         // The final file holds the complete new content (never a torn mix)...
-        assert_eq!(std::fs::read(&path).unwrap(), b"second-version-which-is-longer");
+        assert_eq!(
+            std::fs::read(&path).unwrap(),
+            b"second-version-which-is-longer"
+        );
         // ...and the rename consumed the temp — no `.identity.bin.<pid>.tmp` litter.
         let leftover: Vec<_> = std::fs::read_dir(&dir)
             .unwrap()

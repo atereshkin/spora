@@ -83,8 +83,14 @@ async fn udp_echo_over_loopback_relay() {
             && stats.rtt_p95 <= stats.rtt_max,
         "inconsistent RTT percentiles: {stats:?}"
     );
-    assert!(stats.rtt_p50 > Duration::ZERO, "zero p50 with 20 echoes in: {stats:?}");
-    assert!(stats.rtt_max < Duration::from_secs(5), "absurd RTT: {stats:?}");
+    assert!(
+        stats.rtt_p50 > Duration::ZERO,
+        "zero p50 with 20 echoes in: {stats:?}"
+    );
+    assert!(
+        stats.rtt_max < Duration::from_secs(5),
+        "absurd RTT: {stats:?}"
+    );
 
     // wait_event semantics: both RelaySessionEstablished events fired during
     // session setup, long before these calls — they must still match from
@@ -196,7 +202,10 @@ async fn udp_echo_over_v6_loopback_relay() {
         .expect("echo finishes within the deadline")
         .expect("pump answers the command")
         .expect("echo run succeeds");
-    assert_eq!(stats.received, 20, "echo lost packets over the v6 relay: {stats:?}");
+    assert_eq!(
+        stats.received, 20,
+        "echo lost packets over the v6 relay: {stats:?}"
+    );
 
     drop(cmd_tx);
     tokio::time::timeout(Duration::from_secs(5), pump)
@@ -284,7 +293,8 @@ async fn udp_echo_over_relayless_direct() {
             |e| {
                 matches!(
                     e,
-                    TunnelEvent::DirectUpgradeFailed { .. } | TunnelEvent::DirectUpgradeSucceeded { .. }
+                    TunnelEvent::DirectUpgradeFailed { .. }
+                        | TunnelEvent::DirectUpgradeSucceeded { .. }
                 )
             },
             Duration::from_secs(2),
@@ -317,7 +327,10 @@ async fn udp_echo_over_tcp_tls_relay() {
     // In-process TCP/TLS relay on loopback.
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let relay_addr = listener.local_addr().unwrap();
-    tokio::spawn(relay::tcp::serve_tcp(listener, relay::tcp::TcpRelayState::new()));
+    tokio::spawn(relay::tcp::serve_tcp(
+        listener,
+        relay::tcp::TcpRelayState::new(),
+    ));
 
     let tcp_ep = spora_core::identity::RelayEndpoint::with_protocol(
         "127.0.0.1",
@@ -453,7 +466,10 @@ async fn udp_echo_over_nz_relay() {
         .expect("pump answers the command")
         .expect("echo run succeeds");
     assert_eq!(stats.sent, 20);
-    assert_eq!(stats.received, 20, "echo lost packets over the nz relay: {stats:?}");
+    assert_eq!(
+        stats.received, 20,
+        "echo lost packets over the nz relay: {stats:?}"
+    );
 
     drop(cmd_tx);
     tokio::time::timeout(Duration::from_secs(5), pump)
@@ -520,7 +536,10 @@ async fn tcp_tls_gated_relay_requires_a_valid_token() {
         .expect("echo finishes")
         .expect("pump answers")
         .expect("echo succeeds");
-    assert_eq!(stats.received, 5, "authorized tunnel must carry traffic: {stats:?}");
+    assert_eq!(
+        stats.received, 5,
+        "authorized tunnel must carry traffic: {stats:?}"
+    );
     drop(cmd_tx);
     let _ = tokio::time::timeout(Duration::from_secs(5), pump).await;
     session.abort();
@@ -570,7 +589,9 @@ async fn relayless_share_with_unresolvable_advertised_host_starts() {
 
     let session = spora_core::share(Identity::generate(), share_cfg)
         .await
-        .expect("relay-less share() must start even when the advertised host does not resolve locally");
+        .expect(
+            "relay-less share() must start even when the advertised host does not resolve locally",
+        );
     assert!(
         session
             .url
@@ -662,8 +683,7 @@ async fn multi_relay_fails_over_when_preferred_is_dead() {
     };
     let v4_relay = spawn_relay("127.0.0.1:0").await;
 
-    let mut opts =
-        LabPeerOpts::new(v4_relay, "127.0.0.1:3478").with_relays([dead_v6, v4_relay]);
+    let mut opts = LabPeerOpts::new(v4_relay, "127.0.0.1:3478").with_relays([dead_v6, v4_relay]);
     // Snappy failover so the dead-relay attempt doesn't stretch the test.
     opts.timings.relay_dial_timeout = Duration::from_secs(2);
 
@@ -698,7 +718,10 @@ async fn multi_relay_fails_over_when_preferred_is_dead() {
     .expect("relay-via session established after failover");
     match ev {
         TunnelEvent::RelaySessionEstablished { peer } => {
-            assert_eq!(peer, v4_relay, "must have failed over to the v4 relay, got {peer}");
+            assert_eq!(
+                peer, v4_relay,
+                "must have failed over to the v4 relay, got {peer}"
+            );
         }
         other => panic!("unexpected event {other:?}"),
     }
@@ -742,7 +765,10 @@ async fn pump_cpu_time_grows_with_work() {
 
     let cpu_before = pump_cpu(&cmd_tx).await;
     // The QUIC handshake already burned cycles on this thread.
-    assert!(cpu_before > Duration::ZERO, "zero CPU after a QUIC handshake");
+    assert!(
+        cpu_before > Duration::ZERO,
+        "zero CPU after a QUIC handshake"
+    );
 
     // 30 echoes' worth of pump + QUIC work, all on this same thread; the
     // run also covers the p50/p95 ordering on a fresh stats instance.
@@ -767,7 +793,10 @@ async fn pump_cpu_time_grows_with_work() {
             && stats.rtt_p95 <= stats.rtt_max,
         "inconsistent RTT percentiles: {stats:?}"
     );
-    assert!(stats.rtt_p95 < Duration::from_secs(5), "absurd p95: {stats:?}");
+    assert!(
+        stats.rtt_p95 < Duration::from_secs(5),
+        "absurd p95: {stats:?}"
+    );
 
     let cpu_after = pump_cpu(&cmd_tx).await;
     assert!(

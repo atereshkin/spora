@@ -74,8 +74,16 @@ pub fn mock_transport_pair() -> (MockTransport, MockTransport) {
     let (_err_tx_a, err_rx_a) = mpsc::unbounded_channel();
     let (_err_tx_b, err_rx_b) = mpsc::unbounded_channel();
     (
-        MockTransport { rx: rx_a, tx: tx_a, error_rx: err_rx_a },
-        MockTransport { rx: rx_b, tx: tx_b, error_rx: err_rx_b },
+        MockTransport {
+            rx: rx_a,
+            tx: tx_a,
+            error_rx: err_rx_a,
+        },
+        MockTransport {
+            rx: rx_b,
+            tx: tx_b,
+            error_rx: err_rx_b,
+        },
     )
 }
 

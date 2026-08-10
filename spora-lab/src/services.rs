@@ -165,7 +165,10 @@ fn start_wan_inner<F>(wan: &Netns, relay_state: F, dual_stack: bool) -> Result<W
 where
     F: Fn() -> relay::State + Send + 'static,
 {
-    let svc_ip: IpAddr = WAN_SERVICES_IP.parse::<Ipv4Addr>().expect("WAN_SERVICES_IP parses").into();
+    let svc_ip: IpAddr = WAN_SERVICES_IP
+        .parse::<Ipv4Addr>()
+        .expect("WAN_SERVICES_IP parses")
+        .into();
     let relay_addr = SocketAddr::new(svc_ip, RELAY_PORT);
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
     let (cmd_tx, mut cmd_rx) = tokio::sync::mpsc::unbounded_channel::<Cmd>();
@@ -174,7 +177,12 @@ where
         let bound = async {
             let mut ips: Vec<IpAddr> = vec![svc_ip];
             if dual_stack {
-                ips.push(WAN_SERVICES_IP6.parse::<Ipv6Addr>().expect("WAN_SERVICES_IP6 parses").into());
+                ips.push(
+                    WAN_SERVICES_IP6
+                        .parse::<Ipv6Addr>()
+                        .expect("WAN_SERVICES_IP6 parses")
+                        .into(),
+                );
             }
             for ip in ips {
                 tokio::spawn(stun_responder(bind_udp(ip, STUN_PORT).await?));
@@ -226,7 +234,12 @@ where
     })?;
 
     match ready_rx.recv_timeout(Duration::from_secs(10)) {
-        Ok(Ok(())) => Ok(WanHandle { cmds: cmd_tx, relay_addr, dual_stack, host }),
+        Ok(Ok(())) => Ok(WanHandle {
+            cmds: cmd_tx,
+            relay_addr,
+            dual_stack,
+            host,
+        }),
         Ok(Err(e)) => Err(format!("wan services: {e}")),
         Err(e) => Err(format!("wan services never became ready: {e}")),
     }
@@ -459,8 +472,16 @@ mod tests {
         let src: SocketAddr = "[2001:db8:0:b::2]:40000".parse().unwrap();
         let reply = stun_binding_reply(&req, src).expect("binding reply");
         assert_eq!(&reply[0..2], &[0x01, 0x01]);
-        assert_eq!(u16::from_be_bytes([reply[2], reply[3]]), 24, "message length");
-        assert_eq!(&reply[20..24], &[0x00, 0x20, 0x00, 0x14], "attr header, len 20");
+        assert_eq!(
+            u16::from_be_bytes([reply[2], reply[3]]),
+            24,
+            "message length"
+        );
+        assert_eq!(
+            &reply[20..24],
+            &[0x00, 0x20, 0x00, 0x14],
+            "attr header, len 20"
+        );
         assert_eq!(reply[25], 0x02, "family v6");
         let port = u16::from_be_bytes([reply[26], reply[27]]) ^ 0x2112;
         assert_eq!(port, 40000);

@@ -1,10 +1,10 @@
+use crate::IpTransport;
 use futures_util::SinkExt;
 use futures_util::stream::StreamExt;
 use log::{debug, error, info, trace};
 use std::io;
 use std::time::Instant;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use crate::IpTransport;
 
 /// How often to emit aggregate tunnel stats at debug level.
 const STATS_INTERVAL_SECS: u64 = 30;
@@ -108,7 +108,10 @@ impl TunnelStats {
     }
 }
 
-pub async fn start(mut transport: IpTransport, mut tun: impl AsyncReadExt+AsyncWriteExt+Unpin) -> io::Result<()> {
+pub async fn start(
+    mut transport: IpTransport,
+    mut tun: impl AsyncReadExt + AsyncWriteExt + Unpin,
+) -> io::Result<()> {
     let mut buffer = vec![0u8; 1500];
     let mut stats = TunnelStats::new();
 
@@ -232,7 +235,11 @@ async fn start_fd_inner(
                 // Wait for the fd to become readable instead of busy-looping
                 // on WouldBlock.  The 100ms timeout lets us detect shutdown
                 // (channel receiver dropped) without sleeping forever.
-                let mut pfd = libc::pollfd { fd: raw_fd, events: libc::POLLIN, revents: 0 };
+                let mut pfd = libc::pollfd {
+                    fd: raw_fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
                 let ret = unsafe { libc::poll(&mut pfd, 1, 100) };
                 if ret < 0 {
                     let e = io::Error::last_os_error();
@@ -259,7 +266,9 @@ async fn start_fd_inner(
                         // utun frames every packet with a 4-byte AF header;
                         // strip it so the transport carries bare IP packets.
                         let payload = if utun_prefix {
-                            if n <= 4 { continue; }
+                            if n <= 4 {
+                                continue;
+                            }
                             &buf[4..n]
                         } else {
                             &buf[..n]
@@ -268,8 +277,12 @@ async fn start_fd_inner(
                             break; // receiver dropped
                         }
                     }
-                    Err(e) if e.kind() == io::ErrorKind::WouldBlock
-                           || e.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(e)
+                        if e.kind() == io::ErrorKind::WouldBlock
+                            || e.kind() == io::ErrorKind::Interrupted =>
+                    {
+                        continue;
+                    }
                     Err(e) => {
                         error!("TUN read error: {}", e);
                         break;

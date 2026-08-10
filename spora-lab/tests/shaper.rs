@@ -98,10 +98,14 @@ fn shaped_nz_has_no_structural_tells() -> Result<(), String> {
         return Err("no UDP datagrams captured on the wan leg".into());
     }
     if report.msg1_sizes.is_empty() {
-        return Err("no msg1 (routing_key-prefixed) datagram captured — flow never handshook".into());
+        return Err(
+            "no msg1 (routing_key-prefixed) datagram captured — flow never handshook".into(),
+        );
     }
     if report.looks_like_bare_nz() {
-        return Err(format!("bare-nz structural signature present on the wire: {report:?}"));
+        return Err(format!(
+            "bare-nz structural signature present on the wire: {report:?}"
+        ));
     }
     if !report.passes_shaping() {
         return Err(format!(

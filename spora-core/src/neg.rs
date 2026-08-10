@@ -1,9 +1,9 @@
-use std::net::SocketAddr;
-use std::str::FromStr;
-use log::error;
 use crate::server::TunnelError;
 use crate::server::TunnelError::ProtocolError;
 use crate::signal::SignalChannel;
+use log::error;
+use std::net::SocketAddr;
+use std::str::FromStr;
 
 pub trait NegChannel {
     async fn send_endpoint(&mut self, addr: SocketAddr) -> Result<(), TunnelError>;
@@ -18,7 +18,6 @@ impl<'a> SignalNegChannel<'a> {
     pub fn new(channel: &'a mut SignalChannel) -> Self {
         SignalNegChannel { channel }
     }
-
 }
 
 impl<'a> NegChannel for SignalNegChannel<'a> {

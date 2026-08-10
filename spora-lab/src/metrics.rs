@@ -99,12 +99,19 @@ impl Metrics {
             .max()
             .unwrap_or(0)
             .max("value".len());
-        println!("{:<name_w$}  {:>value_w$}  {:<8}  better", "metric", "value", "unit");
+        println!(
+            "{:<name_w$}  {:>value_w$}  {:<8}  better",
+            "metric", "value", "unit"
+        );
         for ((name, m), value) in self.entries.iter().zip(&values) {
             println!(
                 "{name:<name_w$}  {value:>value_w$}  {:<8}  {}",
                 m.unit,
-                if m.higher_is_better { "higher" } else { "lower" },
+                if m.higher_is_better {
+                    "higher"
+                } else {
+                    "lower"
+                },
             );
         }
     }
@@ -230,7 +237,10 @@ impl Metrics {
             violations.join("\n  ")
         );
         if !warnings.is_empty() {
-            msg.push_str(&format!("\nwarnings (not failures):\n  {}", warnings.join("\n  ")));
+            msg.push_str(&format!(
+                "\nwarnings (not failures):\n  {}",
+                warnings.join("\n  ")
+            ));
         }
         Err(msg)
     }
@@ -256,10 +266,13 @@ pub fn global() -> &'static Mutex<Metrics> {
 /// Record into the [`global`] registry. `noise_pct` is the metric's expected
 /// run-to-run variance band — see the module docs.
 pub fn record(name: &str, value: f64, unit: &str, higher_is_better: bool, noise_pct: f64) {
-    global()
-        .lock()
-        .expect("metrics mutex poisoned")
-        .record(name, value, unit, higher_is_better, noise_pct);
+    global().lock().expect("metrics mutex poisoned").record(
+        name,
+        value,
+        unit,
+        higher_is_better,
+        noise_pct,
+    );
 }
 
 /// Suite-end hook: print the table, write the JSON snapshot if
@@ -278,9 +291,7 @@ pub fn finish(suite: &str) -> Result<(), String> {
     if let Ok(path) = std::env::var("SPORA_LAB_PERF_BASELINE") {
         let tolerance = match std::env::var("SPORA_LAB_PERF_TOLERANCE") {
             Ok(v) => v.parse::<f64>().unwrap_or_else(|e| {
-                eprintln!(
-                    "{suite}: SPORA_LAB_PERF_TOLERANCE={v} is not a number ({e}); using 30"
-                );
+                eprintln!("{suite}: SPORA_LAB_PERF_TOLERANCE={v} is not a number ({e}); using 30");
                 30.0
             }),
             Err(_) => 30.0,
@@ -313,7 +324,10 @@ fn meta() -> serde_json::Value {
 /// First line of a command's stdout, or `None` (serialized as JSON null) if
 /// it cannot run — meta only, never fatal.
 fn command_line(program: &str, args: &[&str]) -> Option<String> {
-    let out = std::process::Command::new(program).args(args).output().ok()?;
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
     if !out.status.success() {
         return None;
     }
@@ -339,8 +353,16 @@ mod tests {
     fn higher_is_better_direction() {
         let base = metrics(&[("mbps", 100.0, true)]);
         // Better and slightly worse both pass.
-        assert!(metrics(&[("mbps", 130.0, true)]).compare_with(&base, 25.0).is_ok());
-        assert!(metrics(&[("mbps", 80.0, true)]).compare_with(&base, 25.0).is_ok());
+        assert!(
+            metrics(&[("mbps", 130.0, true)])
+                .compare_with(&base, 25.0)
+                .is_ok()
+        );
+        assert!(
+            metrics(&[("mbps", 80.0, true)])
+                .compare_with(&base, 25.0)
+                .is_ok()
+        );
         // Worse by more than the tolerance fails.
         let err = metrics(&[("mbps", 60.0, true)])
             .compare_with(&base, 25.0)
@@ -351,8 +373,16 @@ mod tests {
     #[test]
     fn lower_is_better_direction() {
         let base = metrics(&[("rtt_ms", 100.0, false)]);
-        assert!(metrics(&[("rtt_ms", 70.0, false)]).compare_with(&base, 25.0).is_ok());
-        assert!(metrics(&[("rtt_ms", 120.0, false)]).compare_with(&base, 25.0).is_ok());
+        assert!(
+            metrics(&[("rtt_ms", 70.0, false)])
+                .compare_with(&base, 25.0)
+                .is_ok()
+        );
+        assert!(
+            metrics(&[("rtt_ms", 120.0, false)])
+                .compare_with(&base, 25.0)
+                .is_ok()
+        );
         let err = metrics(&[("rtt_ms", 140.0, false)])
             .compare_with(&base, 25.0)
             .unwrap_err();
@@ -363,19 +393,43 @@ mod tests {
     fn tolerance_edges_pass() {
         // 25% of 100 is exact in binary: the bounds are exactly 75 and 125.
         let base_hi = metrics(&[("m", 100.0, true)]);
-        assert!(metrics(&[("m", 75.0, true)]).compare_with(&base_hi, 25.0).is_ok());
-        assert!(metrics(&[("m", 74.9, true)]).compare_with(&base_hi, 25.0).is_err());
+        assert!(
+            metrics(&[("m", 75.0, true)])
+                .compare_with(&base_hi, 25.0)
+                .is_ok()
+        );
+        assert!(
+            metrics(&[("m", 74.9, true)])
+                .compare_with(&base_hi, 25.0)
+                .is_err()
+        );
 
         let base_lo = metrics(&[("m", 100.0, false)]);
-        assert!(metrics(&[("m", 125.0, false)]).compare_with(&base_lo, 25.0).is_ok());
-        assert!(metrics(&[("m", 125.1, false)]).compare_with(&base_lo, 25.0).is_err());
+        assert!(
+            metrics(&[("m", 125.0, false)])
+                .compare_with(&base_lo, 25.0)
+                .is_ok()
+        );
+        assert!(
+            metrics(&[("m", 125.1, false)])
+                .compare_with(&base_lo, 25.0)
+                .is_err()
+        );
     }
 
     #[test]
     fn zero_tolerance_requires_no_regression_at_all() {
         let base = metrics(&[("m", 100.0, true)]);
-        assert!(metrics(&[("m", 100.0, true)]).compare_with(&base, 0.0).is_ok());
-        assert!(metrics(&[("m", 99.9, true)]).compare_with(&base, 0.0).is_err());
+        assert!(
+            metrics(&[("m", 100.0, true)])
+                .compare_with(&base, 0.0)
+                .is_ok()
+        );
+        assert!(
+            metrics(&[("m", 99.9, true)])
+                .compare_with(&base, 0.0)
+                .is_err()
+        );
     }
 
     #[test]
@@ -427,8 +481,6 @@ mod tests {
     #[test]
     fn malformed_baseline_is_an_error() {
         assert!(Metrics::from_json(&serde_json::json!({})).is_err());
-        assert!(
-            Metrics::from_json(&serde_json::json!({"metrics": {"m": {"unit": "x"}}})).is_err()
-        );
+        assert!(Metrics::from_json(&serde_json::json!({"metrics": {"m": {"unit": "x"}}})).is_err());
     }
 }

@@ -106,7 +106,10 @@ fn handshake_clienthello() -> Result<(), String> {
     // JA4-Q shape: QUIC (q), TLS 1.3 (13), no SNI (i). Pin the prefix; the full
     // value is logged above for tracking against a browser reference.
     if !ch.ja4.starts_with("q13i") {
-        return Err(format!("unexpected JA4_a shape: {} (expected q13i…)", ch.ja4));
+        return Err(format!(
+            "unexpected JA4_a shape: {} (expected q13i…)",
+            ch.ja4
+        ));
     }
 
     Ok(())

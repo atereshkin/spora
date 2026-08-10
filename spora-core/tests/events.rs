@@ -11,7 +11,7 @@ use tokio::net::UdpSocket as TokioUdp;
 use tokio::sync::mpsc;
 
 use spora_core::identity::Identity;
-use spora_core::{connect, share, Config, ExitMode, SessionHandler, TunnelEvent};
+use spora_core::{Config, ExitMode, SessionHandler, TunnelEvent, connect, share};
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn relay_session_events_and_disabled_direct_upgrade() {
@@ -40,7 +40,10 @@ async fn relay_session_events_and_disabled_direct_upgrade() {
 
     let (share_tx, mut share_rx) = mpsc::unbounded_channel();
     let share_config = Config {
-        relays: vec![spora_core::identity::RelayEndpoint::new("127.0.0.1", relay_addr.port())],
+        relays: vec![spora_core::identity::RelayEndpoint::new(
+            "127.0.0.1",
+            relay_addr.port(),
+        )],
         exit_mode: ExitMode::Custom(handler),
         event_hook: Some(Arc::new(move |ev| {
             let _ = share_tx.send(ev);

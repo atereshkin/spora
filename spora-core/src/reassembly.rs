@@ -203,7 +203,10 @@ impl IpReassembler {
             self.evict_oldest();
         }
 
-        let group = self.groups.entry(key).or_insert_with(|| FragGroup::new(now));
+        let group = self
+            .groups
+            .entry(key)
+            .or_insert_with(|| FragGroup::new(now));
         if offset_bytes == 0 {
             group.header = header;
         }
@@ -222,7 +225,9 @@ impl IpReassembler {
                 return Vec::new();
             }
             group.stored_bytes += payload_len;
-            group.chunks.insert(offset_bytes, pkt[data_start..].to_vec());
+            group
+                .chunks
+                .insert(offset_bytes, pkt[data_start..].to_vec());
         }
 
         if group.complete() {
@@ -364,7 +369,11 @@ mod tests {
             out.extend(r.process(f.clone(), now));
         }
         assert_eq!(out.len(), 1, "exactly one reassembled packet");
-        assert_eq!(out[0], normalize(&pkt), "reassembles to the original (DF cleared)");
+        assert_eq!(
+            out[0],
+            normalize(&pkt),
+            "reassembles to the original (DF cleared)"
+        );
     }
 
     #[test]

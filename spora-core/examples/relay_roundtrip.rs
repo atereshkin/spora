@@ -4,7 +4,7 @@
 // problem from a tunnel-plumbing bug in the appex.
 //
 //   cargo run -p spora-core --example relay_roundtrip
-use spora_core::{connect, identity::Identity, share, Config};
+use spora_core::{Config, connect, identity::Identity, share};
 
 #[tokio::main]
 async fn main() {

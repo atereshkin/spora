@@ -66,7 +66,11 @@ fn set_bits_per_byte(p: &[u8]) -> f64 {
 pub fn analyze(payloads: &[Vec<u8>], routing_key: &[u8; ROUTING_KEY_LEN]) -> NzFlowReport {
     let is_msg1 = |p: &[u8]| p.len() >= ROUTING_KEY_LEN && &p[..ROUTING_KEY_LEN] == routing_key;
 
-    let msg1_sizes: Vec<usize> = payloads.iter().filter(|p| is_msg1(p)).map(|p| p.len()).collect();
+    let msg1_sizes: Vec<usize> = payloads
+        .iter()
+        .filter(|p| is_msg1(p))
+        .map(|p| p.len())
+        .collect();
 
     // Echo: does any datagram start with some msg1's [20..24]?
     let mut index_echo = false;
@@ -84,9 +88,17 @@ pub fn analyze(payloads: &[Vec<u8>], routing_key: &[u8; ROUTING_KEY_LEN]) -> NzF
         }
     }
 
-    let first_msg1_popcount = payloads.iter().find(|p| is_msg1(p)).map(|p| set_bits_per_byte(p));
+    let first_msg1_popcount = payloads
+        .iter()
+        .find(|p| is_msg1(p))
+        .map(|p| set_bits_per_byte(p));
 
-    NzFlowReport { msg1_sizes, index_echo, first_msg1_popcount, datagrams: payloads.len() }
+    NzFlowReport {
+        msg1_sizes,
+        index_echo,
+        first_msg1_popcount,
+        datagrams: payloads.len(),
+    }
 }
 
 /// Convenience: analyze a raw pcap directly.

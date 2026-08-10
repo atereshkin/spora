@@ -39,7 +39,8 @@ pub fn register_signing_input(
     routing_key: &[u8; ROUTING_KEY_LEN],
     timestamp_millis: u64,
 ) -> Vec<u8> {
-    let mut v = Vec::with_capacity(REGISTER_SIG_DOMAIN.len() + ROUTING_KEY_LEN + REGISTER_TIMESTAMP_LEN);
+    let mut v =
+        Vec::with_capacity(REGISTER_SIG_DOMAIN.len() + ROUTING_KEY_LEN + REGISTER_TIMESTAMP_LEN);
     v.extend_from_slice(REGISTER_SIG_DOMAIN);
     v.extend_from_slice(routing_key);
     v.extend_from_slice(&timestamp_millis.to_be_bytes());
@@ -64,8 +65,14 @@ pub fn build_signed_register(
     signature: &[u8],
     token: &[u8],
 ) -> Vec<u8> {
-    debug_assert!(cert_der.len() <= u16::MAX as usize, "cert too large for u16 length");
-    debug_assert!(signature.len() <= u16::MAX as usize, "signature too large for u16 length");
+    debug_assert!(
+        cert_der.len() <= u16::MAX as usize,
+        "cert too large for u16 length"
+    );
+    debug_assert!(
+        signature.len() <= u16::MAX as usize,
+        "signature too large for u16 length"
+    );
     let mut pkt = Vec::with_capacity(
         CTRL_MAGIC.len()
             + 1
@@ -111,9 +118,11 @@ fn parse_signed_register(body: &[u8]) -> Option<ParsedRegister<'_>> {
             .try_into()
             .unwrap(),
     );
-    let cert_len =
-        u16::from_be_bytes(body[ROUTING_KEY_LEN + REGISTER_TIMESTAMP_LEN..HEAD].try_into().unwrap())
-            as usize;
+    let cert_len = u16::from_be_bytes(
+        body[ROUTING_KEY_LEN + REGISTER_TIMESTAMP_LEN..HEAD]
+            .try_into()
+            .unwrap(),
+    ) as usize;
     let cert_end = HEAD.checked_add(cert_len)?;
     // Read the 2-byte signature length that follows the cert.
     let sig_len_end = cert_end.checked_add(2)?;
@@ -246,7 +255,13 @@ impl RegisterSigner {
             .key_pair
             .sign(&self.rng, &input)
             .expect("ECDSA signing of a fixed-size input does not fail");
-        build_signed_register(&self.routing_key, ts, &self.cert_der, sig.as_ref(), &self.token)
+        build_signed_register(
+            &self.routing_key,
+            ts,
+            &self.cert_der,
+            sig.as_ref(),
+            &self.token,
+        )
     }
 }
 
@@ -326,7 +341,10 @@ mod tests {
                 assert_eq!(ty, ctrl::REGISTER);
                 let (rk, _ts, token) = verify_signed_register(body).expect("verifies");
                 assert_eq!(rk, signer.routing_key());
-                assert!(token.is_empty(), "a plain signer registers open-mode (no token)");
+                assert!(
+                    token.is_empty(),
+                    "a plain signer registers open-mode (no token)"
+                );
             }
             other => panic!("expected Control, got {:?}", other),
         }
@@ -344,7 +362,10 @@ mod tests {
         let (rk2, ts2, _) = verify_signed_register(&body(&p2)).unwrap();
         assert_eq!(rk1, signer.routing_key());
         assert_eq!(rk2, signer.routing_key());
-        assert!(ts2 > ts1, "timestamps must strictly increase ({ts1} -> {ts2})");
+        assert!(
+            ts2 > ts1,
+            "timestamps must strictly increase ({ts1} -> {ts2})"
+        );
     }
 
     #[test]
@@ -358,7 +379,11 @@ mod tests {
         let body = &pkt[CTRL_MAGIC.len() + 1..];
         let (rk, _ts, got) = verify_signed_register(body).expect("verifies");
         assert_eq!(rk, signer.routing_key());
-        assert_eq!(got, &token[..], "the exact token must round-trip after the signature");
+        assert_eq!(
+            got,
+            &token[..],
+            "the exact token must round-trip after the signature"
+        );
     }
 
     #[test]

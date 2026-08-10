@@ -104,7 +104,12 @@ impl TcpRelayState {
 
     /// Number of routing keys with at least one parked connection (for tests).
     pub fn parked_key_count(&self) -> usize {
-        self.parked.lock().unwrap().values().filter(|q| !q.is_empty()).count()
+        self.parked
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|q| !q.is_empty())
+            .count()
     }
 }
 
@@ -185,7 +190,10 @@ async fn handle_conn(mut conn: TcpStream, state: Arc<TcpRelayState>) {
                 tokio::time::sleep(Duration::from_millis(50)).await;
             };
             let Some(mut sharer) = sharer else {
-                debug!("tcp: no parked sharer for rk {:x?}; dropping client", &rk[..4]);
+                debug!(
+                    "tcp: no parked sharer for rk {:x?}; dropping client",
+                    &rk[..4]
+                );
                 return;
             };
             // Blind 1:1 splice — the E2E TLS runs A<->B through here; the relay
@@ -306,8 +314,14 @@ mod tests {
         assert!(!state.requires_authorization());
         let rk = [0x11u8; ROUTING_KEY_LEN];
         let mut s = TcpStream::connect(addr).await.unwrap();
-        s.write_all(&tcp::build_preamble(tcp::role::REGISTER, &rk, &[])).await.unwrap();
-        assert_eq!(wait_parked(&state, 1).await, 1, "open mode parks a tokenless register");
+        s.write_all(&tcp::build_preamble(tcp::role::REGISTER, &rk, &[]))
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_parked(&state, 1).await,
+            1,
+            "open mode parks a tokenless register"
+        );
     }
 
     #[tokio::test]
@@ -320,15 +334,27 @@ mod tests {
 
         // Tokenless => refused, never parks.
         let mut s = TcpStream::connect(addr).await.unwrap();
-        s.write_all(&tcp::build_preamble(tcp::role::REGISTER, &rk, &[])).await.unwrap();
+        s.write_all(&tcp::build_preamble(tcp::role::REGISTER, &rk, &[]))
+            .await
+            .unwrap();
         tokio::time::sleep(Duration::from_millis(150)).await;
-        assert_eq!(state.parked_key_count(), 0, "gated relay must refuse a tokenless register");
+        assert_eq!(
+            state.parked_key_count(),
+            0,
+            "gated relay must refuse a tokenless register"
+        );
 
         // Valid token bound to rk => parks.
         let token = issuer.issue(&rk);
         let mut s2 = TcpStream::connect(addr).await.unwrap();
-        s2.write_all(&tcp::build_preamble(tcp::role::REGISTER, &rk, &token)).await.unwrap();
-        assert_eq!(wait_parked(&state, 1).await, 1, "a valid token must be accepted");
+        s2.write_all(&tcp::build_preamble(tcp::role::REGISTER, &rk, &token))
+            .await
+            .unwrap();
+        assert_eq!(
+            wait_parked(&state, 1).await,
+            1,
+            "a valid token must be accepted"
+        );
     }
 
     #[tokio::test]
@@ -352,7 +378,11 @@ mod tests {
         TcpStream::connect(addr)
             .await
             .unwrap()
-            .write_all(&tcp::build_preamble(tcp::role::REGISTER, &rk, &wrong_subject))
+            .write_all(&tcp::build_preamble(
+                tcp::role::REGISTER,
+                &rk,
+                &wrong_subject,
+            ))
             .await
             .unwrap();
 

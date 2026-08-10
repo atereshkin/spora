@@ -9,7 +9,7 @@ use log::info;
 use tokio::net::UdpSocket;
 
 use relay::sessionlog::{SessionLog, SessionLogConfig};
-use relay::{serve, State};
+use relay::{State, serve};
 
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]

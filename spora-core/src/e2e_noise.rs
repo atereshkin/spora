@@ -53,7 +53,10 @@ pub(crate) const NOISE_HS_MAX: usize = 128;
 
 /// PSK = SHA-256(domain || routing_key || secret). Both peers derive it: B from
 /// the URL's `routing_key`/`secret`, A from its own `Identity`.
-pub(crate) fn derive_psk(routing_key: &[u8; ROUTING_KEY_LEN], secret: &[u8; SECRET_LEN]) -> [u8; 32] {
+pub(crate) fn derive_psk(
+    routing_key: &[u8; ROUTING_KEY_LEN],
+    secret: &[u8; SECRET_LEN],
+) -> [u8; 32] {
     let mut ctx = ring::digest::Context::new(&ring::digest::SHA256);
     ctx.update(PSK_DOMAIN);
     ctx.update(routing_key);
@@ -198,7 +201,10 @@ impl NoiseSession {
 /// where `signature` is ECDSA-P256-SHA256 (ASN.1 DER) over
 /// `AUTH_SIG_DOMAIN || handshake_hash`. The caller encrypts this with the
 /// session and sends it as the first transport message.
-pub(crate) fn build_cert_auth(identity: &Identity, handshake_hash: &[u8; 32]) -> Result<Vec<u8>, String> {
+pub(crate) fn build_cert_auth(
+    identity: &Identity,
+    handshake_hash: &[u8; 32],
+) -> Result<Vec<u8>, String> {
     let rng = SystemRandom::new();
     let key_pair = EcdsaKeyPair::from_pkcs8(
         &ECDSA_P256_SHA256_ASN1_SIGNING,
@@ -249,7 +255,8 @@ pub(crate) fn verify_cert_auth(
     }
 
     let cert = CertificateDer::from(cert_der);
-    let eec = webpki::EndEntityCert::try_from(&cert).map_err(|_| "noise auth: bad cert".to_string())?;
+    let eec =
+        webpki::EndEntityCert::try_from(&cert).map_err(|_| "noise auth: bad cert".to_string())?;
     let mut input = Vec::with_capacity(AUTH_SIG_DOMAIN.len() + handshake_hash.len());
     input.extend_from_slice(AUTH_SIG_DOMAIN);
     input.extend_from_slice(handshake_hash);
@@ -285,8 +292,7 @@ mod tests {
     fn full_handshake_and_cert_auth_succeeds() {
         let identity = Identity::generate();
         let rk = identity.routing_key;
-        let (a_sess, b_sess) =
-            handshake_pair(&rk, &identity.secret, &identity).expect("handshake");
+        let (a_sess, b_sess) = handshake_pair(&rk, &identity.secret, &identity).expect("handshake");
 
         // Same channel binding on both sides.
         assert_eq!(a_sess.handshake_hash, b_sess.handshake_hash);
@@ -315,7 +321,10 @@ mod tests {
             Ok(_) => panic!("a wrong secret must not complete the handshake"),
             Err(e) => e,
         };
-        assert!(err.contains("noise read"), "expected a read/tag failure: {err}");
+        assert!(
+            err.contains("noise read"),
+            "expected a read/tag failure: {err}"
+        );
     }
 
     #[test]
@@ -324,7 +333,9 @@ mod tests {
         let (a_sess, b_sess) =
             handshake_pair(&identity.routing_key, &identity.secret, &identity).unwrap();
         let auth = build_cert_auth(&identity, &a_sess.handshake_hash).unwrap();
-        let pt = b_sess.decrypt(0, &a_sess.encrypt(0, &auth).unwrap()).unwrap();
+        let pt = b_sess
+            .decrypt(0, &a_sess.encrypt(0, &auth).unwrap())
+            .unwrap();
         // Pin to a different routing key than the cert commits to.
         let mut bogus = identity.routing_key;
         bogus[0] ^= 0xFF;
@@ -351,10 +362,8 @@ mod tests {
         // A signature from one session must not verify against another session's
         // channel binding (replay/relay resistance).
         let identity = Identity::generate();
-        let (a1, _b1) =
-            handshake_pair(&identity.routing_key, &identity.secret, &identity).unwrap();
-        let (_a2, b2) =
-            handshake_pair(&identity.routing_key, &identity.secret, &identity).unwrap();
+        let (a1, _b1) = handshake_pair(&identity.routing_key, &identity.secret, &identity).unwrap();
+        let (_a2, b2) = handshake_pair(&identity.routing_key, &identity.secret, &identity).unwrap();
         assert_ne!(a1.handshake_hash, b2.handshake_hash, "sessions differ");
         let auth = build_cert_auth(&identity, &a1.handshake_hash).unwrap();
         // Verify against session 2's binding: must fail.

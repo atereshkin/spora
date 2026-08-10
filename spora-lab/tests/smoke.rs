@@ -394,7 +394,9 @@ fn nat_filtering_semantics() -> Result<(), String> {
                 return fail(format!("{kind:?}: unsolicited probe was NOT delivered"));
             }
             (true, Some(p)) => {
-                return fail(format!("{kind:?}: probe delivered with wrong payload {p:02X?}"));
+                return fail(format!(
+                    "{kind:?}: probe delivered with wrong payload {p:02X?}"
+                ));
             }
         }
     }
@@ -411,24 +413,26 @@ fn netem_latency() -> Result<(), String> {
 
     // UDP echo host on the (public) sharer.
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(), String>>();
-    let echo_host = topo.sharer.spawn_host("shr-echo", move |_cancel| async move {
-        let sock = match UdpSocket::bind("0.0.0.0:7").await {
-            Ok(s) => {
-                let _ = ready_tx.send(Ok(()));
-                s
+    let echo_host = topo
+        .sharer
+        .spawn_host("shr-echo", move |_cancel| async move {
+            let sock = match UdpSocket::bind("0.0.0.0:7").await {
+                Ok(s) => {
+                    let _ = ready_tx.send(Ok(()));
+                    s
+                }
+                Err(e) => {
+                    let _ = ready_tx.send(Err(format!("bind echo: {e}")));
+                    return;
+                }
+            };
+            let mut buf = [0u8; 2048];
+            loop {
+                if let Ok((n, src)) = sock.recv_from(&mut buf).await {
+                    let _ = sock.send_to(&buf[..n], src).await;
+                }
             }
-            Err(e) => {
-                let _ = ready_tx.send(Err(format!("bind echo: {e}")));
-                return;
-            }
-        };
-        let mut buf = [0u8; 2048];
-        loop {
-            if let Ok((n, src)) = sock.recv_from(&mut buf).await {
-                let _ = sock.send_to(&buf[..n], src).await;
-            }
-        }
-    })?;
+        })?;
     ready_rx
         .recv_timeout(Duration::from_secs(10))
         .map_err(|e| format!("echo host not ready: {e}"))??;
@@ -481,7 +485,9 @@ fn netem_latency() -> Result<(), String> {
         ));
     }
     if avg >= Duration::from_millis(800) {
-        return fail(format!("average RTT {avg:?} over the 800ms ceiling (all: {rtts:?})"));
+        return fail(format!(
+            "average RTT {avg:?} over the 800ms ceiling (all: {rtts:?})"
+        ));
     }
 
     // Exercise the clear path too.

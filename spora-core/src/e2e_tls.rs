@@ -18,7 +18,7 @@ use subtle::ConstantTimeEq;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
-use crate::identity::{Identity, RoutingKeyVerifier, ROUTING_KEY_LEN, SECRET_LEN};
+use crate::identity::{Identity, ROUTING_KEY_LEN, RoutingKeyVerifier, SECRET_LEN};
 use crate::transport::IpTransport;
 use crate::transport::stream::StreamPeerTransport;
 
@@ -132,7 +132,9 @@ mod tests {
 
         let server_id = identity.clone();
         let server = tokio::spawn(async move { accept(server_io, &server_id).await });
-        let mut client = connect(client_io, rk, &secret).await.expect("client connects");
+        let mut client = connect(client_io, rk, &secret)
+            .await
+            .expect("client connects");
         let mut server = server.await.unwrap().expect("server accepts");
 
         let up = vec![0x45u8, 0, 0, 0x14, 1, 2, 3, 4];
@@ -156,7 +158,10 @@ mod tests {
         bad[0] ^= 0xFF;
         let r = connect(client_io, identity.routing_key, &bad).await;
         assert!(r.is_err(), "client must not get an ack for a bad secret");
-        assert!(server.await.unwrap().is_err(), "server must reject the bad secret");
+        assert!(
+            server.await.unwrap().is_err(),
+            "server must reject the bad secret"
+        );
     }
 
     #[tokio::test]
@@ -169,7 +174,10 @@ mod tests {
         let server = tokio::spawn(async move { accept(server_io, &a).await });
 
         let r = connect(client_io, b.routing_key, &b.secret).await;
-        assert!(r.is_err(), "cert pinning must reject a mismatched routing key");
+        assert!(
+            r.is_err(),
+            "cert pinning must reject a mismatched routing key"
+        );
         let _ = server.await;
     }
 }

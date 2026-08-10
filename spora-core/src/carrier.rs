@@ -27,10 +27,10 @@ use tokio::net::TcpStream;
 
 use crate::e2e::{E2eSession, client_connect, client_endpoint};
 use crate::e2e_tls;
-use crate::identity::{RelayProtocol, ROUTING_KEY_LEN, SECRET_LEN};
+use crate::identity::{ROUTING_KEY_LEN, RelayProtocol, SECRET_LEN};
 use crate::signal::SignalChannel;
 use crate::transport::IpTransport;
-use crate::{Timings, SocketProtector, bind_local_udp};
+use crate::{SocketProtector, Timings, bind_local_udp};
 
 /// Tunnel MTU reported for a stream carrier. A byte stream has no per-packet
 /// datagram limit (framing + TCP handle any size), but the inner netstack still

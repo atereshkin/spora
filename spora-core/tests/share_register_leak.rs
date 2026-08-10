@@ -5,15 +5,15 @@
 //! aborting the task, so the registrar kept sending REGISTER forever and — on a
 //! same-process re-share — flapped the relay's routing-key binding.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use tokio::net::UdpSocket as TokioUdp;
 
-use relay_client::protocol::{classify, ctrl, Classified};
+use relay_client::protocol::{Classified, classify, ctrl};
 use spora_core::identity::Identity;
-use spora_core::{share, Config, Timings};
+use spora_core::{Config, Timings, share};
 
 /// Bind a fake relay that just counts REGISTER control packets it receives.
 async fn counting_relay() -> (std::net::SocketAddr, Arc<AtomicUsize>) {
@@ -47,7 +47,10 @@ async fn abort_stops_the_relay_registrar() {
 
     let interval = Duration::from_millis(50);
     let config = Config {
-        relays: vec![spora_core::identity::RelayEndpoint::new("127.0.0.1", relay_addr.port())],
+        relays: vec![spora_core::identity::RelayEndpoint::new(
+            "127.0.0.1",
+            relay_addr.port(),
+        )],
         timings: Timings {
             register_interval: interval,
             ..Timings::default()

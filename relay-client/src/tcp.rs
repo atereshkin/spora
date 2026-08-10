@@ -45,7 +45,10 @@ pub const MAX_TOKEN_LEN: usize = 4096;
 /// Build a connection preamble: the header followed by `token` (pass an empty
 /// slice for a CONNECT or an open-mode REGISTER).
 pub fn build_preamble(role: u8, routing_key: &[u8; ROUTING_KEY_LEN], token: &[u8]) -> Vec<u8> {
-    debug_assert!(token.len() <= u16::MAX as usize, "token too large for u16 length");
+    debug_assert!(
+        token.len() <= u16::MAX as usize,
+        "token too large for u16 length"
+    );
     let mut p = Vec::with_capacity(PREAMBLE_HEADER_LEN + token.len());
     p.extend_from_slice(&TCP_MAGIC);
     p.push(role);
@@ -84,7 +87,11 @@ mod tests {
         assert_eq!(role, role::REGISTER);
         assert_eq!(got_rk, rk);
         assert_eq!(tlen, token.len());
-        assert_eq!(&p[PREAMBLE_HEADER_LEN..], &token[..], "token follows the header verbatim");
+        assert_eq!(
+            &p[PREAMBLE_HEADER_LEN..],
+            &token[..],
+            "token follows the header verbatim"
+        );
 
         let c = build_preamble(role::CONNECT, &rk, &[]);
         let (role, _, tlen) = parse_header(&c).expect("header parses");
@@ -99,6 +106,10 @@ mod tests {
         let mut p = build_preamble(role::CONNECT, &rk, &[]);
         p[0] ^= 0xFF;
         assert_eq!(parse_header(&p), None, "bad magic must be rejected");
-        assert_eq!(parse_header(&p[..PREAMBLE_HEADER_LEN - 1]), None, "short buffer rejected");
+        assert_eq!(
+            parse_header(&p[..PREAMBLE_HEADER_LEN - 1]),
+            None,
+            "short buffer rejected"
+        );
     }
 }

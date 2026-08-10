@@ -169,10 +169,12 @@ fn setup_carrier(
                 "tc qdisc add dev {dev} root handle 1: prio bands 2 \
                  priomap 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
             ))?;
-            topo.wan
-                .run(&format!("tc qdisc add dev {dev} parent 1:1 handle 10: netem delay 10ms"))?;
-            topo.wan
-                .run(&format!("tc qdisc add dev {dev} parent 1:2 handle 20: pfifo"))?;
+            topo.wan.run(&format!(
+                "tc qdisc add dev {dev} parent 1:1 handle 10: netem delay 10ms"
+            ))?;
+            topo.wan.run(&format!(
+                "tc qdisc add dev {dev} parent 1:2 handle 20: pfifo"
+            ))?;
             topo.wan.run(&format!(
                 "tc filter add dev {dev} parent 1: protocol ip u32 \
                  match ip src {WAN_SERVICES_IP}/32 flowid 1:2"
@@ -209,7 +211,12 @@ fn setup_carrier(
 /// UDP echo through the tunnel with zero tolerated loss (the lab has no
 /// lossy links; anything dropped means a product/path problem).
 fn assert_echo_works(client: &ClientHandle, label: &str) -> Result<(), String> {
-    let stats = client.udp_echo(svc(ECHO_UDP_PORT), ECHO_COUNT, ECHO_LEN, Duration::from_secs(30))?;
+    let stats = client.udp_echo(
+        svc(ECHO_UDP_PORT),
+        ECHO_COUNT,
+        ECHO_LEN,
+        Duration::from_secs(30),
+    )?;
     if stats.received != ECHO_COUNT {
         return Err(format!("{label}: udp echo lost packets: {stats:?}"));
     }
@@ -308,7 +315,9 @@ fn direct_pair_case(
 
     let bulk = client.tcp_bulk(svc(ECHO_TCP_PORT), 64 * 1024, Duration::from_secs(60))?;
     if bulk.bytes != 64 * 1024 {
-        return Err(format!("{pairing}: post-relay-death tcp bulk incomplete: {bulk:?}"));
+        return Err(format!(
+            "{pairing}: post-relay-death tcp bulk incomplete: {bulk:?}"
+        ));
     }
     log::info!(
         "{pairing}: post-relay-death bulk ok ({:.2} Mbps)",

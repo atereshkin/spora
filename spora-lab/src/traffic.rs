@@ -700,11 +700,7 @@ impl TrafficPump {
                 }
 
                 if ack_len == 8 {
-                    elapsed = Some(
-                        started
-                            .expect("the ack implies data was sent")
-                            .elapsed(),
-                    );
+                    elapsed = Some(started.expect("the ack implies data was sent").elapsed());
                     let counted = u64::from_be_bytes(ack);
                     if counted != bytes as u64 {
                         return Err(format!(
@@ -840,7 +836,10 @@ fn tcp_session(
 /// CPU time consumed by the CALLING thread
 /// (`clock_gettime(CLOCK_THREAD_CPUTIME_ID)`).
 pub fn thread_cpu_time() -> Result<Duration, String> {
-    let mut ts = libc::timespec { tv_sec: 0, tv_nsec: 0 };
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
     if unsafe { libc::clock_gettime(libc::CLOCK_THREAD_CPUTIME_ID, &mut ts) } != 0 {
         return Err(format!(
             "clock_gettime(CLOCK_THREAD_CPUTIME_ID): {}",
@@ -1494,7 +1493,10 @@ mod tests {
         );
         // Wrong nonce, wrong port: no match.
         assert_eq!(match_echo_reply(&reply, server, 40000, 1), None);
-        assert_eq!(match_echo_reply(&reply, server, 40001, 0xDEAD_BEEF_CAFE_F00D), None);
+        assert_eq!(
+            match_echo_reply(&reply, server, 40001, 0xDEAD_BEEF_CAFE_F00D),
+            None
+        );
         // A padded reply still matches on the tag prefix.
         let mut padded = Vec::new();
         let mut big = payload.to_vec();
@@ -1532,10 +1534,16 @@ mod tests {
         );
         // Wrong nonce, wrong port: no match.
         assert_eq!(match_echo_reply(&reply, server, 40000, 1), None);
-        assert_eq!(match_echo_reply(&reply, server, 40001, 0xDEAD_BEEF_CAFE_F00D), None);
+        assert_eq!(
+            match_echo_reply(&reply, server, 40001, 0xDEAD_BEEF_CAFE_F00D),
+            None
+        );
         // A v4 session never claims a v6 reply.
         let v4: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 100), 7).into();
-        assert_eq!(match_echo_reply(&reply, v4, 40000, 0xDEAD_BEEF_CAFE_F00D), None);
+        assert_eq!(
+            match_echo_reply(&reply, v4, 40000, 0xDEAD_BEEF_CAFE_F00D),
+            None
+        );
     }
 
     #[test]
@@ -1599,9 +1607,13 @@ mod tests {
         assert!(is_session_tcp(&pkt, server, 40000));
         // Wrong local port, wrong server address, v4 session: no match.
         assert!(!is_session_tcp(&pkt, server, 40001));
-        let other: SocketAddr =
-            SocketAddrV6::new(Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x200), 5201, 0, 0)
-                .into();
+        let other: SocketAddr = SocketAddrV6::new(
+            Ipv6Addr::new(0x2001, 0xdb8, 0, 0, 0, 0, 0, 0x200),
+            5201,
+            0,
+            0,
+        )
+        .into();
         assert!(!is_session_tcp(&pkt, other, 40000));
         let v4: SocketAddr = SocketAddrV4::new(Ipv4Addr::new(203, 0, 113, 100), 5201).into();
         assert!(!is_session_tcp(&pkt, v4, 40000));

@@ -19,10 +19,10 @@ use log::{debug, info};
 use quinn::Connection;
 use subtle::ConstantTimeEq;
 
-use crate::identity::{Identity, RoutingKeyVerifier, ROUTING_KEY_LEN, SECRET_LEN};
-use crate::signal::SignalChannel;
-use crate::transport::quic::{build_transport_config, QuicPeerTransport};
 use crate::Timings;
+use crate::identity::{Identity, ROUTING_KEY_LEN, RoutingKeyVerifier, SECRET_LEN};
+use crate::signal::SignalChannel;
+use crate::transport::quic::{QuicPeerTransport, build_transport_config};
 
 // Present as HTTP/3 ("h3") rather than a product-unique token: the ALPN in the
 // ClientHello is derivable from a QUIC Initial, so a project-specific value
@@ -159,9 +159,7 @@ pub async fn authenticate_incoming(
     // client gets the connection closed above instead of this byte, which is
     // how the client distinguishes a bad token from a healthy session. Only on
     // the relay path (see `send_ack`).
-    if send_ack
-        && let Err(e) = send.write_all(&[AUTH_ACK]).await
-    {
+    if send_ack && let Err(e) = send.write_all(&[AUTH_ACK]).await {
         conn.close(1u32.into(), b"ack-failed");
         return Err(format!("auth ack to {}: {}", peer, e));
     }
@@ -211,18 +209,12 @@ pub fn client_endpoint(
         timings.quic_keep_alive,
     )));
     let rk_bytes = routing_key.to_vec();
-    client_config.initial_dst_cid_provider(Arc::new(move || {
-        quinn::ConnectionId::new(&rk_bytes)
-    }));
+    client_config.initial_dst_cid_provider(Arc::new(move || quinn::ConnectionId::new(&rk_bytes)));
 
     let runtime = quinn::default_runtime().ok_or_else(|| "no async runtime".to_string())?;
-    let mut endpoint = quinn::Endpoint::new(
-        quinn::EndpointConfig::default(),
-        None,
-        socket,
-        runtime,
-    )
-    .map_err(|e| format!("endpoint creation: {}", e))?;
+    let mut endpoint =
+        quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
+            .map_err(|e| format!("endpoint creation: {}", e))?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
 }
@@ -376,7 +368,10 @@ mod tests {
 
         // Drive A's accept and B's connect concurrently.
         let accept_task = tokio::spawn(async move {
-            accept_one(&a_endpoint, &secret, true).await.unwrap().unwrap()
+            accept_one(&a_endpoint, &secret, true)
+                .await
+                .unwrap()
+                .unwrap()
         });
         let mut b_session = client_connect(&b_endpoint, relay_addr, &secret, true)
             .await
@@ -484,8 +479,12 @@ mod tests {
         let b2_std = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         b2_std.set_nonblocking(true).unwrap();
         let b2_endpoint = client_endpoint(b2_std, routing_key, &Timings::default()).unwrap();
-        let accept_task =
-            tokio::spawn(async move { accept_one(&a2_endpoint, &secret, true).await.unwrap().unwrap() });
+        let accept_task = tokio::spawn(async move {
+            accept_one(&a2_endpoint, &secret, true)
+                .await
+                .unwrap()
+                .unwrap()
+        });
         let _b = client_connect(&b2_endpoint, relay_addr, &secret, true)
             .await
             .expect("an authorized sharer must be reachable via the gated relay");
@@ -559,7 +558,12 @@ mod tests {
             c: &rustls::pki_types::CertificateDer<'_>,
             d: &rustls::DigitallySignedStruct,
         ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls12_signature(m, c, d, &self.0.signature_verification_algorithms)
+            rustls::crypto::verify_tls12_signature(
+                m,
+                c,
+                d,
+                &self.0.signature_verification_algorithms,
+            )
         }
         fn verify_tls13_signature(
             &self,
@@ -567,7 +571,12 @@ mod tests {
             c: &rustls::pki_types::CertificateDer<'_>,
             d: &rustls::DigitallySignedStruct,
         ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-            rustls::crypto::verify_tls13_signature(m, c, d, &self.0.signature_verification_algorithms)
+            rustls::crypto::verify_tls13_signature(
+                m,
+                c,
+                d,
+                &self.0.signature_verification_algorithms,
+            )
         }
         fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
             self.0.signature_verification_algorithms.supported_schemes()

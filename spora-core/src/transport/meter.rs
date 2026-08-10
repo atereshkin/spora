@@ -66,7 +66,10 @@ struct FragKey {
 }
 
 enum FlowState {
-    Open { fin_up: bool, fin_down: bool },
+    Open {
+        fin_up: bool,
+        fin_down: bool,
+    },
     /// Closed by FIN/RST or policy-blocked: the entry lingers (until idle
     /// sweep) so retransmits and local echo replies don't reopen a record.
     Done,
@@ -164,7 +167,8 @@ impl MeteredTransport {
                 id,
             };
             if let Some(key) = self.frags.get(&fkey).copied()
-                && let Some(flow) = table_for(&mut self.tcp_flows, &mut self.other_flows, key.proto).get_mut(&key)
+                && let Some(flow) =
+                    table_for(&mut self.tcp_flows, &mut self.other_flows, key.proto).get_mut(&key)
                 && let Some(g) = &flow.guard
             {
                 match dir {
@@ -401,12 +405,8 @@ fn parse_v6(pkt: &[u8]) -> Option<Parsed> {
                     return None;
                 }
                 let frag_off = u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]) >> 3;
-                let id = u32::from_be_bytes([
-                    pkt[off + 4],
-                    pkt[off + 5],
-                    pkt[off + 6],
-                    pkt[off + 7],
-                ]);
+                let id =
+                    u32::from_be_bytes([pkt[off + 4], pkt[off + 5], pkt[off + 6], pkt[off + 7]]);
                 if frag_off != 0 {
                     return Some(Parsed {
                         proto: pkt[off],
@@ -612,21 +612,62 @@ mod tests {
         let server = [93, 184, 216, 34];
 
         // SYN up.
-        r.handle.send(tcp_pkt(client, 50000, server, 443, (true, false, false), b"")).unwrap();
+        r.handle
+            .send(tcp_pkt(
+                client,
+                50000,
+                server,
+                443,
+                (true, false, false),
+                b"",
+            ))
+            .unwrap();
         let syn = r.meter.next().await.unwrap().unwrap();
         let syn_len = syn.len() as u64;
         // SYN-ACK down (establishes).
         r.meter
-            .send(tcp_pkt(server, 443, client, 50000, (true, false, false), b""))
+            .send(tcp_pkt(
+                server,
+                443,
+                client,
+                50000,
+                (true, false, false),
+                b"",
+            ))
             .await
             .unwrap();
         // Data up, then FIN both ways.
-        r.handle.send(tcp_pkt(client, 50000, server, 443, (false, false, false), b"hello")).unwrap();
+        r.handle
+            .send(tcp_pkt(
+                client,
+                50000,
+                server,
+                443,
+                (false, false, false),
+                b"hello",
+            ))
+            .unwrap();
         r.meter.next().await.unwrap().unwrap();
-        r.handle.send(tcp_pkt(client, 50000, server, 443, (false, true, false), b"")).unwrap();
+        r.handle
+            .send(tcp_pkt(
+                client,
+                50000,
+                server,
+                443,
+                (false, true, false),
+                b"",
+            ))
+            .unwrap();
         r.meter.next().await.unwrap().unwrap();
         r.meter
-            .send(tcp_pkt(server, 443, client, 50000, (false, true, false), b""))
+            .send(tcp_pkt(
+                server,
+                443,
+                client,
+                50000,
+                (false, true, false),
+                b"",
+            ))
             .await
             .unwrap();
 
@@ -658,7 +699,10 @@ mod tests {
         assert_eq!(row.dst_port, 443);
         assert_eq!(row.end_reason.as_deref(), Some("fin"));
         assert!(row.established);
-        assert!(!row.confirmed, "meter flows are offered-traffic, not confirmed egress");
+        assert!(
+            !row.confirmed,
+            "meter flows are offered-traffic, not confirmed egress"
+        );
         assert!(row.bytes_up > syn_len, "SYN + data + FIN counted");
         assert!(row.bytes_down > 0);
         drop(rows);
@@ -670,17 +714,35 @@ mod tests {
         let mut r = rig(dir.path());
 
         // Keepalive ping + reply between the synthetic pair: never logged.
-        r.handle.send(icmp_echo([10, 0, 0, 1], [10, 0, 0, 2])).unwrap();
+        r.handle
+            .send(icmp_echo([10, 0, 0, 1], [10, 0, 0, 2]))
+            .unwrap();
         r.meter.next().await.unwrap().unwrap();
-        r.meter.send(icmp_echo([10, 0, 0, 2], [10, 0, 0, 1])).await.unwrap();
+        r.meter
+            .send(icmp_echo([10, 0, 0, 2], [10, 0, 0, 1]))
+            .await
+            .unwrap();
 
         // Real UDP flow.
-        r.handle.send(udp_pkt([10, 0, 85, 2], 40000, [8, 8, 8, 8], 53, b"query")).unwrap();
+        r.handle
+            .send(udp_pkt([10, 0, 85, 2], 40000, [8, 8, 8, 8], 53, b"query"))
+            .unwrap();
         r.meter.next().await.unwrap().unwrap();
-        r.meter.send(udp_pkt([8, 8, 8, 8], 53, [10, 0, 85, 2], 40000, b"answer-bytes")).await.unwrap();
+        r.meter
+            .send(udp_pkt(
+                [8, 8, 8, 8],
+                53,
+                [10, 0, 85, 2],
+                40000,
+                b"answer-bytes",
+            ))
+            .await
+            .unwrap();
 
         // Blocked destination (RFC1918): recorded as blocked, not as egress.
-        r.handle.send(udp_pkt([10, 0, 85, 2], 40001, [192, 168, 1, 1], 53, b"x")).unwrap();
+        r.handle
+            .send(udp_pkt([10, 0, 85, 2], 40001, [192, 168, 1, 1], 53, b"x"))
+            .unwrap();
         r.meter.next().await.unwrap().unwrap();
 
         // Session teardown closes the open UDP flow via guard Drop.
@@ -725,11 +787,27 @@ mod tests {
         let client = [10, 0, 85, 2];
         let server = [203, 0, 113, 80];
 
-        r.handle.send(tcp_pkt(client, 50000, server, 80, (true, false, false), b"")).unwrap();
+        r.handle
+            .send(tcp_pkt(
+                client,
+                50000,
+                server,
+                80,
+                (true, false, false),
+                b"",
+            ))
+            .unwrap();
         r.meter.next().await.unwrap().unwrap();
         // RST from the server side.
         r.meter
-            .send(tcp_pkt(server, 80, client, 50000, (false, false, true), b""))
+            .send(tcp_pkt(
+                server,
+                80,
+                client,
+                50000,
+                (false, false, true),
+                b"",
+            ))
             .await
             .unwrap();
 
@@ -746,7 +824,11 @@ mod tests {
             if rows[0].end_reason.as_deref() == Some("rst") {
                 break;
             }
-            assert!(Instant::now() < deadline, "expected rst close, got {:?}", rows[0].end_reason);
+            assert!(
+                Instant::now() < deadline,
+                "expected rst close, got {:?}",
+                rows[0].end_reason
+            );
             std::thread::sleep(Duration::from_millis(25));
         }
     }

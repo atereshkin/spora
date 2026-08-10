@@ -1,15 +1,15 @@
+use crate::IpTransport;
+use futures_util::{Sink, Stream};
+use log::{debug, info, trace, warn};
 use std::future::Future;
+use std::io;
+use std::net::Ipv4Addr;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use futures_util::{Sink, Stream};
-use std::io;
-use std::pin::Pin;
 use std::task::{Context, Poll};
-use log::{debug, info, trace, warn};
-use tokio::time::{sleep, Sleep};
-use std::net::Ipv4Addr;
 use tokio::time::Instant;
-use crate::IpTransport;
+use tokio::time::{Sleep, sleep};
 
 /// How the keepalive layer decides when to probe.
 #[derive(Clone)]
@@ -123,12 +123,8 @@ enum ModeState {
 fn build_icmp_echo(cfg: &KeepAliveConfig, seq: &mut u16) -> Vec<u8> {
     let payload: [u8; 4] = *b"spka";
     let mut pkt = Vec::with_capacity(64);
-    let builder = etherparse::PacketBuilder::ipv4(
-        cfg.src_ip.octets(),
-        cfg.dst_ip.octets(),
-        64,
-    )
-    .icmpv4_echo_request(cfg.icmp_id, *seq);
+    let builder = etherparse::PacketBuilder::ipv4(cfg.src_ip.octets(), cfg.dst_ip.octets(), 64)
+        .icmpv4_echo_request(cfg.icmp_id, *seq);
 
     *seq = seq.wrapping_add(1);
 
@@ -141,7 +137,11 @@ fn build_icmp_echo(cfg: &KeepAliveConfig, seq: &mut u16) -> Vec<u8> {
 
 /// Try to flush a pending keepalive packet through the inner sink.
 /// Free function to avoid borrow conflicts.
-fn flush_send_state(inner: &mut IpTransport, send_state: &mut KeepAliveSendState, cx: &mut Context<'_>) -> Poll<()> {
+fn flush_send_state(
+    inner: &mut IpTransport,
+    send_state: &mut KeepAliveSendState,
+    cx: &mut Context<'_>,
+) -> Poll<()> {
     loop {
         match send_state {
             KeepAliveSendState::Idle => return Poll::Ready(()),
@@ -215,8 +215,14 @@ pub struct KeepAliveTransport {
 impl KeepAliveTransport {
     pub fn new(inner: IpTransport, cfg: KeepAliveConfig) -> Self {
         let mode_state = match &cfg.mode {
-            KeepAliveMode::Periodic { interval, recv_timeout } => {
-                info!("Keepalive: Periodic mode (interval={:?}, recv_timeout={:?})", interval, recv_timeout);
+            KeepAliveMode::Periodic {
+                interval,
+                recv_timeout,
+            } => {
+                info!(
+                    "Keepalive: Periodic mode (interval={:?}, recv_timeout={:?})",
+                    interval, recv_timeout
+                );
                 ModeState::Periodic {
                     timer: Box::pin(sleep(*interval)),
                     recv_timer: recv_timeout.map(|d| Box::pin(sleep(d))),
@@ -252,7 +258,9 @@ impl KeepAliveTransport {
 
     fn poll_maybe_probe(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match &mut self.mode_state {
-            ModeState::Periodic { timer, interval, .. } => {
+            ModeState::Periodic {
+                timer, interval, ..
+            } => {
                 if matches!(self.send_state, KeepAliveSendState::Idle) {
                     if let Poll::Ready(()) = timer.as_mut().poll(cx) {
                         let pkt = build_icmp_echo(&self.cfg, &mut self.seq);
@@ -283,7 +291,10 @@ impl KeepAliveTransport {
                             *waker.lock().unwrap() = Some(cx.waker().clone());
                         }
                     }
-                    ProbeState::Probing { ping_timer, response_deadline } => {
+                    ProbeState::Probing {
+                        ping_timer,
+                        response_deadline,
+                    } => {
                         // knob == 0 means screen OFF — go dormant immediately.
                         if knob_val == 0 {
                             info!("Keepalive: Probing -> Dormant (knob set to 0)");
@@ -298,7 +309,9 @@ impl KeepAliveTransport {
                                 debug!("Keepalive: ping timer fired, sending ICMP echo");
                                 self.send_state = KeepAliveSendState::Sending(pkt);
                                 ping_timer.as_mut().reset(Instant::now() + interval);
-                                response_deadline.as_mut().reset(Instant::now() + self.cfg.response_timeout);
+                                response_deadline
+                                    .as_mut()
+                                    .reset(Instant::now() + self.cfg.response_timeout);
                             }
                         }
                     }
@@ -311,12 +324,14 @@ impl KeepAliveTransport {
 
     fn on_outbound(&mut self) {
         match &mut self.mode_state {
-            ModeState::Periodic { timer, interval, .. } => {
+            ModeState::Periodic {
+                timer, interval, ..
+            } => {
                 timer.as_mut().reset(Instant::now() + *interval);
             }
             ModeState::Adaptive { knob, state, .. } => {
-                let was_idle =
-                    Instant::now().duration_since(state.last_real_outbound) > self.cfg.idle_threshold;
+                let was_idle = Instant::now().duration_since(state.last_real_outbound)
+                    > self.cfg.idle_threshold;
                 state.last_real_outbound = Instant::now();
 
                 if matches!(state.probe, ProbeState::Dormant) && was_idle {
@@ -342,7 +357,12 @@ impl KeepAliveTransport {
 
     fn on_inbound(&mut self) {
         match &mut self.mode_state {
-            ModeState::Periodic { timer, recv_timer, interval, recv_timeout } => {
+            ModeState::Periodic {
+                timer,
+                recv_timer,
+                interval,
+                recv_timeout,
+            } => {
                 timer.as_mut().reset(Instant::now() + *interval);
                 if let (Some(rt), Some(timeout)) = (recv_timer.as_mut(), recv_timeout) {
                     rt.as_mut().reset(Instant::now() + *timeout);
@@ -365,11 +385,18 @@ impl KeepAliveTransport {
     /// Check if peer appears dead. Returns true if we should yield None.
     fn check_dead(&mut self, cx: &mut Context<'_>) -> Option<Poll<Option<io::Result<Vec<u8>>>>> {
         match &mut self.mode_state {
-            ModeState::Periodic { recv_timer, recv_timeout, .. } => {
+            ModeState::Periodic {
+                recv_timer,
+                recv_timeout,
+                ..
+            } => {
                 if let Some(rt) = recv_timer.as_mut() {
                     match rt.as_mut().poll(cx) {
                         Poll::Ready(_) => {
-                            warn!("No inbound traffic for {:?}, peer appears dead", recv_timeout);
+                            warn!(
+                                "No inbound traffic for {:?}, peer appears dead",
+                                recv_timeout
+                            );
                             Some(Poll::Ready(None))
                         }
                         Poll::Pending => None,
@@ -379,14 +406,23 @@ impl KeepAliveTransport {
                 }
             }
             ModeState::Adaptive { state, .. } => {
-                if let ProbeState::Probing { response_deadline, .. } = &mut state.probe {
+                if let ProbeState::Probing {
+                    response_deadline, ..
+                } = &mut state.probe
+                {
                     if let Poll::Ready(()) = response_deadline.as_mut().poll(cx) {
                         if !state.ever_received {
                             // Connection not yet proven alive — keep probing but don't
                             // declare dead. The relay handshake may still be in progress.
-                            debug!("Keepalive: response deadline fired but no inbound yet, waiting");
-                            response_deadline.as_mut().reset(Instant::now() + self.cfg.response_timeout);
-                        } else if Instant::now().duration_since(state.last_inbound) > self.cfg.inbound_grace {
+                            debug!(
+                                "Keepalive: response deadline fired but no inbound yet, waiting"
+                            );
+                            response_deadline
+                                .as_mut()
+                                .reset(Instant::now() + self.cfg.response_timeout);
+                        } else if Instant::now().duration_since(state.last_inbound)
+                            > self.cfg.inbound_grace
+                        {
                             if !state.rescue_sent {
                                 // First miss — send a rescue ping through the current transport.
                                 // This handles transport upgrades where the inner connection
@@ -397,16 +433,23 @@ impl KeepAliveTransport {
                                     self.send_state = KeepAliveSendState::Sending(pkt);
                                 }
                                 state.rescue_sent = true;
-                                response_deadline.as_mut().reset(Instant::now() + self.cfg.response_timeout);
+                                response_deadline
+                                    .as_mut()
+                                    .reset(Instant::now() + self.cfg.response_timeout);
                             } else {
-                                warn!("Keepalive: peer dead (no response to rescue ping, no inbound for {:?})", self.cfg.inbound_grace);
+                                warn!(
+                                    "Keepalive: peer dead (no response to rescue ping, no inbound for {:?})",
+                                    self.cfg.inbound_grace
+                                );
                                 return Some(Poll::Ready(None));
                             }
                         } else {
                             // Peer responded to our ping (last_inbound is recent).
                             // Park the deadline until the next ping_timer fires and
                             // resets it — don't keep re-checking every 3s.
-                            response_deadline.as_mut().reset(Instant::now() + std::time::Duration::from_secs(3600));
+                            response_deadline
+                                .as_mut()
+                                .reset(Instant::now() + std::time::Duration::from_secs(3600));
                         }
                     }
                 }
@@ -476,7 +519,7 @@ impl Sink<Vec<u8>> for KeepAliveTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::transport::mock::{mock_transport, mock_transport_pair, is_icmp_echo_request};
+    use crate::transport::mock::{is_icmp_echo_request, mock_transport, mock_transport_pair};
     use futures_util::{SinkExt, StreamExt};
 
     // =====================================================================
@@ -518,7 +561,11 @@ mod tests {
             .expect("should receive keepalive packet")
             .unwrap()
             .unwrap();
-        assert!(is_icmp_echo_request(&pkt), "expected ICMP echo request, got {:?}", &pkt[..pkt.len().min(24)]);
+        assert!(
+            is_icmp_echo_request(&pkt),
+            "expected ICMP echo request, got {:?}",
+            &pkt[..pkt.len().min(24)]
+        );
     }
 
     #[tokio::test]
@@ -537,8 +584,12 @@ mod tests {
 
         tokio::time::advance(std::time::Duration::from_secs(3)).await;
 
-        let result = tokio::time::timeout(std::time::Duration::from_millis(10), remote.next()).await;
-        assert!(result.is_err(), "should not have received keepalive yet (timer was reset)");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(10), remote.next()).await;
+        assert!(
+            result.is_err(),
+            "should not have received keepalive yet (timer was reset)"
+        );
 
         tokio::time::advance(std::time::Duration::from_secs(3)).await;
 
@@ -572,8 +623,12 @@ mod tests {
 
         tokio::time::advance(std::time::Duration::from_secs(3)).await;
 
-        let result = tokio::time::timeout(std::time::Duration::from_millis(10), handle.recv()).await;
-        assert!(result.is_err(), "should not have received keepalive yet (timer was reset by outbound)");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(10), handle.recv()).await;
+        assert!(
+            result.is_err(),
+            "should not have received keepalive yet (timer was reset by outbound)"
+        );
 
         tokio::time::advance(std::time::Duration::from_secs(3)).await;
 
@@ -636,7 +691,10 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(10)).await;
 
         let result = tokio::time::timeout(std::time::Duration::from_millis(10), ka.next()).await;
-        assert!(result.is_err(), "should still be pending (recv timer was reset)");
+        assert!(
+            result.is_err(),
+            "should still be pending (recv timer was reset)"
+        );
 
         tokio::time::advance(std::time::Duration::from_secs(6)).await;
 
@@ -670,7 +728,10 @@ mod tests {
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), ka.next()).await;
         match result {
             Ok(None) => {}
-            other => panic!("expected None (outbound shouldn't reset recv timer), got {:?}", other),
+            other => panic!(
+                "expected None (outbound shouldn't reset recv timer), got {:?}",
+                other
+            ),
         }
     }
 
@@ -710,8 +771,12 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(120)).await;
         drive_poll(&mut ka).await;
 
-        let result = tokio::time::timeout(std::time::Duration::from_millis(10), handle.recv()).await;
-        assert!(result.is_err(), "should not receive any pings while dormant");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(10), handle.recv()).await;
+        assert!(
+            result.is_err(),
+            "should not receive any pings while dormant"
+        );
     }
 
     #[tokio::test]
@@ -770,8 +835,12 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(60)).await;
         drive_poll(&mut ka).await;
 
-        let result = tokio::time::timeout(std::time::Duration::from_millis(10), handle.recv()).await;
-        assert!(result.is_err(), "should not receive pings after going dormant");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(10), handle.recv()).await;
+        assert!(
+            result.is_err(),
+            "should not receive pings after going dormant"
+        );
     }
 
     #[tokio::test]
@@ -835,7 +904,10 @@ mod tests {
         // Advance a bit more — should still be alive.
         tokio::time::advance(RESPONSE_TIMEOUT + std::time::Duration::from_secs(1)).await;
         let result = tokio::time::timeout(std::time::Duration::from_millis(10), ka.next()).await;
-        assert!(result.is_err(), "should still be alive after rescue ping was answered");
+        assert!(
+            result.is_err(),
+            "should still be alive after rescue ping was answered"
+        );
     }
 
     #[tokio::test]
@@ -856,7 +928,10 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(60)).await;
 
         let result = tokio::time::timeout(std::time::Duration::from_millis(100), ka.next()).await;
-        assert!(result.is_err(), "should NOT declare peer dead before first inbound packet");
+        assert!(
+            result.is_err(),
+            "should NOT declare peer dead before first inbound packet"
+        );
     }
 
     #[tokio::test]
@@ -884,7 +959,10 @@ mod tests {
 
         // Should still be alive since we got inbound traffic.
         let result = tokio::time::timeout(std::time::Duration::from_millis(10), ka.next()).await;
-        assert!(result.is_err(), "should still be pending (inbound traffic reset deadline)");
+        assert!(
+            result.is_err(),
+            "should still be pending (inbound traffic reset deadline)"
+        );
     }
 
     #[tokio::test]
@@ -932,7 +1010,8 @@ mod tests {
         // Dormant initially — no pings.
         tokio::time::advance(std::time::Duration::from_secs(5)).await;
         drive_poll(&mut ka).await;
-        let result = tokio::time::timeout(std::time::Duration::from_millis(10), handle.recv()).await;
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(10), handle.recv()).await;
         assert!(result.is_err(), "should be dormant");
 
         // Switch knob to 20 (screen on).
@@ -971,8 +1050,11 @@ mod tests {
         tokio::time::advance(std::time::Duration::from_secs(60)).await;
         drive_poll(&mut ka).await;
 
-        let result = tokio::time::timeout(std::time::Duration::from_millis(10), handle.recv()).await;
-        assert!(result.is_err(), "should not ping after switching to on-demand and going idle");
+        let result =
+            tokio::time::timeout(std::time::Duration::from_millis(10), handle.recv()).await;
+        assert!(
+            result.is_err(),
+            "should not ping after switching to on-demand and going idle"
+        );
     }
-
 }

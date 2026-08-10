@@ -1,11 +1,11 @@
 mod carrier;
-mod neg;
-mod reassembly;
 pub mod connlog;
 pub mod e2e;
 pub mod e2e_noise;
 pub mod e2e_tls;
 pub mod identity;
+mod neg;
+mod reassembly;
 pub mod server;
 pub mod signal;
 pub mod transport;
@@ -29,16 +29,16 @@ use url::Url;
 
 use crate::connlog::{AddrKind, ConnLog, ConnLogConfig, SessionLog};
 use crate::e2e::{authenticate_incoming, client_connect, client_endpoint, server_endpoint};
-use crate::identity::{Identity, RelayEndpoint, RelayProtocol, Token, ROUTING_KEY_LEN, SECRET_LEN};
+use crate::identity::{Identity, ROUTING_KEY_LEN, RelayEndpoint, RelayProtocol, SECRET_LEN, Token};
 use crate::neg::{NegChannel, SignalNegChannel};
 use crate::server::TunnelError;
-use crate::signal::SignalChannel;
-use crate::transport::keepalive::{KeepAliveConfig, KeepAliveMode, KeepAliveTransport};
-use crate::transport::upgradable::{upgradable_transport, UpgradeSender};
-use crate::transport::DialFuture;
-use crate::transport::ReconnectTransport;
 pub use crate::server::is_local_address;
+use crate::signal::SignalChannel;
+use crate::transport::DialFuture;
 pub use crate::transport::IpTransport;
+use crate::transport::ReconnectTransport;
+use crate::transport::keepalive::{KeepAliveConfig, KeepAliveMode, KeepAliveTransport};
+use crate::transport::upgradable::{UpgradeSender, upgradable_transport};
 /// Capability-token authorization helpers (issuer keys, token encode/decode).
 /// Re-exported so platform front-ends can present a `Config::relay_token`
 /// without depending on `relay-client` directly.
@@ -58,7 +58,8 @@ pub type SessionFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
 /// Receives the fully composed session transport (keepalive + upgradable +
 /// QUIC) and a token that is cancelled when a new peer replaces this session
 /// or the share stops.
-pub type SessionHandler = Arc<dyn Fn(IpTransport, CancellationToken) -> SessionFuture + Send + Sync>;
+pub type SessionHandler =
+    Arc<dyn Fn(IpTransport, CancellationToken) -> SessionFuture + Send + Sync>;
 
 /// How the share side turns tunneled IP packets into real traffic.
 #[derive(Clone, Default)]
@@ -297,7 +298,10 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     let register_addrs: Vec<SocketAddr> = if udp_relays.is_empty() {
         Vec::new()
     } else {
-        resolve_relays(&udp_relays)?.into_iter().map(|(a, _)| a).collect()
+        resolve_relays(&udp_relays)?
+            .into_iter()
+            .map(|(a, _)| a)
+            .collect()
     };
 
     // A `Direct` (relay-less) sharer must bind the advertised port so clients
@@ -326,9 +330,10 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     // — resolving the advertised name here (which may be external-only) is
     // avoided, so a dual-stack socket serves whichever family the client picks.
     let want_v6 = register_addrs.iter().any(|a| a.is_ipv6())
-        || config.relays.iter().any(|r| {
-            !r.protocol.is_relayed() && r.host.parse::<std::net::Ipv4Addr>().is_err()
-        });
+        || config
+            .relays
+            .iter()
+            .any(|r| !r.protocol.is_relayed() && r.host.parse::<std::net::Ipv4Addr>().is_err());
     let std_socket = bind_share_udp(&config.protector, want_v6, bind_port)?;
     let std_clone = std_socket
         .try_clone()
@@ -352,10 +357,12 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     // Sign each relay registration with the identity's certificate key, so the
     // relay (which holds no secret) can verify the routing key is ours and
     // reject an on-path attacker's attempt to rebind it.
-    let signer =
-        relay_client::protocol::RegisterSigner::new(&identity.cert_der_bytes, &identity.key_der_bytes)
-            .map_err(|e| format!("build register signer: {}", e))?
-            .with_token(config.relay_token.clone());
+    let signer = relay_client::protocol::RegisterSigner::new(
+        &identity.cert_der_bytes,
+        &identity.key_der_bytes,
+    )
+    .map_err(|e| format!("build register signer: {}", e))?
+    .with_token(config.relay_token.clone());
 
     // Connection log: opened before the share goes live, so a default-on log
     // that cannot be written fails here loudly instead of running unlogged.
@@ -662,8 +669,11 @@ async fn noise_accept_dispatcher(
 
         // 2) A handshake msg1 addressed to us (routing_key prefix)?
         if clean.len() >= NZ_MSG1_MIN && clean[0..ROUTING_KEY_LEN] == identity.routing_key {
-            let idx_b =
-                u32::from_be_bytes(clean[ROUTING_KEY_LEN..ROUTING_KEY_LEN + 4].try_into().unwrap());
+            let idx_b = u32::from_be_bytes(
+                clean[ROUTING_KEY_LEN..ROUTING_KEY_LEN + 4]
+                    .try_into()
+                    .unwrap(),
+            );
             if let Some(&idx_a) = by_client.get(&idx_b) {
                 if let Some(tx) = by_index.get(&idx_a) {
                     let _ = tx.send((clean.clone(), src)); // retransmit -> same session
@@ -696,7 +706,9 @@ async fn noise_accept_dispatcher(
                 match noise_accept(sock, rx, idx_a, None, id.as_ref(), hs_timeout, idle).await {
                     Ok(mut transport) => {
                         let remote_addr = transport.peer_addr();
-                        let signal = transport.take_signal().map(crate::signal::SignalChannel::noise);
+                        let signal = transport
+                            .take_signal()
+                            .map(crate::signal::SignalChannel::noise);
                         let _ = stx.send(carrier::PeerSession {
                             transport: Box::new(transport),
                             remote_addr,
@@ -735,12 +747,22 @@ async fn run_share_loop(
 
     // Sharer-side TCP/TLS carrier: park connections at each TcpTls relay and
     // deliver each spliced client as a session into the same channel.
-    spawn_tcp_registrars(&config, identity.clone(), session_tx.clone(), cancel.clone());
+    spawn_tcp_registrars(
+        &config,
+        identity.clone(),
+        session_tx.clone(),
+        cancel.clone(),
+    );
 
     // Sharer-side Noise UDP carrier: register each NoiseUdp relay from a
     // dedicated socket and deliver each authenticated client into the same
     // channel. No-op when the config lists no NoiseUdp relay.
-    spawn_noise_registrar(&config, identity.clone(), session_tx.clone(), cancel.clone());
+    spawn_noise_registrar(
+        &config,
+        identity.clone(),
+        session_tx.clone(),
+        cancel.clone(),
+    );
 
     info!("[share] waiting for peers");
     loop {
@@ -822,10 +844,8 @@ fn spawn_responder_tunnel(
     // The meter (Custom exit mode) must ignore the synthetic keepalive pings
     // riding the tunnel; tell it which inner address pair they use.
     let keepalive_pair = (keepalive_cfg.src_ip, keepalive_cfg.dst_ip);
-    let transport: IpTransport = Box::new(KeepAliveTransport::new(
-        Box::new(upgradable),
-        keepalive_cfg,
-    ));
+    let transport: IpTransport =
+        Box::new(KeepAliveTransport::new(Box::new(upgradable), keepalive_cfg));
 
     let protector_for_tunnel = config.protector.clone();
     let upgrade_cancel = tunnel_cancel.clone();
@@ -1058,9 +1078,8 @@ async fn dial_relays(
             }
         }
     }
-    Err(last_err.unwrap_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "no relays to dial")
-    }))
+    Err(last_err
+        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no relays to dial")))
 }
 
 async fn dial_initiator(
@@ -1146,8 +1165,7 @@ async fn dial_initiator(
     // no QUIC signal channel and no UDP path to punch. Skipping for Direct also
     // drops the signal now, so the sharer's responder upgrade hits EOF on its
     // first recv_endpoint and stops *before* it ever STUNs.
-    let attempt_upgrade =
-        config.enable_direct_upgrade && protocol.is_relayed() && signal.is_some();
+    let attempt_upgrade = config.enable_direct_upgrade && protocol.is_relayed() && signal.is_some();
     if attempt_upgrade {
         let signal = signal.expect("attempt_upgrade requires a signal channel");
         let role = DirectRole::Initiator {
@@ -1250,9 +1268,7 @@ impl DirectError {
 /// anyway. A garbled endpoint *payload* (`ProtocolError`) is transient.
 fn neg_err(e: TunnelError) -> DirectError {
     match e {
-        TunnelError::NegChannelClosed => {
-            DirectError::SignalClosed("signal channel closed".into())
-        }
+        TunnelError::NegChannelClosed => DirectError::SignalClosed("signal channel closed".into()),
         other => DirectError::Transient(format!("{:?}", other)),
     }
 }
@@ -1297,9 +1313,7 @@ pub(crate) async fn try_direct_upgrade(
             return;
         }
 
-        if initiator
-            && let Some(ref knob) = keepalive_knob
-        {
+        if initiator && let Some(ref knob) = keepalive_knob {
             let knob_val = knob.load(std::sync::atomic::Ordering::Relaxed);
             let active = knob_val > 0;
             if active && !was_active {
@@ -1452,9 +1466,7 @@ async fn try_direct_as_initiator(
         neg.send_endpoint(external_addr).await.map_err(neg_err)?;
         tokio::time::timeout(timings.endpoint_exchange_timeout, neg.recv_endpoint())
             .await
-            .map_err(|_| {
-                DirectError::Transient("timed out waiting for peer endpoint".to_string())
-            })?
+            .map_err(|_| DirectError::Transient("timed out waiting for peer endpoint".to_string()))?
             .map_err(neg_err)?
     };
     // The punch socket's family is fixed by our STUN result; a peer endpoint
@@ -1687,7 +1699,10 @@ async fn try_direct_as_responder(
 /// separate relays.
 fn resolve_one_relay(relay: &RelayEndpoint) -> Result<Vec<SocketAddr>, String> {
     let host = &relay.host;
-    let bare = host.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host);
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
     if let Ok(ip) = bare.parse::<std::net::IpAddr>() {
         return Ok(vec![SocketAddr::new(ip, relay.port)]);
     }
@@ -1795,14 +1810,17 @@ fn bind_share_udp(
 /// protector, and return it as a `std::net::UdpSocket` ready for handoff to
 /// quinn. The client uses this per relay-dial attempt, so the punch family
 /// matches the relay family unambiguously (no v4-mapped guessing).
-pub(crate) fn bind_local_udp(protector: &SocketProtector, peer: SocketAddr) -> Result<std::net::UdpSocket, String> {
+pub(crate) fn bind_local_udp(
+    protector: &SocketProtector,
+    peer: SocketAddr,
+) -> Result<std::net::UdpSocket, String> {
     let wildcard: SocketAddr = if peer.is_ipv6() {
         (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
     } else {
         (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
     };
-    let std = std::net::UdpSocket::bind(wildcard)
-        .map_err(|e| format!("bind UDP {}: {}", wildcard, e))?;
+    let std =
+        std::net::UdpSocket::bind(wildcard).map_err(|e| format!("bind UDP {}: {}", wildcard, e))?;
     std.set_nonblocking(true)
         .map_err(|e| format!("set_nonblocking: {}", e))?;
     tune_udp_buffers(&std);
@@ -1831,7 +1849,10 @@ fn punch_markers(secret: &[u8; SECRET_LEN]) -> ([u8; PUNCH_MARKER_LEN], [u8; PUN
         marker.copy_from_slice(&digest.as_ref()[..PUNCH_MARKER_LEN]);
         marker
     };
-    (derive(b"spora-punch-v1-probe"), derive(b"spora-punch-v1-verify"))
+    (
+        derive(b"spora-punch-v1-probe"),
+        derive(b"spora-punch-v1-verify"),
+    )
 }
 
 /// Cap on peer-reflexive sources learned during a single punch exchange. A
@@ -2038,7 +2059,11 @@ mod tests {
             let s = SocketAddr::from(([10, 0, (i >> 8) as u8, i as u8], 9));
             record_punch_source(&mut learned, &mut targets, s);
         }
-        assert_eq!(learned.len(), MAX_PUNCH_SOURCES, "learned is bounded by the cap");
+        assert_eq!(
+            learned.len(),
+            MAX_PUNCH_SOURCES,
+            "learned is bounded by the cap"
+        );
         let flood: SocketAddr = "9.9.9.9:9".parse().unwrap();
         assert!(!record_punch_source(&mut learned, &mut targets, flood));
         assert_eq!(learned.len(), MAX_PUNCH_SOURCES);
@@ -2068,7 +2093,10 @@ mod tests {
         let b_endpoint = client_endpoint(b_std, identity.routing_key, &timings).unwrap();
 
         let accept_task = tokio::spawn(async move {
-            accept_one(&a_endpoint, &secret, false).await.unwrap().unwrap()
+            accept_one(&a_endpoint, &secret, false)
+                .await
+                .unwrap()
+                .unwrap()
         });
         let b_session = client_connect(&b_endpoint, a_addr, &secret, false)
             .await

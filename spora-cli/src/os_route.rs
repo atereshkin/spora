@@ -35,7 +35,7 @@ use std::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, trace, warn};
-use spora_core::{is_local_address, CancellationToken, IpTransport, SessionFuture, SessionHandler};
+use spora_core::{CancellationToken, IpTransport, SessionFuture, SessionHandler, is_local_address};
 use tokio_tun::Tun;
 
 /// Upper bound on learned client addresses. Sessions are sequential, but a
@@ -63,9 +63,12 @@ impl Options {
         mtu: u16,
         configure_nat: bool,
     ) -> Result<Self, String> {
-        let (addr, prefix) = tun_addr
-            .split_once('/')
-            .ok_or_else(|| format!("--tun-addr must be CIDR (e.g. 10.213.0.1/24), got {}", tun_addr))?;
+        let (addr, prefix) = tun_addr.split_once('/').ok_or_else(|| {
+            format!(
+                "--tun-addr must be CIDR (e.g. 10.213.0.1/24), got {}",
+                tun_addr
+            )
+        })?;
         let addr: Ipv4Addr = addr
             .parse()
             .map_err(|e| format!("bad --tun-addr address: {}", e))?;
@@ -73,10 +76,16 @@ impl Options {
             .parse()
             .map_err(|e| format!("bad --tun-addr prefix length: {}", e))?;
         if !(8..=30).contains(&prefix_len) {
-            return Err(format!("--tun-addr prefix length must be 8..=30, got {}", prefix_len));
+            return Err(format!(
+                "--tun-addr prefix length must be 8..=30, got {}",
+                prefix_len
+            ));
         }
         let (addr6, prefix6) = tun_addr6.split_once('/').ok_or_else(|| {
-            format!("--tun-addr6 must be CIDR (e.g. fd00:5350::1/64), got {}", tun_addr6)
+            format!(
+                "--tun-addr6 must be CIDR (e.g. fd00:5350::1/64), got {}",
+                tun_addr6
+            )
         })?;
         let addr6: Ipv6Addr = addr6
             .parse()
@@ -95,7 +104,10 @@ impl Options {
         // address would be unreachable from the tunnel while shadowing a real
         // v6 prefix on the host. Refuse it.
         if !is_ula_client_source(addr6) {
-            return Err(format!("--tun-addr6 must be inside fc00::/7 (ULA), got {}", addr6));
+            return Err(format!(
+                "--tun-addr6 must be inside fc00::/7 (ULA), got {}",
+                addr6
+            ));
         }
         if !(576..=9000).contains(&mtu) {
             return Err(format!("--tun-mtu must be 576..=9000, got {}", mtu));
@@ -171,7 +183,10 @@ impl OsRoute {
         // `nodad` because there is no other host on this point-to-point link to
         // duplicate. No undo needed: the address dies with the device.
         let addr6 = format!("{}/{}", opts.addr6, opts.prefix6_len);
-        run_cmd("ip", &svec(&["-6", "addr", "add", &addr6, "dev", tun.name(), "nodad"]));
+        run_cmd(
+            "ip",
+            &svec(&["-6", "addr", "add", &addr6, "dev", tun.name(), "nodad"]),
+        );
         // Quiet the kernel's v6 autoconf on the TUN (link-local generation,
         // router solicitations). Belt-and-braces — the pump filters link-scope
         // frames anyway — and best-effort: older kernels lack addr_gen_mode.
@@ -237,22 +252,78 @@ impl OsRoute {
                 ),
                 (
                     svec(&[
-                        "-w", "-t", "mangle", "-A", "FORWARD", "-i", &tun, "-p", "tcp",
-                        "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", &mss,
+                        "-w",
+                        "-t",
+                        "mangle",
+                        "-A",
+                        "FORWARD",
+                        "-i",
+                        &tun,
+                        "-p",
+                        "tcp",
+                        "--tcp-flags",
+                        "SYN,RST",
+                        "SYN",
+                        "-j",
+                        "TCPMSS",
+                        "--set-mss",
+                        &mss,
                     ]),
                     svec(&[
-                        "-w", "-t", "mangle", "-D", "FORWARD", "-i", &tun, "-p", "tcp",
-                        "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", &mss,
+                        "-w",
+                        "-t",
+                        "mangle",
+                        "-D",
+                        "FORWARD",
+                        "-i",
+                        &tun,
+                        "-p",
+                        "tcp",
+                        "--tcp-flags",
+                        "SYN,RST",
+                        "SYN",
+                        "-j",
+                        "TCPMSS",
+                        "--set-mss",
+                        &mss,
                     ]),
                 ),
                 (
                     svec(&[
-                        "-w", "-t", "mangle", "-A", "FORWARD", "-o", &tun, "-p", "tcp",
-                        "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", &mss,
+                        "-w",
+                        "-t",
+                        "mangle",
+                        "-A",
+                        "FORWARD",
+                        "-o",
+                        &tun,
+                        "-p",
+                        "tcp",
+                        "--tcp-flags",
+                        "SYN,RST",
+                        "SYN",
+                        "-j",
+                        "TCPMSS",
+                        "--set-mss",
+                        &mss,
                     ]),
                     svec(&[
-                        "-w", "-t", "mangle", "-D", "FORWARD", "-o", &tun, "-p", "tcp",
-                        "--tcp-flags", "SYN,RST", "SYN", "-j", "TCPMSS", "--set-mss", &mss,
+                        "-w",
+                        "-t",
+                        "mangle",
+                        "-D",
+                        "FORWARD",
+                        "-o",
+                        &tun,
+                        "-p",
+                        "tcp",
+                        "--tcp-flags",
+                        "SYN,RST",
+                        "SYN",
+                        "-j",
+                        "TCPMSS",
+                        "--set-mss",
+                        &mss,
                     ]),
                 ),
             ];
@@ -374,19 +445,43 @@ impl Shared {
             );
             return;
         }
-        info!("os-routing: learned client address {}, installing return route", ip);
+        info!(
+            "os-routing: learned client address {}, installing return route",
+            ip
+        );
         let dst = host_dst(ip);
         let nat = nat_cmd(ip);
         // No undo needed: the route is bound to the TUN device and dies with it.
         run_cmd_async("ip", ip_route_args(ip, "replace", &dst, &self.tun_name)).await;
         if self.configure_nat {
             let add = svec(&[
-                "-w", "-t", "nat", "-I", "POSTROUTING", "1", "-s", &dst, "!", "-o",
-                &self.tun_name, "-j", "MASQUERADE",
+                "-w",
+                "-t",
+                "nat",
+                "-I",
+                "POSTROUTING",
+                "1",
+                "-s",
+                &dst,
+                "!",
+                "-o",
+                &self.tun_name,
+                "-j",
+                "MASQUERADE",
             ]);
             let del = svec(&[
-                "-w", "-t", "nat", "-D", "POSTROUTING", "-s", &dst, "!", "-o", &self.tun_name,
-                "-j", "MASQUERADE",
+                "-w",
+                "-t",
+                "nat",
+                "-D",
+                "POSTROUTING",
+                "-s",
+                &dst,
+                "!",
+                "-o",
+                &self.tun_name,
+                "-j",
+                "MASQUERADE",
             ]);
             if run_cmd_async(nat, add).await {
                 // Race with cleanup(): it sets `shutting_down` *before* draining
@@ -405,7 +500,10 @@ impl Shared {
                     Err(_) => true, // poisoned: remove defensively
                 };
                 if delete_now {
-                    warn!("os-routing: shutting down, removing just-added MASQUERADE for {}", ip);
+                    warn!(
+                        "os-routing: shutting down, removing just-added MASQUERADE for {}",
+                        ip
+                    );
                     run_cmd_async(nat, del).await;
                 }
             }
@@ -420,15 +518,28 @@ impl Shared {
             reserve_peer_slot(&mut peers, ip, Instant::now(), MAX_PEERS)
         };
         if let Some(victim) = evicted {
-            info!("os-routing: peer table full, evicting least-recently-active {}", victim);
+            info!(
+                "os-routing: peer table full, evicting least-recently-active {}",
+                victim
+            );
             let vdst = host_dst(victim);
             run_cmd_async("ip", ip_route_args(victim, "del", &vdst, &self.tun_name)).await;
             if self.configure_nat {
                 run_cmd_async(
                     nat_cmd(victim),
                     svec(&[
-                        "-w", "-t", "nat", "-D", "POSTROUTING", "-s", &vdst, "!", "-o",
-                        &self.tun_name, "-j", "MASQUERADE",
+                        "-w",
+                        "-t",
+                        "nat",
+                        "-D",
+                        "POSTROUTING",
+                        "-s",
+                        &vdst,
+                        "!",
+                        "-o",
+                        &self.tun_name,
+                        "-j",
+                        "MASQUERADE",
                     ]),
                 )
                 .await;
@@ -447,7 +558,11 @@ fn host_dst(ip: IpAddr) -> String {
 
 /// The NAT frontend for the peer's family; both take the same rule syntax.
 fn nat_cmd(ip: IpAddr) -> &'static str {
-    if ip.is_ipv4() { "iptables" } else { "ip6tables" }
+    if ip.is_ipv4() {
+        "iptables"
+    } else {
+        "ip6tables"
+    }
 }
 
 /// `ip route <verb> <dst> dev <tun>`, with the `-6` family selector for v6.
@@ -522,11 +637,15 @@ fn route_table_conflicts(routes: &str, ip: IpAddr, tun: &str) -> bool {
         }
         let covers = match ip {
             IpAddr::V4(ip) => {
-                let Some((net, plen)) = parse_ipv4_prefix(prefix) else { continue };
+                let Some((net, plen)) = parse_ipv4_prefix(prefix) else {
+                    continue;
+                };
                 plen != 0 && ipv4_in_prefix(ip, net, plen)
             }
             IpAddr::V6(ip) => {
-                let Some((net, plen)) = parse_ipv6_prefix(prefix) else { continue };
+                let Some((net, plen)) = parse_ipv6_prefix(prefix) else {
+                    continue;
+                };
                 // The kernel puts fe80::/64 on every interface; it can never
                 // cover a ULA client source, so don't let it read as one.
                 if (net.segments()[0] & 0xFFC0) == 0xFE80 {
@@ -782,7 +901,10 @@ async fn pump<D: ExitDevice>(
             },
         }
     }
-    info!("os-routing: session pump ended (client->kernel {} pkts, kernel->client {} pkts)", rx, tx);
+    info!(
+        "os-routing: session pump ended (client->kernel {} pkts, kernel->client {} pkts)",
+        rx, tx
+    );
 }
 
 /// Should a frame read from the TUN be forwarded to the client? IPv4 always
@@ -1112,8 +1234,10 @@ mod tests {
     #[test]
     fn checksum_known_vector() {
         // Example from RFC 1071 / common references.
-        let data = [0x45u8, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00,
-                    0xc0, 0xa8, 0x00, 0x01, 0xc0, 0xa8, 0x00, 0xc7];
+        let data = [
+            0x45u8, 0x00, 0x00, 0x73, 0x00, 0x00, 0x40, 0x00, 0x40, 0x11, 0x00, 0x00, 0xc0, 0xa8,
+            0x00, 0x01, 0xc0, 0xa8, 0x00, 0xc7,
+        ];
         assert_eq!(inet_checksum(&data), 0xb861);
     }
 
@@ -1248,12 +1372,22 @@ mod tests {
         ));
         // Keepalive ping to a ULA destination → answered locally.
         assert!(matches!(
-            classify(&icmpv6_echo_request("fd00:5350::2", "fd00:5350::1", 0x5350, 1)),
+            classify(&icmpv6_echo_request(
+                "fd00:5350::2",
+                "fd00:5350::1",
+                0x5350,
+                1
+            )),
             Verdict::ReplyEcho(_)
         ));
         // Ping to a global destination → forwarded like normal traffic.
         assert!(matches!(
-            classify(&icmpv6_echo_request("fd00:5350::2", "2606:4700::1111", 1, 1)),
+            classify(&icmpv6_echo_request(
+                "fd00:5350::2",
+                "2606:4700::1111",
+                1,
+                1
+            )),
             Verdict::Forward(_)
         ));
         // Public (global) SOURCE → dropped: it would otherwise earn a /128
@@ -1275,25 +1409,68 @@ mod tests {
 
     #[test]
     fn private_client_source_ranges() {
-        for ip in [[10, 0, 0, 1], [10, 0, 85, 1], [172, 16, 0, 1], [172, 31, 255, 9],
-                   [192, 168, 1, 1], [100, 64, 0, 1], [100, 127, 255, 1]] {
-            assert!(is_private_client_source(Ipv4Addr::from(ip)), "{:?} should be allowed", ip);
+        for ip in [
+            [10, 0, 0, 1],
+            [10, 0, 85, 1],
+            [172, 16, 0, 1],
+            [172, 31, 255, 9],
+            [192, 168, 1, 1],
+            [100, 64, 0, 1],
+            [100, 127, 255, 1],
+        ] {
+            assert!(
+                is_private_client_source(Ipv4Addr::from(ip)),
+                "{:?} should be allowed",
+                ip
+            );
         }
-        for ip in [[8, 8, 8, 8], [1, 1, 1, 1], [172, 15, 0, 1], [172, 32, 0, 1],
-                   [100, 63, 0, 1], [100, 128, 0, 1], [169, 254, 0, 1], [127, 0, 0, 1],
-                   [192, 167, 0, 1], [11, 0, 0, 1]] {
-            assert!(!is_private_client_source(Ipv4Addr::from(ip)), "{:?} should be refused", ip);
+        for ip in [
+            [8, 8, 8, 8],
+            [1, 1, 1, 1],
+            [172, 15, 0, 1],
+            [172, 32, 0, 1],
+            [100, 63, 0, 1],
+            [100, 128, 0, 1],
+            [169, 254, 0, 1],
+            [127, 0, 0, 1],
+            [192, 167, 0, 1],
+            [11, 0, 0, 1],
+        ] {
+            assert!(
+                !is_private_client_source(Ipv4Addr::from(ip)),
+                "{:?} should be refused",
+                ip
+            );
         }
     }
 
     #[test]
     fn ula_client_source_ranges() {
         for ip in ["fc00::1", "fd00::1", "fd00:5350::2", "fdff:ffff::1"] {
-            assert!(is_ula_client_source(ip.parse().unwrap()), "{} should be allowed", ip);
+            assert!(
+                is_ula_client_source(ip.parse().unwrap()),
+                "{} should be allowed",
+                ip
+            );
         }
-        for ip in ["2001:db8::1", "2606:4700::1111", "fe80::1", "febf::1", "ff02::1",
-                   "::", "::1", "::ffff:10.0.0.1", "fbff::1", "fe00::1", "64:ff9b::1"] {
-            assert!(!is_ula_client_source(ip.parse().unwrap()), "{} should be refused", ip);
+        for ip in [
+            "2001:db8::1",
+            "2606:4700::1111",
+            "fe80::1",
+            "febf::1",
+            "ff02::1",
+            "::",
+            "::1",
+            "::ffff:10.0.0.1",
+            "fbff::1",
+            "fe00::1",
+            "64:ff9b::1",
+        ] {
+            assert!(
+                !is_ula_client_source(ip.parse().unwrap()),
+                "{} should be refused",
+                ip
+            );
         }
     }
 
@@ -1308,7 +1485,10 @@ mod tests {
         // otherwise the rule would leak past shutdown.
         let mut undo = Vec::new();
         assert!(record_undo_or_signal_delete(true, &mut undo, cmd()));
-        assert!(undo.is_empty(), "must not push onto an already-drained stack");
+        assert!(
+            undo.is_empty(),
+            "must not push onto an already-drained stack"
+        );
     }
 
     #[test]
@@ -1320,8 +1500,14 @@ mod tests {
 
         // Fill to cap=3 with increasing timestamps; ip(1) is least recent.
         assert_eq!(reserve_peer_slot(&mut peers, ip(1), t0, 3), None);
-        assert_eq!(reserve_peer_slot(&mut peers, ip(2), t0 + Duration::from_secs(1), 3), None);
-        assert_eq!(reserve_peer_slot(&mut peers, ip(3), t0 + Duration::from_secs(2), 3), None);
+        assert_eq!(
+            reserve_peer_slot(&mut peers, ip(2), t0 + Duration::from_secs(1), 3),
+            None
+        );
+        assert_eq!(
+            reserve_peer_slot(&mut peers, ip(3), t0 + Duration::from_secs(2), 3),
+            None
+        );
         assert_eq!(peers.len(), 3);
 
         // A new peer at the cap evicts the least-recently-active (ip(1)).
@@ -1407,7 +1593,11 @@ mod tests {
         assert!(!route_table_conflicts(table, ip("fdcc::1"), tun));
         // The kernel's per-interface fe80::/64 is skipped outright (a client
         // source can't be link-local anyway, but don't let it read as a hit).
-        assert!(!route_table_conflicts("fe80::/64 dev eth0 proto kernel\n", ip("fe80::5"), tun));
+        assert!(!route_table_conflicts(
+            "fe80::/64 dev eth0 proto kernel\n",
+            ip("fe80::5"),
+            tun
+        ));
     }
 
     // ---- pump tests with a mock transport + mock device ----
@@ -1550,7 +1740,11 @@ mod tests {
         let reply = recv_with_timeout(&mut h.from_transport).await.unwrap();
         let ihl = ((reply[0] & 0x0F) as usize) * 4;
         assert_eq!(reply[ihl], 0, "expected echo reply type");
-        assert_eq!(&reply[16..20], &[10, 0, 0, 1], "reply goes back to the pinger");
+        assert_eq!(
+            &reply[16..20],
+            &[10, 0, 0, 1],
+            "reply goes back to the pinger"
+        );
 
         // 3. Packet to a private dst is dropped (never reaches the device).
         h.to_transport
@@ -1602,16 +1796,27 @@ mod tests {
         // 3. v6 keepalive ping to the (blocked) ULA peer address is answered
         //    locally with a valid echo reply.
         h.to_transport
-            .send(icmpv6_echo_request("fd00:5350::2", "fd00:5350::1", 0x5350, 3))
+            .send(icmpv6_echo_request(
+                "fd00:5350::2",
+                "fd00:5350::1",
+                0x5350,
+                3,
+            ))
             .unwrap();
         let reply = recv_with_timeout(&mut h.from_transport).await.unwrap();
         assert_eq!(reply[40], 129, "expected ICMPv6 echo reply type");
-        assert_eq!(&reply[24..40], &v6("fd00:5350::2"), "reply goes back to the pinger");
+        assert_eq!(
+            &reply[24..40],
+            &v6("fd00:5350::2"),
+            "reply goes back to the pinger"
+        );
 
         // 4. Device-side link-scope chatter (RS/NS/MLD-shaped addressing) is
         //    filtered; a global-addressed v6 frame passes. Ordering of the two
         //    proves the first was dropped.
-        h.to_dev.send(ipv6_udp("fe80::1", "ff02::2", b"rs")).unwrap();
+        h.to_dev
+            .send(ipv6_udp("fe80::1", "ff02::2", b"rs"))
+            .unwrap();
         let v6_reply = ipv6_udp("2606:4700::1111", "fd00:5350::2", b"resp");
         h.to_dev.send(v6_reply.clone()).unwrap();
         assert_eq!(
@@ -1629,15 +1834,31 @@ mod tests {
     #[test]
     fn tun_frames_filtered_by_scope() {
         // IPv4 always passes; non-IP and empty frames never do.
-        assert!(tun_frame_to_client(&ipv4_udp([8, 8, 8, 8], [10, 0, 85, 1], b"x")));
+        assert!(tun_frame_to_client(&ipv4_udp(
+            [8, 8, 8, 8],
+            [10, 0, 85, 1],
+            b"x"
+        )));
         assert!(!tun_frame_to_client(&[]));
         assert!(!tun_frame_to_client(&[0x00, 0x01]));
         assert!(!tun_frame_to_client(&[0x60, 0, 0, 0])); // truncated v6
         // Global/ULA v6 passes.
-        assert!(tun_frame_to_client(&ipv6_udp("2606:4700::1111", "fd00:5350::2", b"x")));
+        assert!(tun_frame_to_client(&ipv6_udp(
+            "2606:4700::1111",
+            "fd00:5350::2",
+            b"x"
+        )));
         // Anything link-local or multicast on either side is chatter.
-        assert!(!tun_frame_to_client(&ipv6_udp("fe80::1", "fd00:5350::2", b"x")));
-        assert!(!tun_frame_to_client(&ipv6_udp("fd00:5350::1", "ff02::1", b"x")));
+        assert!(!tun_frame_to_client(&ipv6_udp(
+            "fe80::1",
+            "fd00:5350::2",
+            b"x"
+        )));
+        assert!(!tun_frame_to_client(&ipv6_udp(
+            "fd00:5350::1",
+            "ff02::1",
+            b"x"
+        )));
         assert!(!tun_frame_to_client(&ipv6_udp("fe80::1", "ff02::2", b"x")));
     }
 
@@ -1670,7 +1891,13 @@ mod tests {
         assert!(Options::parse(v4, "not-an-ip/64", 1280, true).is_err());
         assert!(Options::parse(v4, "fd00:5350::1/8", 1280, true).is_err());
         assert!(Options::parse(v4, "fd00:5350::1/127", 1280, true).is_err());
-        assert!(Options::parse(v4, "2001:db8::1/64", 1280, true).is_err(), "global refused");
-        assert!(Options::parse(v4, "fe80::1/64", 1280, true).is_err(), "link-local refused");
+        assert!(
+            Options::parse(v4, "2001:db8::1/64", 1280, true).is_err(),
+            "global refused"
+        );
+        assert!(
+            Options::parse(v4, "fe80::1/64", 1280, true).is_err(),
+            "link-local refused"
+        );
     }
 }

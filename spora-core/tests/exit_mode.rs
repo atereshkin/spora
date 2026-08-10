@@ -8,9 +8,9 @@ use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use tokio::net::UdpSocket as TokioUdp;
 
-use spora_core::e2e::{client_connect, client_endpoint, E2eSession};
+use spora_core::e2e::{E2eSession, client_connect, client_endpoint};
 use spora_core::identity::{Identity, Token};
-use spora_core::{share, Config, ExitMode, SessionHandler, Timings};
+use spora_core::{Config, ExitMode, SessionHandler, Timings, share};
 
 fn icmp_echo(seq: u16) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(64);
@@ -47,7 +47,10 @@ async fn custom_exit_mode_pumps_packets() {
     });
 
     let config = Config {
-        relays: vec![spora_core::identity::RelayEndpoint::new("127.0.0.1", relay_addr.port())],
+        relays: vec![spora_core::identity::RelayEndpoint::new(
+            "127.0.0.1",
+            relay_addr.port(),
+        )],
         exit_mode: ExitMode::Custom(handler),
         ..Config::default()
     };
@@ -83,7 +86,10 @@ async fn custom_exit_mode_pumps_packets() {
     })
     .await
     .expect("timed out waiting for the echoed packet");
-    assert!(echoed, "custom exit handler should have echoed the packet back");
+    assert!(
+        echoed,
+        "custom exit handler should have echoed the packet back"
+    );
 
     session.stop().await;
 }

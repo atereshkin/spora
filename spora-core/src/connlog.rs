@@ -566,7 +566,8 @@ impl Throttle {
 // ---------- Writer thread ----------
 
 fn open_db(path: &Path, identity: &Identity) -> Result<Connection, String> {
-    let db = Connection::open(path).map_err(|e| format!("connlog: open {}: {}", path.display(), e))?;
+    let db =
+        Connection::open(path).map_err(|e| format!("connlog: open {}: {}", path.display(), e))?;
     // auto_vacuum must be set before the first table is created to take
     // effect; on an existing database the pragma is a no-op (kept FULL/INCR
     // from creation time).
@@ -585,11 +586,9 @@ fn open_db(path: &Path, identity: &Identity) -> Result<Connection, String> {
         .map(|b| format!("{:02x}", b))
         .collect();
     let stored_rk: Option<String> = db
-        .query_row(
-            "SELECT value FROM meta WHERE key='routing_key'",
-            [],
-            |r| r.get(0),
-        )
+        .query_row("SELECT value FROM meta WHERE key='routing_key'", [], |r| {
+            r.get(0)
+        })
         .ok();
     if let Some(stored) = stored_rk
         && stored != rk_hex
@@ -741,7 +740,10 @@ fn writer_loop(
                     // backs up meanwhile).
                     if state.degraded_since_ms.is_none() {
                         state.degraded_since_ms = Some(now_ms());
-                        error!("connlog: write failed (will retry, tunnel unaffected): {}", e);
+                        error!(
+                            "connlog: write failed (will retry, tunnel unaffected): {}",
+                            e
+                        );
                         if let Some(h) = &hook {
                             h(crate::TunnelEvent::ConnLogDegraded {
                                 detail: e.to_string(),
@@ -751,7 +753,10 @@ fn writer_loop(
                     if batch.len() >= CHANNEL_CAPACITY {
                         let dropped_now = batch.len() as u64;
                         dropped.fetch_add(dropped_now, Ordering::Relaxed);
-                        warn!("connlog: dropping {} buffered records while degraded", dropped_now);
+                        warn!(
+                            "connlog: dropping {} buffered records while degraded",
+                            dropped_now
+                        );
                         batch.clear();
                     }
                 }
@@ -819,7 +824,11 @@ fn housekeeping(
     }
 }
 
-fn flush_batch(db: &mut Connection, cfg: &ConnLogConfig, batch: &[Ev]) -> Result<(), rusqlite::Error> {
+fn flush_batch(
+    db: &mut Connection,
+    cfg: &ConnLogConfig,
+    batch: &[Ev],
+) -> Result<(), rusqlite::Error> {
     let tx = db.transaction()?;
     for ev in batch {
         match ev {
@@ -934,7 +943,11 @@ fn flush_batch(db: &mut Connection, cfg: &ConnLogConfig, batch: &[Ev]) -> Result
                     rusqlite::params![id, last_ms, up, down, *established, reason],
                 )?;
             }
-            Ev::Mark { ts_ms, kind, detail } => {
+            Ev::Mark {
+                ts_ms,
+                kind,
+                detail,
+            } => {
                 tx.execute(
                     "INSERT INTO marks(ts_ms, kind, detail) VALUES (?1, ?2, ?3)",
                     rusqlite::params![ts_ms, kind, detail],
@@ -987,21 +1000,15 @@ fn retention_sweep(db: &mut Connection, retention: Duration) -> Result<(), rusql
 /// Open a connlog database read-only.
 pub fn open_readonly(dir: &Path) -> Result<Connection, String> {
     let path = dir.join("connlog.sqlite");
-    Connection::open_with_flags(
-        &path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-    )
-    .map_err(|e| format!("open {}: {}", path.display(), e))
+    Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+        .map_err(|e| format!("open {}: {}", path.display(), e))
 }
 
 /// Open a connlog database read-write (hold management).
 pub fn open_readwrite(dir: &Path) -> Result<Connection, String> {
     let path = dir.join("connlog.sqlite");
-    Connection::open_with_flags(
-        &path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE,
-    )
-    .map_err(|e| format!("open {}: {}", path.display(), e))
+    Connection::open_with_flags(&path, rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE)
+        .map_err(|e| format!("open {}: {}", path.display(), e))
 }
 
 #[derive(Debug, Clone)]
@@ -1067,25 +1074,28 @@ pub fn query_flows(db: &Connection, q: &FlowQuery) -> Result<Vec<FlowRow>, Strin
     sql.push_str(" ORDER BY first_ms");
     let mut stmt = db.prepare(&sql).map_err(|e| e.to_string())?;
     let rows = stmt
-        .query_map(rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())), |r| {
-            Ok(FlowRow {
-                id: r.get(0)?,
-                session_id: r.get(1)?,
-                proto: r.get(2)?,
-                src: r.get(3)?,
-                src_port: r.get(4)?,
-                dst: r.get(5)?,
-                dst_port: r.get(6)?,
-                first_ms: r.get(7)?,
-                last_ms: r.get(8)?,
-                bytes_up: r.get::<_, i64>(9)? as u64,
-                bytes_down: r.get::<_, i64>(10)? as u64,
-                egress_addr: r.get(11)?,
-                established: r.get(12)?,
-                confirmed: r.get(13)?,
-                end_reason: r.get(14)?,
-            })
-        })
+        .query_map(
+            rusqlite::params_from_iter(params.iter().map(|p| p.as_ref())),
+            |r| {
+                Ok(FlowRow {
+                    id: r.get(0)?,
+                    session_id: r.get(1)?,
+                    proto: r.get(2)?,
+                    src: r.get(3)?,
+                    src_port: r.get(4)?,
+                    dst: r.get(5)?,
+                    dst_port: r.get(6)?,
+                    first_ms: r.get(7)?,
+                    last_ms: r.get(8)?,
+                    bytes_up: r.get::<_, i64>(9)? as u64,
+                    bytes_down: r.get::<_, i64>(10)? as u64,
+                    egress_addr: r.get(11)?,
+                    established: r.get(12)?,
+                    confirmed: r.get(13)?,
+                    end_reason: r.get(14)?,
+                })
+            },
+        )
         .map_err(|e| e.to_string())?
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| e.to_string())?;
@@ -1112,8 +1122,10 @@ pub fn query_sessions(db: &Connection, ids: Option<&[i64]>) -> Result<Vec<Sessio
                 .collect::<Vec<_>>()
                 .join(",")
         ),
-        None => "SELECT id, start_ms, end_ms, end_reason, relay_addr FROM sessions ORDER BY start_ms"
-            .to_string(),
+        None => {
+            "SELECT id, start_ms, end_ms, end_reason, relay_addr FROM sessions ORDER BY start_ms"
+                .to_string()
+        }
     };
     let mut stmt = db.prepare(&sql).map_err(|e| e.to_string())?;
     let mut sessions = stmt
@@ -1152,9 +1164,15 @@ pub struct MarkRow {
 
 /// Marks overlapping a window — `spora log query` surfaces these so a gap or
 /// clock jump inside the queried interval is never silently omitted.
-pub fn query_marks(db: &Connection, from_ms: Option<i64>, to_ms: Option<i64>) -> Result<Vec<MarkRow>, String> {
+pub fn query_marks(
+    db: &Connection,
+    from_ms: Option<i64>,
+    to_ms: Option<i64>,
+) -> Result<Vec<MarkRow>, String> {
     let mut stmt = db
-        .prepare("SELECT ts_ms, kind, detail FROM marks WHERE ts_ms >= ?1 AND ts_ms <= ?2 ORDER BY seq")
+        .prepare(
+            "SELECT ts_ms, kind, detail FROM marks WHERE ts_ms >= ?1 AND ts_ms <= ?2 ORDER BY seq",
+        )
         .map_err(|e| e.to_string())?;
     let rows = stmt
         .query_map(
@@ -1175,7 +1193,12 @@ pub fn query_marks(db: &Connection, from_ms: Option<i64>, to_ms: Option<i64>) ->
 
 /// Pin a time range against the retention sweep (legal hold / preservation
 /// request). Returns the hold id.
-pub fn add_hold(db: &Connection, from_ms: i64, to_ms: i64, note: Option<&str>) -> Result<i64, String> {
+pub fn add_hold(
+    db: &Connection,
+    from_ms: i64,
+    to_ms: i64,
+    note: Option<&str>,
+) -> Result<i64, String> {
     db.execute(
         "INSERT INTO holds(from_ms, to_ms, note, created_ms) VALUES (?1, ?2, ?3, ?4)",
         rusqlite::params![from_ms, to_ms, note, now_ms()],
@@ -1252,7 +1275,12 @@ mod tests {
         session.addr(AddrKind::PunchVerified, addr([198, 51, 100, 7], 6001));
 
         let flow = session
-            .flow_open(6, addr([10, 0, 85, 2], 50000), addr([93, 184, 216, 34], 443), true)
+            .flow_open(
+                6,
+                addr([10, 0, 85, 2], 50000),
+                addr([93, 184, 216, 34], 443),
+                true,
+            )
             .unwrap();
         flow.established(Some(addr([192, 0, 2, 10], 41000)));
         flow.add_up(1200);
@@ -1361,7 +1389,11 @@ mod tests {
                 f.close("closed", Duration::ZERO);
             }
         }
-        assert!(opened <= 6, "burst cap should limit records, got {}", opened);
+        assert!(
+            opened <= 6,
+            "burst cap should limit records, got {}",
+            opened
+        );
         session.end("ended");
         drop(session);
         drop(log);
@@ -1378,7 +1410,13 @@ mod tests {
         let db = open_readonly(dir.path()).unwrap();
         let marks = query_marks(&db, None, None).unwrap();
         let throttle = marks.iter().find(|m| m.kind == "flow_throttle").unwrap();
-        assert!(throttle.detail.as_deref().unwrap().contains("\"suppressed\":"));
+        assert!(
+            throttle
+                .detail
+                .as_deref()
+                .unwrap()
+                .contains("\"suppressed\":")
+        );
     }
 
     #[test]
@@ -1389,9 +1427,16 @@ mod tests {
         cfg.log_destinations = false;
         let log = ConnLog::open(cfg, &identity, None).unwrap();
         let session = log.session(addr([203, 0, 113, 1], 443));
-        assert!(session
-            .flow_open(6, addr([10, 0, 85, 2], 50000), addr([93, 184, 216, 34], 443), true)
-            .is_none());
+        assert!(
+            session
+                .flow_open(
+                    6,
+                    addr([10, 0, 85, 2], 50000),
+                    addr([93, 184, 216, 34], 443),
+                    true
+                )
+                .is_none()
+        );
         session.flow_blocked(6, addr([10, 0, 85, 2], 50001), addr([192, 168, 1, 1], 80));
         session.end("ended");
         drop(session);

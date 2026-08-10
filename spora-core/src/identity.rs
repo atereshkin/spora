@@ -381,7 +381,10 @@ impl Token {
             .map(|r| format!("r={}", r.to_url_param()))
             .collect::<Vec<_>>()
             .join("&");
-        let url_str = format!("https://{}{}{}?{}", URL_HOST, URL_PATH_PREFIX, encoded, query);
+        let url_str = format!(
+            "https://{}{}{}?{}",
+            URL_HOST, URL_PATH_PREFIX, encoded, query
+        );
         Url::parse(&url_str).expect("constructed Token URL must parse")
     }
 
@@ -389,16 +392,13 @@ impl Token {
     /// single-relay URL is the back-compatible degenerate case); at least one
     /// is required.
     pub fn from_url(url: &Url) -> Result<Self, String> {
-        let blob_b64 = url
-            .path()
-            .strip_prefix(URL_PATH_PREFIX)
-            .ok_or_else(|| {
-                format!(
-                    "URL path must start with {}, got {}",
-                    URL_PATH_PREFIX,
-                    url.path()
-                )
-            })?;
+        let blob_b64 = url.path().strip_prefix(URL_PATH_PREFIX).ok_or_else(|| {
+            format!(
+                "URL path must start with {}, got {}",
+                URL_PATH_PREFIX,
+                url.path()
+            )
+        })?;
         if blob_b64.is_empty() {
             return Err("URL path is missing the token after /s/".into());
         }
@@ -532,7 +532,10 @@ mod tests {
 
         assert_eq!(parsed, token);
         assert!(url.as_str().starts_with("https://spora.to/s/"));
-        assert!(url.as_str().ends_with("?r=relay.spora.dev:443"), "got {url}");
+        assert!(
+            url.as_str().ends_with("?r=relay.spora.dev:443"),
+            "got {url}"
+        );
     }
 
     #[test]
@@ -597,7 +600,10 @@ mod tests {
             url
         );
         let parsed = Token::from_url(&url).unwrap();
-        assert_eq!(parsed, token, "relay host must come back bare (no brackets)");
+        assert_eq!(
+            parsed, token,
+            "relay host must come back bare (no brackets)"
+        );
 
         // A caller that already bracketed the literal round-trips to the
         // bare form too (no double-bracketing).
@@ -630,14 +636,21 @@ mod tests {
             s.contains("r=direct/[2001:db8::9]:443"),
             "direct v6 bracketed inside the tag: {s}"
         );
-        assert_eq!(Token::from_url(&url).unwrap(), token, "protocol must round-trip");
+        assert_eq!(
+            Token::from_url(&url).unwrap(),
+            token,
+            "protocol must round-trip"
+        );
     }
 
     #[test]
     fn from_url_rejects_unknown_protocol() {
         let blob = URL_SAFE_NO_PAD.encode([0u8; TOKEN_BLOB_LEN]);
-        let bad =
-            Url::parse(&format!("https://spora.to/s/{}?r=warpspeed/1.2.3.4:443", blob)).unwrap();
+        let bad = Url::parse(&format!(
+            "https://spora.to/s/{}?r=warpspeed/1.2.3.4:443",
+            blob
+        ))
+        .unwrap();
         let err = Token::from_url(&bad).unwrap_err();
         assert!(err.contains("unknown relay protocol"), "got: {err}");
     }
@@ -645,8 +658,11 @@ mod tests {
     #[test]
     fn quic_tag_parses_as_the_default_protocol() {
         let blob = URL_SAFE_NO_PAD.encode([0u8; TOKEN_BLOB_LEN]);
-        let url =
-            Url::parse(&format!("https://spora.to/s/{}?r=quic/relay.example:443", blob)).unwrap();
+        let url = Url::parse(&format!(
+            "https://spora.to/s/{}?r=quic/relay.example:443",
+            blob
+        ))
+        .unwrap();
         let ep = &Token::from_url(&url).unwrap().relays[0];
         assert_eq!(ep.protocol, RelayProtocol::UdpQuic);
         assert_eq!(ep.host, "relay.example");

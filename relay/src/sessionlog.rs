@@ -300,7 +300,12 @@ CREATE TABLE IF NOT EXISTS marks (
 );
 ";
 
-fn writer_loop(mut db: Connection, rx: Receiver<Ev>, cfg: SessionLogConfig, dropped: Arc<AtomicU64>) {
+fn writer_loop(
+    mut db: Connection,
+    rx: Receiver<Ev>,
+    cfg: SessionLogConfig,
+    dropped: Arc<AtomicU64>,
+) {
     let mut batch: Vec<Ev> = Vec::new();
     let mut dropped_seen: u64 = 0;
     let mut last_sweep: Option<Instant> = None;
@@ -362,7 +367,10 @@ fn writer_loop(mut db: Connection, rx: Receiver<Ev>, cfg: SessionLogConfig, drop
                 Err(e) => {
                     if degraded_since_ms.is_none() {
                         degraded_since_ms = Some(now_ms());
-                        error!("session log: write failed (will retry, forwarding unaffected): {}", e);
+                        error!(
+                            "session log: write failed (will retry, forwarding unaffected): {}",
+                            e
+                        );
                     }
                     if batch.len() >= CHANNEL_CAPACITY {
                         dropped.fetch_add(batch.len() as u64, Ordering::Relaxed);
@@ -419,7 +427,11 @@ fn flush_batch(db: &mut Connection, batch: &[Ev]) -> Result<(), rusqlite::Error>
                     rusqlite::params![id, end_ms, reason, pkts_c2s, bytes_c2s, pkts_s2c, bytes_s2c],
                 )?;
             }
-            Ev::Mark { ts_ms, kind, detail } => {
+            Ev::Mark {
+                ts_ms,
+                kind,
+                detail,
+            } => {
                 tx.execute(
                     "INSERT INTO marks(ts_ms, kind, detail) VALUES (?1, ?2, ?3)",
                     rusqlite::params![ts_ms, kind, detail],
@@ -436,7 +448,10 @@ fn retention_sweep(db: &Connection, retention: Duration) -> Result<(), rusqlite:
         "DELETE FROM sessions WHERE COALESCE(end_ms, start_ms) < ?1",
         rusqlite::params![cutoff],
     )?;
-    db.execute("DELETE FROM marks WHERE ts_ms < ?1", rusqlite::params![cutoff])?;
+    db.execute(
+        "DELETE FROM marks WHERE ts_ms < ?1",
+        rusqlite::params![cutoff],
+    )?;
     Ok(())
 }
 
@@ -451,10 +466,9 @@ mod tests {
     fn wait_for<F: Fn(&Connection) -> bool>(path: &Path, pred: F) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
-            if let Ok(db) = Connection::open_with_flags(
-                path,
-                rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-            ) && pred(&db)
+            if let Ok(db) =
+                Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
+                && pred(&db)
             {
                 return;
             }
@@ -537,9 +551,11 @@ mod tests {
         let log = SessionLog::open(cfg(&path)).unwrap();
         drop(log);
         wait_for(&path, |db| {
-            db.query_row("SELECT COUNT(*) FROM marks WHERE kind='relay_stop'", [], |r| {
-                r.get::<_, i64>(0)
-            })
+            db.query_row(
+                "SELECT COUNT(*) FROM marks WHERE kind='relay_stop'",
+                [],
+                |r| r.get::<_, i64>(0),
+            )
             .unwrap_or(0)
                 == 1
         });

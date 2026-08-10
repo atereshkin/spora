@@ -31,11 +31,7 @@ use spora_lab::{CLIENT_INNER_IP, ECHO_TCP_PORT, ECHO_UDP_PORT, NatKind, WAN_SERV
 fn main() {
     let ok = spora_lab::harness::lab_main(
         "connlog",
-        spora_lab::scenarios![
-            tcp_flow_recorded,
-            udp_flow_recorded,
-            punch_addrs_recorded,
-        ],
+        spora_lab::scenarios![tcp_flow_recorded, udp_flow_recorded, punch_addrs_recorded,],
     );
     std::process::exit(if ok { 0 } else { 1 });
 }
@@ -190,7 +186,10 @@ fn tcp_flow_recorded() -> Result<(), String> {
     // close, so wait for the closed row.
     let flows = poll_db("closed tcp flow row", DB_TIMEOUT, || {
         let flows = query_flows_to(&dir, ECHO_TCP_PORT)?;
-        Ok(flows.iter().any(|f| f.end_reason.is_some()).then_some(flows))
+        Ok(flows
+            .iter()
+            .any(|f| f.end_reason.is_some())
+            .then_some(flows))
     })?;
     if flows.len() != 1 {
         return Err(format!(
@@ -203,7 +202,10 @@ fn tcp_flow_recorded() -> Result<(), String> {
         return Err(format!("flow proto {} != TCP: {f:#?}", f.proto));
     }
     if f.src != CLIENT_INNER_IP.to_string() {
-        return Err(format!("flow src {} is not the inner client address: {f:#?}", f.src));
+        return Err(format!(
+            "flow src {} is not the inner client address: {f:#?}",
+            f.src
+        ));
     }
     if !f.established {
         return Err(format!("flow not marked established: {f:#?}"));
@@ -219,7 +221,9 @@ fn tcp_flow_recorded() -> Result<(), String> {
         ));
     }
     if f.egress_addr.is_none() {
-        return Err(format!("netstack flow must record an egress address: {f:#?}"));
+        return Err(format!(
+            "netstack flow must record an egress address: {f:#?}"
+        ));
     }
     match f.end_reason.as_deref() {
         Some("closed") | Some("session_end") => {}
@@ -230,7 +234,9 @@ fn tcp_flow_recorded() -> Result<(), String> {
     // sessions always bootstrap relay-via), still open.
     let sessions = query_all_sessions(&dir)?;
     if sessions.len() != 1 {
-        return Err(format!("expected exactly one session row, got {sessions:#?}"));
+        return Err(format!(
+            "expected exactly one session row, got {sessions:#?}"
+        ));
     }
     if sessions[0].relay_addr != wan.relay_addr().to_string() {
         return Err(format!(
@@ -240,7 +246,9 @@ fn tcp_flow_recorded() -> Result<(), String> {
         ));
     }
     if sessions[0].end_ms.is_some() {
-        return Err(format!("session ended while the share is live: {sessions:#?}"));
+        return Err(format!(
+            "session ended while the share is live: {sessions:#?}"
+        ));
     }
     if f.session_id != sessions[0].id {
         return Err(format!(
@@ -297,7 +305,10 @@ fn udp_flow_recorded() -> Result<(), String> {
 
     let flows = poll_db("closed udp flow row with bytes", DB_TIMEOUT, || {
         let flows = query_flows_to(&dir, ECHO_UDP_PORT)?;
-        Ok(flows.iter().any(|f| f.end_reason.is_some()).then_some(flows))
+        Ok(flows
+            .iter()
+            .any(|f| f.end_reason.is_some())
+            .then_some(flows))
     })?;
     if flows.len() != 1 {
         return Err(format!(
@@ -310,13 +321,20 @@ fn udp_flow_recorded() -> Result<(), String> {
         return Err(format!("flow proto {} != UDP: {f:#?}", f.proto));
     }
     if f.src != CLIENT_INNER_IP.to_string() {
-        return Err(format!("flow src {} is not the inner client address: {f:#?}", f.src));
+        return Err(format!(
+            "flow src {} is not the inner client address: {f:#?}",
+            f.src
+        ));
     }
     if !f.established || !f.confirmed {
-        return Err(format!("UDP netstack flow must be established+confirmed: {f:#?}"));
+        return Err(format!(
+            "UDP netstack flow must be established+confirmed: {f:#?}"
+        ));
     }
     if f.egress_addr.is_none() {
-        return Err(format!("UDP netstack flow must record an egress address: {f:#?}"));
+        return Err(format!(
+            "UDP netstack flow must record an egress address: {f:#?}"
+        ));
     }
     // Payload bytes, counted at the NAT entry: COUNT x LEN in each direction
     // (zero echo loss was asserted above).

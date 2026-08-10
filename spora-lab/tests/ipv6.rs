@@ -90,7 +90,11 @@ fn outer_v6_relay_session() -> Result<(), String> {
     let mut opts = LabPeerOpts::new(wan.relay_addr6()?, wan.stun_server6()?);
     opts.enable_direct_upgrade = false;
     let mut sharer = peers::start_sharer(&topo.sharer, &opts)?;
-    if !sharer.url().as_str().contains(&format!("[{WAN_SERVICES_IP6}]")) {
+    if !sharer
+        .url()
+        .as_str()
+        .contains(&format!("[{WAN_SERVICES_IP6}]"))
+    {
         return fail(format!(
             "share URL must carry the bracketed v6 relay literal, got {}",
             sharer.url()
@@ -100,13 +104,17 @@ fn outer_v6_relay_session() -> Result<(), String> {
 
     let relay_peer = wait_relay_session(&mut sharer, &mut client)?;
     if !relay_peer.is_ipv6() {
-        return fail(format!("client session peer should be the v6 relay, got {relay_peer}"));
+        return fail(format!(
+            "client session peer should be the v6 relay, got {relay_peer}"
+        ));
     }
 
     // Inner-v4 traffic across the v6 outer path: zero loss + a bulk echo.
     let stats = client.udp_echo(svc(ECHO_UDP_PORT), 20, 200, Duration::from_secs(30))?;
     if stats.received != 20 {
-        return fail(format!("udp echo lost packets over v6 relay path: {stats:?}"));
+        return fail(format!(
+            "udp echo lost packets over v6 relay path: {stats:?}"
+        ));
     }
     let bulk = client.tcp_bulk(svc(ECHO_TCP_PORT), 64 * 1024, Duration::from_secs(90))?;
     if bulk.bytes != 64 * 1024 {
@@ -143,7 +151,9 @@ fn outer_v6_direct_upgrade() -> Result<(), String> {
         unreachable!("predicate matched DirectUpgradeSucceeded");
     };
     if !local.is_ipv6() || !peer.is_ipv6() {
-        return fail(format!("direct path should be v6 on both ends: {local} -> {peer}"));
+        return fail(format!(
+            "direct path should be v6 on both ends: {local} -> {peer}"
+        ));
     }
     let expect_peer = topo.ext_ip6_a.expect("dual topology has v6 externals");
     if peer.ip() != std::net::IpAddr::V6(expect_peer) {
@@ -160,7 +170,9 @@ fn outer_v6_direct_upgrade() -> Result<(), String> {
     wan.stop_relay()?;
     let stats = client.udp_echo(svc(ECHO_UDP_PORT), 20, 200, Duration::from_secs(30))?;
     if stats.received != 20 {
-        return fail(format!("udp echo lost packets on the direct v6 path: {stats:?}"));
+        return fail(format!(
+            "udp echo lost packets on the direct v6 path: {stats:?}"
+        ));
     }
 
     client.stop();
@@ -197,69 +209,77 @@ fn firewalled_v6_direct_upgrade() -> Result<(), String> {
     let (map_tx, map_rx) = std::sync::mpsc::channel::<Result<SocketAddr, String>>();
     let (go_tx, mut go_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
     let (probe_tx, probe_rx) = std::sync::mpsc::channel::<Result<bool, String>>();
-    let cli_host = topo.client.spawn_host("fw-cli-check", move |_cancel| async move {
-        let result = async {
-            let sock = UdpSocket::bind(("::", 0))
-                .await
-                .map_err(|e| format!("bind: {e}"))?;
-            let local_port = sock.local_addr().map_err(|e| e.to_string())?.port();
-            // Retry: the first packet on a fresh veth path is lost to NDP
-            // neighbor resolution (the v4 ARP-warmup the netem scenario
-            // documents). A real client/STUN exchange retransmits the same
-            // way. The conntrack entry the firewall needs is still created
-            // by the FIRST outbound packet — so this only warms NDP, it does
-            // not change what the filter test below proves.
-            let mut buf = [0u8; 256];
-            let observed = loop {
-                sock.send_to(b"whoami", whoami)
+    let cli_host = topo
+        .client
+        .spawn_host("fw-cli-check", move |_cancel| async move {
+            let result = async {
+                let sock = UdpSocket::bind(("::", 0))
                     .await
-                    .map_err(|e| format!("send: {e}"))?;
-                match tokio::time::timeout(Duration::from_secs(1), sock.recv_from(&mut buf)).await {
-                    Ok(Ok((n, _))) => {
-                        let text = std::str::from_utf8(&buf[..n]).map_err(|e| e.to_string())?;
-                        break text.parse::<SocketAddr>().map_err(|e| format!("parse {text:?}: {e}"))?;
+                    .map_err(|e| format!("bind: {e}"))?;
+                let local_port = sock.local_addr().map_err(|e| e.to_string())?.port();
+                // Retry: the first packet on a fresh veth path is lost to NDP
+                // neighbor resolution (the v4 ARP-warmup the netem scenario
+                // documents). A real client/STUN exchange retransmits the same
+                // way. The conntrack entry the firewall needs is still created
+                // by the FIRST outbound packet — so this only warms NDP, it does
+                // not change what the filter test below proves.
+                let mut buf = [0u8; 256];
+                let observed = loop {
+                    sock.send_to(b"whoami", whoami)
+                        .await
+                        .map_err(|e| format!("send: {e}"))?;
+                    match tokio::time::timeout(Duration::from_secs(1), sock.recv_from(&mut buf))
+                        .await
+                    {
+                        Ok(Ok((n, _))) => {
+                            let text = std::str::from_utf8(&buf[..n]).map_err(|e| e.to_string())?;
+                            break text
+                                .parse::<SocketAddr>()
+                                .map_err(|e| format!("parse {text:?}: {e}"))?;
+                        }
+                        Ok(Err(e)) => return Err(format!("recv: {e}")),
+                        // Timeout: keep warming NDP within the host's 15s budget.
+                        Err(_) => continue,
                     }
-                    Ok(Err(e)) => return Err(format!("recv: {e}")),
-                    // Timeout: keep warming NDP within the host's 15s budget.
-                    Err(_) => continue,
+                };
+                if observed.port() != local_port {
+                    return Err(format!(
+                        "port translated: local {local_port}, observed {observed}"
+                    ));
+                }
+                Ok((sock, observed))
+            }
+            .await;
+            let (sock, observed) = match result {
+                Ok(x) => {
+                    let _ = map_tx.send(Ok(x.1));
+                    x
+                }
+                Err(e) => {
+                    let _ = map_tx.send(Err(e));
+                    return;
                 }
             };
-            if observed.port() != local_port {
-                return Err(format!("port translated: local {local_port}, observed {observed}"));
-            }
-            Ok((sock, observed))
-        }
-        .await;
-        let (sock, observed) = match result {
-            Ok(x) => {
-                let _ = map_tx.send(Ok(x.1));
-                x
-            }
-            Err(e) => {
-                let _ = map_tx.send(Err(e));
+            let _ = observed;
+            if go_rx.recv().await.is_none() {
                 return;
             }
-        };
-        let _ = observed;
-        if go_rx.recv().await.is_none() {
-            return;
-        }
-        // Listen for the probe by its PAYLOAD: the NDP warmup above sent
-        // several whoami packets, and a late whoami *reply* can land in this
-        // window — only the exact probe bytes count as a leak (mirrors the
-        // v4 smoke filtering test).
-        let mut buf = [0u8; 256];
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
-        let got = loop {
-            match tokio::time::timeout_at(deadline, sock.recv_from(&mut buf)).await {
-                Ok(Ok((n, _))) if &buf[..n] == b"unsolicited" => break Ok(true),
-                Ok(Ok(_)) => continue, // stale whoami reply — ignore
-                Ok(Err(e)) => break Err(format!("probe recv: {e}")),
-                Err(_) => break Ok(false),
-            }
-        };
-        let _ = probe_tx.send(got);
-    })?;
+            // Listen for the probe by its PAYLOAD: the NDP warmup above sent
+            // several whoami packets, and a late whoami *reply* can land in this
+            // window — only the exact probe bytes count as a leak (mirrors the
+            // v4 smoke filtering test).
+            let mut buf = [0u8; 256];
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+            let got = loop {
+                match tokio::time::timeout_at(deadline, sock.recv_from(&mut buf)).await {
+                    Ok(Ok((n, _))) if &buf[..n] == b"unsolicited" => break Ok(true),
+                    Ok(Ok(_)) => continue, // stale whoami reply — ignore
+                    Ok(Err(e)) => break Err(format!("probe recv: {e}")),
+                    Err(_) => break Ok(false),
+                }
+            };
+            let _ = probe_tx.send(got);
+        })?;
 
     let observed = map_rx
         .recv_timeout(Duration::from_secs(15))
@@ -290,7 +310,9 @@ fn firewalled_v6_direct_upgrade() -> Result<(), String> {
     sent_rx
         .recv_timeout(Duration::from_secs(10))
         .map_err(|e| format!("probe never sent: {e}"))??;
-    go_tx.send(()).map_err(|_| "client check host gone".to_string())?;
+    go_tx
+        .send(())
+        .map_err(|_| "client check host gone".to_string())?;
     let delivered = probe_rx
         .recv_timeout(Duration::from_secs(10))
         .map_err(|e| format!("no probe outcome: {e}"))??;
@@ -331,7 +353,9 @@ fn firewalled_v6_direct_upgrade() -> Result<(), String> {
     wan.stop_relay()?;
     let stats = client.udp_echo(svc6(ECHO_UDP_PORT), 20, 200, Duration::from_secs(30))?;
     if stats.received != 20 {
-        return fail(format!("udp echo lost packets on the firewalled direct path: {stats:?}"));
+        return fail(format!(
+            "udp echo lost packets on the firewalled direct path: {stats:?}"
+        ));
     }
 
     client.stop();
@@ -430,7 +454,9 @@ fn mixed_family_relay_forwarding() -> Result<(), String> {
 
     let stats = client.udp_echo(svc(ECHO_UDP_PORT), 20, 200, Duration::from_secs(30))?;
     if stats.received != 20 {
-        return fail(format!("udp echo lost packets across the mixed-family relay: {stats:?}"));
+        return fail(format!(
+            "udp echo lost packets across the mixed-family relay: {stats:?}"
+        ));
     }
 
     client.stop();

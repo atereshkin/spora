@@ -248,7 +248,10 @@ impl ReplayWindow {
 pub(crate) fn spawn_socket_pump(
     socket: Arc<UdpSocket>,
     shaper: SharedShaper,
-) -> (mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>, JoinHandle<()>) {
+) -> (
+    mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>,
+    JoinHandle<()>,
+) {
     let (tx, rx) = mpsc::unbounded_channel();
     let handle = tokio::spawn(async move {
         let mut buf = vec![0u8; 2048];
@@ -340,8 +343,8 @@ pub(crate) async fn noise_connect(
                     {
                         return Some(d);
                     }
-                    Some(_) => continue,     // stray — skip
-                    None => return None,     // datagram source closed
+                    Some(_) => continue, // stray — skip
+                    None => return None, // datagram source closed
                 }
             }
         })
@@ -415,7 +418,11 @@ pub(crate) async fn noise_accept(
         d.len() >= NZ_MSG1_MIN && d[0..ROUTING_KEY_LEN] == identity.routing_key
     })
     .await?;
-    let idx_b = u32::from_be_bytes(msg1[ROUTING_KEY_LEN..ROUTING_KEY_LEN + INDEX_LEN].try_into().unwrap());
+    let idx_b = u32::from_be_bytes(
+        msg1[ROUTING_KEY_LEN..ROUTING_KEY_LEN + INDEX_LEN]
+            .try_into()
+            .unwrap(),
+    );
 
     let mut hs = NoiseHandshake::responder(identity)?;
     hs.read_message(&msg1[ROUTING_KEY_LEN + INDEX_LEN..])?; // wrong secret fails here
@@ -727,7 +734,10 @@ impl Sink<Vec<u8>> for NoisePeerTransport {
         Poll::Ready(Ok(()))
     }
 
-    fn poll_close(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Result<(), Self::Error>> {
+    fn poll_close(
+        mut self: Pin<&mut Self>,
+        _cx: &mut Context<'_>,
+    ) -> Poll<Result<(), Self::Error>> {
         let _ = self.send_on(CH_CLOSE, &[]);
         Poll::Ready(Ok(()))
     }
@@ -770,8 +780,10 @@ mod tests {
         let b_sock = udp("127.0.0.1:0").await;
         let a_addr = a_sock.local_addr().unwrap();
 
-        let (rx_a, pump_a) =
-            spawn_socket_pump(a_sock.clone(), nz_shaper(&identity.routing_key, &identity.secret));
+        let (rx_a, pump_a) = spawn_socket_pump(
+            a_sock.clone(),
+            nz_shaper(&identity.routing_key, &identity.secret),
+        );
         let id = identity.clone();
         let accept = tokio::spawn(async move {
             noise_accept(
@@ -849,7 +861,10 @@ mod tests {
                 .expect("fragment arrives")
                 .expect("open")
                 .expect("no error");
-            assert!(f.len() <= NZ_TUNNEL_MTU as usize, "fragment fits the tunnel MTU");
+            assert!(
+                f.len() <= NZ_TUNNEL_MTU as usize,
+                "fragment fits the tunnel MTU"
+            );
             got += f.len() - ((f[0] & 0x0f) as usize) * 4;
             frags += 1;
         }
@@ -896,7 +911,10 @@ mod tests {
         }
         let mbps = (n as f64 * 1120.0 * 8.0) / t.elapsed().as_secs_f64() / 1e6;
         println!("nz frame+deframe: {mbps:.0} Mbit/s");
-        assert!(mbps > 200.0, "nz crypto only {mbps:.0} Mbit/s — is snow ring-accelerated?");
+        assert!(
+            mbps > 200.0,
+            "nz crypto only {mbps:.0} Mbit/s — is snow ring-accelerated?"
+        );
     }
 
     #[test]
@@ -956,7 +974,11 @@ mod tests {
             "msg1 must not present QUIC v1's version field"
         );
         // No leading Spora relay-control magic either (that is 0x80 'spR' 0x01).
-        assert_ne!(&msg1[0..4], b"\x80spR", "msg1 must not look like a control packet");
+        assert_ne!(
+            &msg1[0..4],
+            b"\x80spR",
+            "msg1 must not look like a control packet"
+        );
 
         // Across many data packets with sequential counters, the on-wire counter
         // field must never appear in the clear and must not advance by a constant
@@ -974,17 +996,30 @@ mod tests {
             let pkt = frame_data(&a_sess, &hp, idx, counter, CH_IP, b"payload").unwrap();
             let mut cf = [0u8; COUNTER_LEN];
             cf.copy_from_slice(&pkt[INDEX_LEN..DATA_HEADER_LEN]);
-            assert_ne!(cf, counter.to_be_bytes(), "counter {counter} appears in the clear");
+            assert_ne!(
+                cf,
+                counter.to_be_bytes(),
+                "counter {counter} appears in the clear"
+            );
             wire_counters.push(cf);
         }
         // No two on-wire counter fields collide, and no constant stride links
         // them (a masked counter is pseudo-random, not counter+k).
         for i in 1..wire_counters.len() {
-            assert_ne!(wire_counters[i], wire_counters[i - 1], "adjacent counters collide");
-            let delta_prev = u64::from_be_bytes(wire_counters[1]).wrapping_sub(u64::from_be_bytes(wire_counters[0]));
-            let delta_i = u64::from_be_bytes(wire_counters[i]).wrapping_sub(u64::from_be_bytes(wire_counters[i - 1]));
+            assert_ne!(
+                wire_counters[i],
+                wire_counters[i - 1],
+                "adjacent counters collide"
+            );
+            let delta_prev = u64::from_be_bytes(wire_counters[1])
+                .wrapping_sub(u64::from_be_bytes(wire_counters[0]));
+            let delta_i = u64::from_be_bytes(wire_counters[i])
+                .wrapping_sub(u64::from_be_bytes(wire_counters[i - 1]));
             if i > 1 {
-                assert_ne!(delta_i, delta_prev, "counter field advances by a constant stride");
+                assert_ne!(
+                    delta_i, delta_prev,
+                    "counter field advances by a constant stride"
+                );
             }
         }
     }

@@ -1,19 +1,19 @@
 uniffi::setup_scaffolding!();
 
 use crate::ConnectError::InvalidUrl;
+use log::info;
 use once_cell::sync::Lazy;
 use spora_core;
 use spora_core::tun_util;
 use std::collections::HashMap;
 use std::fmt::Formatter;
 use std::os::fd::{FromRawFd, OwnedFd, RawFd};
-use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicI32, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use url::Url;
-use log::info;
 
 /// Callback interface that Kotlin implements to protect sockets from VPN routing.
 #[uniffi::export(callback_interface)]
@@ -59,9 +59,9 @@ impl From<spora_core::TunnelEvent> for SporaEvent {
     fn from(e: spora_core::TunnelEvent) -> Self {
         use spora_core::TunnelEvent as T;
         match e {
-            T::RelaySessionEstablished { peer } => {
-                SporaEvent::RelaySessionEstablished { peer: peer.to_string() }
-            }
+            T::RelaySessionEstablished { peer } => SporaEvent::RelaySessionEstablished {
+                peer: peer.to_string(),
+            },
             T::DirectUpgradeSucceeded { local, peer } => SporaEvent::DirectUpgradeSucceeded {
                 local: local.to_string(),
                 peer: peer.to_string(),
@@ -217,8 +217,8 @@ pub fn share(
     conn_log_retention_days: Option<u32>,
     conn_log_sessions_only: bool,
 ) -> Result<ShareResult, ShareError> {
-    let identity = spora_core::identity::Identity::from_bytes(&identity_bytes)
-        .map_err(ShareError::Generic)?;
+    let identity =
+        spora_core::identity::Identity::from_bytes(&identity_bytes).map_err(ShareError::Generic)?;
     let conn_log = conn_log_dir.map(|dir| {
         let mut cfg = spora_core::connlog::ConnLogConfig::in_dir(dir);
         if let Some(days) = conn_log_retention_days {
@@ -295,7 +295,12 @@ impl std::fmt::Display for TunnelError {
 /// Android can call `VpnService.protect()` to bypass VPN routing.
 /// Use `disconnect` to tear down the tunnel.
 #[uniffi::export]
-pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCallback>, mtu_callback: Option<Box<dyn MtuCallback>>) -> Result<i32, ConnectError> {
+pub fn connect(
+    url: String,
+    tun_fd: RawFd,
+    protector: Box<dyn SocketProtectorCallback>,
+    mtu_callback: Option<Box<dyn MtuCallback>>,
+) -> Result<i32, ConnectError> {
     info!("FFI connect() called with tun_fd={}", tun_fd);
 
     let url = Url::parse(&url).map_err(|_| InvalidUrl)?;
@@ -339,10 +344,15 @@ pub fn connect(url: String, tun_fd: RawFd, protector: Box<dyn SocketProtectorCal
 
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     info!("FFI connect(): returning handle={}", handle);
-    SESSIONS
-        .lock()
-        .unwrap()
-        .insert(handle, TunnelSession { cancel, task, keepalive_knob, keepalive_waker });
+    SESSIONS.lock().unwrap().insert(
+        handle,
+        TunnelSession {
+            cancel,
+            task,
+            keepalive_knob,
+            keepalive_waker,
+        },
+    );
 
     Ok(handle)
 }
@@ -415,10 +425,15 @@ pub fn connect_utun(
 
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     info!("FFI connect_utun(): returning handle={}", handle);
-    SESSIONS
-        .lock()
-        .unwrap()
-        .insert(handle, TunnelSession { cancel, task, keepalive_knob, keepalive_waker });
+    SESSIONS.lock().unwrap().insert(
+        handle,
+        TunnelSession {
+            cancel,
+            task,
+            keepalive_knob,
+            keepalive_waker,
+        },
+    );
 
     Ok(handle)
 }
@@ -445,10 +460,15 @@ pub fn disconnect(handle: i32) -> Result<(), TunnelError> {
 /// Transition from 0→N sends an immediate ping to detect dead connections.
 #[uniffi::export]
 pub fn set_keepalive(handle: i32, interval_secs: u32) -> Result<(), TunnelError> {
-    info!("FFI set_keepalive(handle={}, interval_secs={})", handle, interval_secs);
+    info!(
+        "FFI set_keepalive(handle={}, interval_secs={})",
+        handle, interval_secs
+    );
     let sessions = SESSIONS.lock().unwrap();
     let session = sessions.get(&handle).ok_or(TunnelError::InvalidHandle)?;
-    session.keepalive_knob.store(interval_secs as u64, Ordering::Relaxed);
+    session
+        .keepalive_knob
+        .store(interval_secs as u64, Ordering::Relaxed);
     // Wake the transport task so it notices the knob change immediately.
     // Without this, a Dormant transport has no timers and would sleep until
     // the next inbound/outbound packet.
