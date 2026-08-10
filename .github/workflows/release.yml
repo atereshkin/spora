@@ -1,0 +1,176 @@
+name: release
+
+# Tagging `v*` builds every artifact, verifies it, and creates a DRAFT GitHub
+# Release (publish is a deliberate human step). Tagging `test-release-*` runs
+# the identical build + verification but creates no release — a dry run for
+# changes to this workflow.
+#
+# Artifacts:
+#   spora-<tag>-linux-{x86_64,aarch64}.tar.gz        CLI (static musl)
+#   spora-relay-<tag>-linux-{x86_64,aarch64}.tar.gz  relay (static musl)
+#   spora-ffi-<tag>-android.zip                      jniLibs (4 ABIs) + Kotlin bindings
+#   SHA256SUMS
+
+on:
+  push:
+    tags: ['v*', 'test-release-*']
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Ship stripped binaries; symbols can be rebuilt from the tag if needed.
+  CARGO_PROFILE_RELEASE_STRIP: "true"
+
+jobs:
+  linux-bins:
+    # Each leg builds natively on its own architecture (GitHub's arm64 runners
+    # are free for public repos), so no cross toolchain is involved: musl-tools
+    # provides the target-native musl-gcc for ring/libsqlite3-sys/jemalloc.
+    name: linux ${{ matrix.arch }} (static musl)
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+            arch: x86_64
+            filearch: x86-64
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+            arch: aarch64
+            filearch: aarch64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Install musl toolchain
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - name: Build
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+        run: cargo build --release --target ${{ matrix.target }} -p spora-cli -p relay
+
+      - name: Verify binaries
+        run: |
+          for pkg in spora-cli relay spora-issuer; do
+            info=$(file -b "target/${{ matrix.target }}/release/$pkg")
+            echo "$pkg: $info"
+            grep -qE 'statically linked|static-pie' <<<"$info" \
+              || { echo "::error::$pkg is not statically linked"; exit 1; }
+            grep -q '${{ matrix.filearch }}' <<<"$info" \
+              || { echo "::error::$pkg is not ${{ matrix.filearch }}"; exit 1; }
+          done
+          # native smoke test (both legs run natively on their runner arch)
+          ./target/${{ matrix.target }}/release/spora-cli --help | grep -qi share \
+            || { echo "::error::spora-cli --help smoke test failed"; exit 1; }
+          ./target/${{ matrix.target }}/release/relay --help >/dev/null \
+            || { echo "::error::relay --help smoke test failed"; exit 1; }
+
+      - name: Stage tarballs
+        run: |
+          mkdir -p stage dist
+          install -m 755 target/${{ matrix.target }}/release/spora-cli stage/spora
+          tar -C stage -czf "dist/spora-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz" spora
+          rm stage/spora
+          install -m 755 target/${{ matrix.target }}/release/relay stage/spora-relay
+          install -m 755 target/${{ matrix.target }}/release/spora-issuer stage/spora-issuer
+          tar -C stage -czf "dist/spora-relay-${{ github.ref_name }}-linux-${{ matrix.arch }}.tar.gz" spora-relay spora-issuer
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: linux-${{ matrix.arch }}
+          path: dist/
+
+  ffi-bundle:
+    name: android ffi bundle
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android,armv7-linux-androideabi,i686-linux-android,x86_64-linux-android
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android-ffi
+          cache-on-failure: true
+
+      - name: Install cargo-ndk
+        run: command -v cargo-ndk >/dev/null || cargo install cargo-ndk --locked
+
+      - name: Build bundle
+        run: ./build-ffi.sh --release --out dist-ffi
+
+      - name: Verify bundle
+        run: |
+          check() { # abi, expected `file` substring
+            so="dist-ffi/jniLibs/$1/libspora_ffi.so"
+            [ -f "$so" ] || { echo "::error::missing $so"; exit 1; }
+            info=$(file -b "$so"); echo "$1: $info"
+            grep -qE "$2" <<<"$info" || { echo "::error::$1: expected $2"; exit 1; }
+          }
+          check arm64-v8a   'ARM aarch64'
+          check armeabi-v7a '32-bit.*ARM'
+          check x86         'Intel (80386|i386)'
+          check x86_64      'x86-64'
+          test -s dist-ffi/kotlin/uniffi/spora_ffi/spora_ffi.kt \
+            || { echo "::error::Kotlin bindings missing"; exit 1; }
+
+      - name: Zip bundle
+        run: |
+          {
+            echo "tag: ${{ github.ref_name }}"
+            echo "commit: ${{ github.sha }}"
+            echo "ndk: $ANDROID_NDK_LATEST_HOME"
+            echo "rustc: $(rustc --version)"
+          } > dist-ffi/BUNDLE_INFO
+          mkdir -p dist
+          (cd dist-ffi && zip -qr "../dist/spora-ffi-${{ github.ref_name }}-android.zip" .)
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ffi-bundle
+          path: dist/
+
+  release:
+    name: draft github release
+    if: startsWith(github.ref_name, 'v')
+    needs: [linux-bins, ffi-bundle]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: cd dist && sha256sum * > SHA256SUMS
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${{ github.ref_name }}" \
+            --draft --verify-tag \
+            --title "spora ${{ github.ref_name }}" \
+            --generate-notes \
+            dist/*
