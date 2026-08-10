@@ -10,11 +10,15 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 45
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: dtolnay/rust-toolchain@stable
 
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Every red run otherwise recompiles the workspace from scratch —
+          # the deps cache is worth saving even when a suite fails.
+          cache-on-failure: true
 
       # The spora-lab suites run inside unprivileged user namespaces.
       # Ubuntu 24.04 restricts those via AppArmor by default; lift the
@@ -46,7 +50,7 @@ jobs:
 
       - name: Upload perf metrics
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: lab-perf
           path: lab-perf.json
