@@ -17,6 +17,10 @@ url = "2.5.7"
 
 [target.'cfg(not(windows))'.dependencies]
 tokio-tun = "0.12.1"
+
+# jemalloc-sys does not build on (at least) aarch64-musl; the static musl
+# release binaries use the system allocator instead (see main.rs GLOBAL).
+[target.'cfg(all(not(windows), not(target_env = "musl")))'.dependencies]
 tikv-jemallocator = "0.6"
 
 [dev-dependencies]

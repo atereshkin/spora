@@ -12,10 +12,13 @@ mod os_route;
 /// client. Non-zero opts out of spora-core's dormant ("screen off") mode.
 const KEEPALIVE_PROBE_SECS: u64 = 10;
 
-/// Use jemalloc on non-Windows. The default glibc allocator holds onto pages
-/// under heavy alloc/free churn (every IP packet on the share side allocates
-/// a `Vec<u8>`); jemalloc returns memory to the OS far more aggressively.
-#[cfg(not(windows))]
+/// Use jemalloc on non-Windows glibc targets. The default glibc allocator
+/// holds onto pages under heavy alloc/free churn (every IP packet on the
+/// share side allocates a `Vec<u8>`); jemalloc returns memory to the OS far
+/// more aggressively. Excluded on musl (the static release builds):
+/// jemalloc-sys does not build for aarch64-musl, and musl's own allocator
+/// does not have glibc's page-retention behavior.
+#[cfg(all(not(windows), not(target_env = "musl")))]
 #[global_allocator]
 static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
 
