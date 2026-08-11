@@ -32,7 +32,7 @@ rustls-webpki = { version = "0.103", default-features = false, features = ["std"
 subtle = "2"
 base64 = "0.22"
 rusqlite = { version = "0.32", features = ["bundled"] }
-lru = "0.16"
+lru = "0.18"
 
 [dev-dependencies]
 tokio = { version = "1.40.0", features = ["full", "test-util"] }
