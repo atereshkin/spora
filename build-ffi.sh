@@ -20,14 +20,29 @@ cd "$(dirname "$0")"
 
 PROFILE=debug
 OUT=""
+ABIS=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --release) PROFILE=release ;;
     --out) OUT="${2:?--out needs a directory}"; shift ;;
+    --abi) ABIS+=("${2:?--abi needs an ABI name}"); shift ;;
     *) echo "unknown argument: $1" >&2; exit 2 ;;
   esac
   shift
 done
+# default: all four ABIs; --abi (repeatable) restricts, e.g. CI building only
+# arm64-v8a + x86_64 (device + emulator)
+[ ${#ABIS[@]} -gt 0 ] || ABIS=(arm64-v8a armeabi-v7a x86 x86_64)
+
+triple_of() {
+  case "$1" in
+    arm64-v8a) echo aarch64-linux-android ;;
+    armeabi-v7a) echo armv7-linux-androideabi ;;
+    x86) echo i686-linux-android ;;
+    x86_64) echo x86_64-linux-android ;;
+    *) echo "unknown ABI: $1" >&2; return 1 ;;
+  esac
+}
 
 if [ -z "${ANDROID_NDK_HOME:-}" ]; then
   if [ -n "${ANDROID_NDK_LATEST_HOME:-}" ]; then
@@ -48,16 +63,18 @@ FLAGS=()
 
 # cargo-ndk resolves per-ABI clang/sysroot from ANDROID_NDK_HOME and lays the
 # .so files out as $JNIDIR/<abi>/libspora_ffi.so.
-cargo ndk -t arm64-v8a -t armeabi-v7a -t x86 -t x86_64 \
-  -o "$JNIDIR" build -p spora-ffi "${FLAGS[@]}"
+TARGETS=()
+for abi in "${ABIS[@]}"; do TARGETS+=(-t "$abi"); done
+cargo ndk "${TARGETS[@]}" -o "$JNIDIR" build -p spora-ffi "${FLAGS[@]}"
 
-for abi in arm64-v8a armeabi-v7a x86 x86_64; do
+for abi in "${ABIS[@]}"; do
   [ -f "$JNIDIR/$abi/libspora_ffi.so" ] || { echo "missing $JNIDIR/$abi/libspora_ffi.so" >&2; exit 1; }
 done
 
-# generate the Kotlin scaffolding from the built library
+# generate the Kotlin scaffolding from the built library (any ABI's .so works;
+# use the first one built)
 cargo run --bin uniffi-bindgen generate \
-  --library "target/aarch64-linux-android/$PROFILE/libspora_ffi.so" \
+  --library "target/$(triple_of "${ABIS[0]}")/$PROFILE/libspora_ffi.so" \
   --language kotlin --out-dir "$KOUT"
 [ -s "$KOUT/uniffi/spora_ffi/spora_ffi.kt" ] || { echo "bindgen produced no spora_ffi.kt" >&2; exit 1; }
 
