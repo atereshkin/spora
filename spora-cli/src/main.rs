@@ -398,7 +398,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     parse_host_port(&stun).map_err(|e| format!("--stun: {}", e))?;
                     config.stun_server = stun;
                 }
-                let result = connect(url, &config).await.unwrap();
+                let result = match connect(url, &config).await {
+                    Ok(result) => result,
+                    Err(e) => return Err(format!("could not connect: {e}").into()),
+                };
                 // The CLI is always-on and has no screen state, so opt out of the
                 // Android dormant/battery semantics. A keepalive knob of 0 means
                 // "screen off" to spora-core, which disables the liveness probe
