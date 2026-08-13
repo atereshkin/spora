@@ -334,35 +334,52 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
             .relays
             .iter()
             .any(|r| !r.protocol.is_relayed() && r.host.parse::<std::net::Ipv4Addr>().is_err());
-    let std_socket = bind_share_udp(&config.protector, want_v6, bind_port)?;
-    let std_clone = std_socket
-        .try_clone()
-        .map_err(|e| format!("socket try_clone: {}", e))?;
-    std_clone
-        .set_nonblocking(true)
-        .map_err(|e| format!("set_nonblocking on cloned socket: {}", e))?;
-    let registrar = Arc::new(
-        tokio::net::UdpSocket::from_std(std_clone)
-            .map_err(|e| format!("tokio::from_std: {}", e))?,
-    );
-
-    let endpoint = server_endpoint(std_socket, &identity, &config.timings)?;
-    info!(
-        "share: e2e endpoint up, rk {:x?}, registering with {:?}, direct bind_port {}",
-        &routing_key[..4],
-        register_addrs,
-        bind_port
-    );
 
     // Sign each relay registration with the identity's certificate key, so the
     // relay (which holds no secret) can verify the routing key is ours and
-    // reject an on-path attacker's attempt to rebind it.
-    let signer = relay_client::protocol::RegisterSigner::new(
-        &identity.cert_der_bytes,
-        &identity.key_der_bytes,
-    )
-    .map_err(|e| format!("build register signer: {}", e))?
-    .with_token(config.relay_token.clone());
+    // reject an on-path attacker's attempt to rebind it. ONE signer is shared
+    // by every registrar generation (see QuicListenerCtx): its strictly-
+    // increasing timestamp series must not restart when the listener rolls.
+    let signer = Arc::new(std::sync::Mutex::new(
+        relay_client::protocol::RegisterSigner::new(
+            &identity.cert_der_bytes,
+            &identity.key_der_bytes,
+        )
+        .map_err(|e| format!("build register signer: {}", e))?
+        .with_token(config.relay_token.clone()),
+    ));
+
+    let cancel = CancellationToken::new();
+    let listener_ctx = QuicListenerCtx {
+        protector: config.protector.clone(),
+        want_v6,
+        register_addrs,
+        register_interval: config.timings.register_interval,
+        signer,
+        identity: identity.clone(),
+        timings: config.timings.clone(),
+        cancel: cancel.clone(),
+    };
+    // Direct endpoints get their own PERMANENT endpoint on the advertised
+    // port: it never rolls (the port is in the URL) and never registers.
+    // The relay-facing listener always starts on an ephemeral port and
+    // rolls per accepted session. Splitting the two means a mixed
+    // Direct + relay config gets the full per-port behavior on its relay
+    // path instead of falling back to the legacy shared endpoint.
+    let direct_endpoint = if bind_port != 0 {
+        let sock = bind_share_udp(&config.protector, want_v6, bind_port)?;
+        Some(server_endpoint(sock, &identity, &config.timings)?)
+    } else {
+        None
+    };
+    // Generation 0; bind errors surface from share() itself.
+    let listener = listener_ctx.spawn_listener(0)?;
+    info!(
+        "share: e2e endpoint up, rk {:x?}, registering with {:?}, direct bind_port {}",
+        &routing_key[..4],
+        listener_ctx.register_addrs,
+        bind_port
+    );
 
     // Connection log: opened before the share goes live, so a default-on log
     // that cannot be written fails here loudly instead of running unlogged.
@@ -375,27 +392,113 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
         None => None,
     };
 
-    let cancel = CancellationToken::new();
     let cancel_child = cancel.clone();
     let config_for_loop = config.clone();
     let identity_for_loop = identity.clone();
-    let register_interval = config.timings.register_interval;
-    let task = tokio::spawn(async move {
-        // Run the relay registrar concurrently *inside* this task rather than
-        // as a detached child. `register_loop` never returns, so the select
-        // resolves only when `run_share_loop` does (on cancellation or endpoint
-        // close), and dropping this task's future — e.g. via `ShareSession::abort()`,
-        // which aborts before the cancelled branch can be re-polled — drops the
-        // registrar with it. A detached `tokio::spawn` would instead leak: its
-        // `JoinHandle` is a local here, and dropping a `JoinHandle` does not abort
-        // the task, so the registrar would keep flapping the relay binding forever.
-        tokio::select! {
-            _ = relay_client::register_loop(registrar, register_addrs, register_interval, signer) => {}
-            _ = run_share_loop(endpoint, identity_for_loop, cancel_child, config_for_loop, conn_log) => {}
-        }
-    });
+    let task = tokio::spawn(run_share_loop(
+        listener,
+        listener_ctx,
+        direct_endpoint,
+        identity_for_loop,
+        cancel_child,
+        config_for_loop,
+        conn_log,
+    ));
 
     Ok(ShareSession { url, cancel, task })
+}
+
+/// Everything needed to mint a fresh QUIC listener generation. The rolling
+/// listener is the sharer half of the per-port session design: every accepted
+/// session PERMANENTLY claims the socket it arrived on (its own endpoint, its
+/// own relay flow, its own port), and the routing key immediately moves to a
+/// fresh socket via re-registration — the relay's `rk -> addr` binding always
+/// points at a port with no active flow, so a new client can never be
+/// dropped for an old client's sake (the "actively-serving lockout"), and
+/// same-DCID Initials can never be swallowed by a previous session's
+/// connection (one endpoint per session). The relay needs no changes: its
+/// flow table is keyed by addresses (existing flows keep forwarding), and a
+/// REGISTER from a new source displaces the old binding.
+///
+/// NAT caveat (pre-existing for a client-less sharer, wider now): a listener
+/// socket's NAT mapping is kept alive ONLY by its outbound REGISTERs, which
+/// the relay never answers — on NATs whose unreplied-UDP timeout is at or
+/// below the register interval (netfilter default: 30s, equal to ours;
+/// CGNAT often less) the mapping can lapse between REGISTERs and inbound
+/// Initials forwarded by the relay are dropped until the next REGISTER
+/// re-opens it. The clean fix is a tiny relay REGISTER-ACK (makes the
+/// conntrack state "replied", typical timeout 120s+, and doubles as
+/// registration confirmation) — relay follow-up, not done here.
+struct QuicListenerCtx {
+    protector: SocketProtector,
+    want_v6: bool,
+    register_addrs: Vec<SocketAddr>,
+    register_interval: Duration,
+    signer: Arc<std::sync::Mutex<relay_client::protocol::RegisterSigner>>,
+    identity: Arc<Identity>,
+    timings: Timings,
+    cancel: CancellationToken,
+}
+
+/// One listener generation: the quinn endpoint clients currently land on and
+/// the registrar task announcing its socket to the relays.
+struct QuicListener {
+    endpoint: quinn::Endpoint,
+    registrar: Option<JoinHandle<()>>,
+}
+
+impl QuicListenerCtx {
+    /// Bind a socket (`bind_port` 0 except for generation 0 of a Direct
+    /// sharer), build the endpoint, and start registering from it.
+    fn spawn_listener(&self, bind_port: u16) -> Result<QuicListener, String> {
+        let std_socket = bind_share_udp(&self.protector, self.want_v6, bind_port)?;
+        let std_clone = std_socket
+            .try_clone()
+            .map_err(|e| format!("socket try_clone: {}", e))?;
+        std_clone
+            .set_nonblocking(true)
+            .map_err(|e| format!("set_nonblocking on cloned socket: {}", e))?;
+        let registrar_sock = Arc::new(
+            tokio::net::UdpSocket::from_std(std_clone)
+                .map_err(|e| format!("tokio::from_std: {}", e))?,
+        );
+        let endpoint = server_endpoint(std_socket, &self.identity, &self.timings)?;
+
+        // The registrar selects on the share's cancel token, so `stop()` and
+        // `abort()` (which cancels before aborting) both end it; a roll ends
+        // it via `QuicListener::demote`. `register_loop`'s first tick fires
+        // immediately, so a fresh generation displaces the old registration
+        // within one packet's flight time.
+        let registrar = (!self.register_addrs.is_empty()).then(|| {
+            let addrs = self.register_addrs.clone();
+            let interval = self.register_interval;
+            let signer = self.signer.clone();
+            let cancel = self.cancel.clone();
+            tokio::spawn(async move {
+                tokio::select! {
+                    _ = cancel.cancelled() => {}
+                    _ = relay_client::register_loop(registrar_sock, addrs, interval, signer) => {}
+                }
+            })
+        });
+        Ok(QuicListener {
+            endpoint,
+            registrar,
+        })
+    }
+}
+
+impl QuicListener {
+    /// Demote to session-private: stop announcing this socket (the routing
+    /// key belongs to the next generation) and refuse new handshakes — a
+    /// client racing the re-registration gets a fast refusal (dial fails,
+    /// redial lands on the new port) instead of a hang.
+    fn demote(&mut self) {
+        if let Some(r) = self.registrar.take() {
+            r.abort();
+        }
+        self.endpoint.set_server_config(None);
+    }
 }
 
 /// Spawn TCP/TLS registrar pools for every `TcpTls` relay in the config. Each
@@ -404,7 +507,7 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
 fn spawn_tcp_registrars(
     config: &Config,
     identity: Arc<Identity>,
-    session_tx: tokio::sync::mpsc::UnboundedSender<carrier::PeerSession>,
+    session_tx: tokio::sync::mpsc::UnboundedSender<(carrier::PeerSession, Option<u64>)>,
     cancel: CancellationToken,
 ) {
     // Connections kept parked per relay so a client always finds one.
@@ -443,7 +546,7 @@ fn spawn_tcp_registrars(
 async fn tcp_park_worker(
     relay_addr: SocketAddr,
     identity: Arc<Identity>,
-    session_tx: tokio::sync::mpsc::UnboundedSender<carrier::PeerSession>,
+    session_tx: tokio::sync::mpsc::UnboundedSender<(carrier::PeerSession, Option<u64>)>,
     cancel: CancellationToken,
     protector: SocketProtector,
     token: Vec<u8>,
@@ -454,7 +557,7 @@ async fn tcp_park_worker(
         }
         match park_and_accept(relay_addr, identity.as_ref(), &protector, &token, &cancel).await {
             Ok(Some(session)) => {
-                if session_tx.send(session).is_err() {
+                if session_tx.send((session, None)).is_err() {
                     return; // the share loop is gone
                 }
             }
@@ -532,7 +635,7 @@ async fn park_and_accept(
 fn spawn_noise_registrar(
     config: &Config,
     identity: Arc<Identity>,
-    session_tx: tokio::sync::mpsc::UnboundedSender<carrier::PeerSession>,
+    session_tx: tokio::sync::mpsc::UnboundedSender<(carrier::PeerSession, Option<u64>)>,
     cancel: CancellationToken,
 ) {
     let nz_relays: Vec<RelayEndpoint> = config
@@ -564,37 +667,83 @@ fn spawn_noise_registrar(
             return;
         }
         let want_v6 = addrs.iter().any(|a| a.is_ipv6());
-        let std_socket = match bind_share_udp(&protector, want_v6, 0) {
-            Ok(s) => s,
-            Err(e) => {
-                warn!("[share] nz: bind failed: {e}");
-                return;
-            }
-        };
-        if let Err(e) = std_socket.set_nonblocking(true) {
-            warn!("[share] nz: set_nonblocking: {e}");
-            return;
-        }
-        let socket = match UdpSocket::from_std(std_socket) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                warn!("[share] nz: from_std: {e}");
-                return;
-            }
-        };
+        // One signer across every generation: the strictly-increasing
+        // timestamp series must survive listener rolls (see QuicListenerCtx).
         let signer = match relay_client::protocol::RegisterSigner::new(&cert_der, &key_der) {
-            Ok(s) => s.with_token(token),
+            Ok(s) => Arc::new(std::sync::Mutex::new(s.with_token(token))),
             Err(e) => {
                 warn!("[share] nz: build register signer: {e}");
                 return;
             }
         };
-        info!("[share] nz carrier up, registering with {:?}", addrs);
-        let reg_socket = socket.clone();
-        tokio::select! {
-            _ = cancel.cancelled() => {}
-            _ = relay_client::register_loop(reg_socket, addrs, register_interval, signer) => {}
-            _ = noise_accept_dispatcher(socket, identity, session_tx, hs_timeout, idle, cancel.clone()) => {}
+
+        // Rolling listener, nz edition: each generation binds a fresh socket,
+        // registers it, and serves handshakes until its dispatcher delivers a
+        // session — that socket then belongs to the session (the dispatcher
+        // keeps pumping it, but stops accepting new handshakes) and the next
+        // generation takes over the routing key.
+        loop {
+            // A transient bind failure must not kill the nz carrier for the
+            // share's lifetime — retry until it works or the share stops.
+            let socket = loop {
+                let bound = bind_share_udp(&protector, want_v6, 0).and_then(|s| {
+                    s.set_nonblocking(true)
+                        .map_err(|e| format!("set_nonblocking: {e}"))?;
+                    UdpSocket::from_std(s)
+                        .map(Arc::new)
+                        .map_err(|e| format!("from_std: {e}"))
+                });
+                match bound {
+                    Ok(s) => break s,
+                    Err(e) => {
+                        warn!("[share] nz: listener bind failed: {e}; retrying");
+                        tokio::select! {
+                            _ = cancel.cancelled() => return,
+                            _ = tokio::time::sleep(Duration::from_secs(2)) => {}
+                        }
+                    }
+                }
+            };
+            info!("[share] nz carrier up, registering with {:?}", addrs);
+
+            let registrar = {
+                let sock = socket.clone();
+                let addrs = addrs.clone();
+                let signer = signer.clone();
+                let cancel = cancel.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {}
+                        _ = relay_client::register_loop(sock, addrs, register_interval, signer) => {}
+                    }
+                })
+            };
+            let accepting = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            let (rolled_tx, rolled_rx) = tokio::sync::oneshot::channel::<()>();
+            let dispatcher = tokio::spawn(noise_accept_dispatcher(
+                socket,
+                identity.clone(),
+                session_tx.clone(),
+                hs_timeout,
+                idle,
+                cancel.clone(),
+                accepting,
+                Arc::new(std::sync::Mutex::new(Some(rolled_tx))),
+            ));
+
+            tokio::select! {
+                _ = cancel.cancelled() => {
+                    registrar.abort();
+                    // The dispatcher exits via its own cancel arm.
+                    return;
+                }
+                // A session claimed this generation's socket: stop announcing
+                // it (the dispatcher runs on, serving the session) and roll.
+                _ = rolled_rx => {
+                    registrar.abort();
+                    drop(dispatcher); // detach; it lives with its session
+                }
+            }
         }
     });
 }
@@ -604,13 +753,22 @@ fn spawn_noise_registrar(
 /// `noise_accept` whose dispatcher-assigned index we record for routing. The
 /// relay is dumb, so all clients arrive from the relay's one address; demux is
 /// purely by the session index, never by source address.
+///
+/// Rolling-listener wiring: on the FIRST successfully-authenticated session
+/// the accept task clears `accepting` and fires `rolled` — the generation
+/// manager then registers a fresh socket and this dispatcher becomes
+/// session-private: it keeps routing the live session's datagrams but
+/// ignores new handshakes, and exits once its routing tables empty out.
+#[allow(clippy::too_many_arguments)]
 async fn noise_accept_dispatcher(
     socket: Arc<UdpSocket>,
     identity: Arc<Identity>,
-    session_tx: tokio::sync::mpsc::UnboundedSender<carrier::PeerSession>,
+    session_tx: tokio::sync::mpsc::UnboundedSender<(carrier::PeerSession, Option<u64>)>,
     hs_timeout: Duration,
     idle: Duration,
     cancel: CancellationToken,
+    accepting: Arc<std::sync::atomic::AtomicBool>,
+    rolled: Arc<std::sync::Mutex<Option<tokio::sync::oneshot::Sender<()>>>>,
 ) {
     use crate::transport::noise::{DATA_MIN_LEN, NZ_MSG1_MIN, NZ_TUNNEL_MTU, noise_accept};
     type RawTx = tokio::sync::mpsc::UnboundedSender<(Vec<u8>, SocketAddr)>;
@@ -632,15 +790,37 @@ async fn noise_accept_dispatcher(
     const MAX_INFLIGHT: usize = 4096;
     let (reap_tx, mut reap_rx) = tokio::sync::mpsc::unbounded_channel::<(u32, u32)>();
     let mut buf = vec![0u8; 2048];
+    // A demoted dispatcher's session can die SILENTLY (its peer just stops
+    // sending), which recv_from alone can never observe — sweep the routing
+    // tables for closed session channels on a timer and exit (releasing the
+    // socket) once nothing is left to route. Without this, every nz session
+    // would leak a socket + task for the share's lifetime.
+    let mut cleanup = tokio::time::interval(Duration::from_secs(5));
+    cleanup.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
     loop {
+        let demoted = !accepting.load(std::sync::atomic::Ordering::Relaxed);
         let (n, src) = tokio::select! {
             _ = cancel.cancelled() => return,
+            _ = cleanup.tick() => {
+                if demoted {
+                    by_index.retain(|_, tx| !tx.is_closed());
+                    by_client.retain(|_, ia| by_index.contains_key(ia));
+                    if by_index.is_empty() {
+                        debug!("[share] nz: demoted dispatcher done, releasing socket");
+                        return;
+                    }
+                }
+                continue;
+            }
             // A spawned accept task failed to authenticate — drop its pre-auth
             // routing entries so a forged-msg1 spray can't leak the tables.
             Some((ia, ib)) = reap_rx.recv() => {
                 by_index.remove(&ia);
                 by_client.remove(&ib);
+                if demoted && by_index.is_empty() {
+                    return;
+                }
                 continue;
             }
             r = socket.recv_from(&mut buf) => match r {
@@ -662,6 +842,11 @@ async fn noise_accept_dispatcher(
                 if dead {
                     by_index.remove(&idx);
                     by_client.retain(|_, v| *v != idx);
+                    // A demoted (rolled-away) dispatcher whose session is
+                    // gone has nothing left to route: release the socket.
+                    if demoted && by_index.is_empty() {
+                        return;
+                    }
                 }
                 continue;
             }
@@ -674,10 +859,18 @@ async fn noise_accept_dispatcher(
                     .try_into()
                     .unwrap(),
             );
+            // Retransmit for an IN-FLIGHT handshake: always redeliver, even
+            // when demoted — this dispatcher still owns every handshake it
+            // started, and the relay keeps forwarding by the client's flow.
             if let Some(&idx_a) = by_client.get(&idx_b) {
                 if let Some(tx) = by_index.get(&idx_a) {
                     let _ = tx.send((clean.clone(), src)); // retransmit -> same session
                 }
+                continue;
+            }
+            // NEW handshakes only while this socket holds the routing key;
+            // once demoted they belong to the next generation.
+            if demoted {
                 continue;
             }
             // Shed load past the cap so a forged-msg1 burst can't exhaust memory
@@ -702,6 +895,8 @@ async fn noise_accept_dispatcher(
             let id = identity.clone();
             let stx = session_tx.clone();
             let reap = reap_tx.clone();
+            let accepting = accepting.clone();
+            let rolled = rolled.clone();
             tokio::spawn(async move {
                 match noise_accept(sock, rx, idx_a, None, id.as_ref(), hs_timeout, idle).await {
                     Ok(mut transport) => {
@@ -709,13 +904,31 @@ async fn noise_accept_dispatcher(
                         let signal = transport
                             .take_signal()
                             .map(crate::signal::SignalChannel::noise);
-                        let _ = stx.send(carrier::PeerSession {
-                            transport: Box::new(transport),
-                            remote_addr,
-                            quic_conn: None,
-                            signal,
-                            fixed_mtu: NZ_TUNNEL_MTU,
-                        });
+                        // Deliver the session FIRST: if the share loop is
+                        // gone the send fails and we must not roll (the
+                        // manager would otherwise mint generations for a
+                        // dead share until cancellation propagates).
+                        let delivered = stx
+                            .send((
+                                carrier::PeerSession {
+                                    transport: Box::new(transport),
+                                    remote_addr,
+                                    quic_conn: None,
+                                    signal,
+                                    fixed_mtu: NZ_TUNNEL_MTU,
+                                },
+                                None,
+                            ))
+                            .is_ok();
+                        // The session claims this generation's socket: stop
+                        // accepting here and let the manager roll to a
+                        // fresh one.
+                        if delivered {
+                            accepting.store(false, std::sync::atomic::Ordering::Relaxed);
+                            if let Some(tx) = rolled.lock().expect("rolled sender").take() {
+                                let _ = tx.send(());
+                            }
+                        }
                     }
                     // Reap the pre-auth routing entries; the live-session case is
                     // covered by the reactive cleanup on a dead by_index sender.
@@ -731,19 +944,41 @@ async fn noise_accept_dispatcher(
 }
 
 async fn run_share_loop(
-    endpoint: quinn::Endpoint,
+    mut listener: QuicListener,
+    roll_ctx: QuicListenerCtx,
+    direct_endpoint: Option<quinn::Endpoint>,
     identity: Arc<Identity>,
     cancel: CancellationToken,
     config: Config,
     conn_log: Option<ConnLog>,
 ) {
+    // EVERY exit from this loop — cancellation, endpoint death, a panic in
+    // an event hook — must stop the detached registrar generations and
+    // carrier workers, which all select on `cancel`. The guard makes any
+    // exit equivalent to an explicit stop; without it, an endpoint-driver
+    // death would leave the last registrar re-announcing a dead socket to
+    // the relays forever.
+    let _cancel_guard = cancel.clone().drop_guard();
     let secret = identity.secret;
     let mut tunnel_cancel: Option<CancellationToken> = None;
     let mut iteration: u32 = 0;
-    // Authenticated sessions arrive here from the per-connection QUIC auth tasks
-    // and the TCP/TLS registrar pools, unified as carrier::PeerSession.
+    // Generation of the ACTIVE session's endpoint (None: direct/tcp/nz).
+    let mut active_gen: Option<u64> = None;
+    // Which listener generation the CURRENT `listener` is; sessions are
+    // tagged with the generation they were accepted on so the loop knows
+    // whether an arriving session claims the current listener (-> roll) or
+    // came from a demoted one / another carrier.
+    let mut generation: u64 = 0;
+    // Endpoints of demoted generations, kept so their session (at most one
+    // is active, plus briefly-draining kicked ones) stays served and the
+    // socket is closed once no session can be using it anymore.
+    let mut demoted: std::collections::HashMap<u64, quinn::Endpoint> =
+        std::collections::HashMap::new();
+    // Authenticated sessions arrive here from the per-connection QUIC auth
+    // tasks (tagged with their listener generation) and the TCP/TLS + nz
+    // registrars (untagged), unified as carrier::PeerSession.
     let (session_tx, mut session_rx) =
-        tokio::sync::mpsc::unbounded_channel::<carrier::PeerSession>();
+        tokio::sync::mpsc::unbounded_channel::<(carrier::PeerSession, Option<u64>)>();
 
     // Sharer-side TCP/TLS carrier: park connections at each TcpTls relay and
     // deliver each spliced client as a session into the same channel.
@@ -770,7 +1005,14 @@ async fn run_share_loop(
             _ = cancel.cancelled() => {
                 info!("share cancelled");
                 if let Some(tc) = tunnel_cancel.take() { tc.cancel(); }
-                endpoint.close(0u32.into(), b"share-cancelled");
+                listener.demote();
+                listener.endpoint.close(0u32.into(), b"share-cancelled");
+                if let Some(ep) = &direct_endpoint {
+                    ep.close(0u32.into(), b"share-cancelled");
+                }
+                for (_, ep) in demoted.drain() {
+                    ep.close(0u32.into(), b"share-cancelled");
+                }
                 break;
             }
             // Accept connection attempts and authenticate each one in its own
@@ -778,18 +1020,19 @@ async fn run_share_loop(
             // only the routing key) can't block the accept loop and starve
             // legitimate peers. The sharer still serves one tunnel at a time;
             // we just no longer serialize the handshake+auth of every attempt.
-            incoming = endpoint.accept() => {
+            incoming = listener.endpoint.accept() => {
                 match incoming {
                     None => { info!("share endpoint closed"); break; }
                     Some(incoming) => {
                         let tx = session_tx.clone();
                         let cancel = cancel.clone();
+                        let listener_gen = generation;
                         tokio::spawn(async move {
                             tokio::select! {
                                 _ = cancel.cancelled() => {}
                                 res = authenticate_incoming(incoming, &secret, true) => match res {
                                     Ok(session) => {
-                                        let _ = tx.send(carrier::PeerSession::from_quic(session));
+                                        let _ = tx.send((carrier::PeerSession::from_quic(session), Some(listener_gen)));
                                     }
                                     Err(e) => warn!("[share] accept failed: {}", e),
                                 }
@@ -798,13 +1041,74 @@ async fn run_share_loop(
                     }
                 }
             }
-            Some(session) = session_rx.recv() => {
+            // Direct (relay-less) clients dial the permanent advertised
+            // endpoint; their sessions never trigger a roll (untagged).
+            incoming = async { direct_endpoint.as_ref().unwrap().accept().await },
+                if direct_endpoint.is_some() =>
+            {
+                match incoming {
+                    None => { info!("share direct endpoint closed"); break; }
+                    Some(incoming) => {
+                        let tx = session_tx.clone();
+                        let cancel = cancel.clone();
+                        tokio::spawn(async move {
+                            tokio::select! {
+                                _ = cancel.cancelled() => {}
+                                res = authenticate_incoming(incoming, &secret, true) => match res {
+                                    Ok(session) => {
+                                        let _ = tx.send((carrier::PeerSession::from_quic(session), None));
+                                    }
+                                    Err(e) => warn!("[share] direct accept failed: {}", e),
+                                }
+                            }
+                        });
+                    }
+                }
+            }
+            Some((session, from_gen)) = session_rx.recv() => {
                 iteration += 1;
                 let remote_addr = session.remote_addr;
                 emit(
                     &config.event_hook,
                     TunnelEvent::RelaySessionEstablished { peer: remote_addr },
                 );
+
+                // Roll: the session was accepted on the CURRENT listener, so
+                // that socket is now its private endpoint — mint the next
+                // generation and move the routing key there. On a roll
+                // failure (fd exhaustion, ...) keep the current listener:
+                // the share degrades to the legacy shared-endpoint behavior
+                // instead of dying.
+                if from_gen == Some(generation) {
+                    match roll_ctx.spawn_listener(0) {
+                        Ok(next) => {
+                            let mut old = std::mem::replace(&mut listener, next);
+                            old.demote();
+                            demoted.insert(generation, old.endpoint);
+                            generation += 1;
+                            debug!("[share #{iteration}] rolled listener to generation {generation}");
+                        }
+                        Err(e) => warn!("[share] listener roll failed: {e}; keeping current listener"),
+                    }
+                }
+
+                // Close demoted endpoints no session can be using anymore.
+                // Kept: the NEW active session's endpoint, and — for one
+                // more takeover — the endpoint of the session being
+                // replaced, so a stale-generation session that was already
+                // queued behind this one cannot have the rug pulled from
+                // under a LIVE endpoint (its own arrival will be processed
+                // against a still-consistent map and self-heal by kick).
+                let prev_gen = active_gen;
+                active_gen = from_gen;
+                demoted.retain(|g, ep| {
+                    if Some(*g) == from_gen || Some(*g) == prev_gen {
+                        true
+                    } else {
+                        ep.close(0u32.into(), b"session-replaced");
+                        false
+                    }
+                });
 
                 if let Some(tc) = tunnel_cancel.take() {
                     info!("[share #{}] new peer, cancelling previous tunnel", iteration);

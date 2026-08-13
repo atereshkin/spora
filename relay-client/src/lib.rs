@@ -34,7 +34,7 @@ pub async fn register_loop(
     socket: Arc<tokio::net::UdpSocket>,
     relay_addrs: Vec<std::net::SocketAddr>,
     interval: std::time::Duration,
-    mut signer: protocol::RegisterSigner,
+    signer: Arc<std::sync::Mutex<protocol::RegisterSigner>>,
 ) {
     let mut tick = tokio::time::interval(interval);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
@@ -43,7 +43,12 @@ pub async fn register_loop(
         for relay_addr in &relay_addrs {
             // A fresh packet per relay: each carries a strictly-increasing
             // timestamp, so the relays never see a "replayed" (equal-ts) copy.
-            let pkt = signer.next_register_packet();
+            // The signer is SHARED across a sharer's successive registrar
+            // instances (the rolling listener re-registers from a fresh
+            // socket per accepted session): one strictly-increasing
+            // timestamp series means a new instance's first REGISTER can
+            // never be rejected as a replay of the old instance's last.
+            let pkt = signer.lock().expect("register signer").next_register_packet();
             if let Err(e) = socket.send_to(&pkt, relay_addr).await {
                 warn!("register_loop: send_to {} failed: {}", relay_addr, e);
             }

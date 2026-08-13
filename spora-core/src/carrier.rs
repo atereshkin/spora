@@ -25,7 +25,7 @@ use quinn::Connection;
 use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 
-use crate::e2e::{E2eSession, client_connect, client_endpoint};
+use crate::e2e::{E2eSession, client_connect};
 use crate::e2e_tls;
 use crate::identity::{ROUTING_KEY_LEN, RelayProtocol, SECRET_LEN};
 use crate::signal::SignalChannel;
@@ -108,11 +108,16 @@ pub(crate) fn relay_client_for(protocol: RelayProtocol) -> Box<dyn RelayClient> 
 }
 
 /// Shared QUIC dial (UDP relay + Direct): bind a local UDP socket in the
-/// target's family, pin the cert to `routing_key` (DCID = routing_key so a dumb
-/// relay routes the first Initial), handshake, authenticate with the secret.
-async fn quic_dial(ctx: DialCtx<'_>) -> Result<PeerSession, String> {
+/// target's family, pin the cert to `routing_key`, handshake, authenticate
+/// with the secret. `rk_dcid` sets the first Initial's DCID to the routing
+/// key — required on the relay path (it is how the dumb relay routes the
+/// Initial), harmful on a Direct dial (a shared DCID collides with the
+/// previous client's live/draining connection on the sharer's endpoint and
+/// the Initials are silently swallowed) — Direct uses random DCIDs.
+async fn quic_dial(ctx: DialCtx<'_>, rk_dcid: bool) -> Result<PeerSession, String> {
     let std_socket = bind_local_udp(ctx.protector, ctx.target)?;
-    let endpoint = client_endpoint(std_socket, ctx.routing_key, ctx.timings)?;
+    let endpoint =
+        crate::e2e::client_endpoint_with_dcid(std_socket, ctx.routing_key, ctx.timings, rk_dcid)?;
     let session = client_connect(&endpoint, ctx.target, &ctx.secret, ctx.expect_ack).await?;
     Ok(PeerSession::from_quic(session))
 }
@@ -189,7 +194,7 @@ impl RelayClient for UdpQuicRelayClient {
         RelayProtocol::UdpQuic
     }
     fn dial<'a>(&'a self, ctx: DialCtx<'a>) -> SessionFut<'a> {
-        Box::pin(quic_dial(ctx))
+        Box::pin(quic_dial(ctx, true))
     }
 }
 
@@ -201,7 +206,7 @@ impl RelayClient for DirectRelayClient {
         RelayProtocol::Direct
     }
     fn dial<'a>(&'a self, ctx: DialCtx<'a>) -> SessionFut<'a> {
-        Box::pin(quic_dial(ctx))
+        Box::pin(quic_dial(ctx, false))
     }
 }
 

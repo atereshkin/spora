@@ -82,13 +82,15 @@ There is exactly one QUIC connection — between A and B — even when traffic f
 
 Use `Identity::generate()` once and `Identity::from_bytes(&persisted)` thereafter. Round-trip via `to_bytes()` / `from_bytes()` is versioned and magic-checked (`b"sIDv"`, version 1).
 
-### Sharer (A) flow — `spora_core::share(identity, config)`
+### Sharer (A) flow — `spora_core::share(identity, config)` (rolling listener / per-port sessions)
 
 1. Receive `Identity` from the platform layer (already persisted on disk or in the OS keystore).
-2. Bind UDP socket; `try_clone()` it so quinn owns one fd and `register_loop` uses the other.
-3. Spawn `relay_client::register_loop` — every 30s sends a `[CTRL_MAGIC | REGISTER | routing_key]` UDP packet to the relay; the relay updates `routing_key -> A_addr`.
-4. Stand up a quinn server `Endpoint` with the identity's cert. `accept_one()` performs the QUIC handshake, accepts a bidi stream, reads B's 16-byte secret, verifies, and yields an `E2eSession { conn, transport, signal }`.
-5. Per session: wrap `transport` in `UpgradableTransport → KeepAliveTransport`; spawn `try_direct_upgrade` (responder role, with the identity); spawn the netstack tunnel.
+2. Bind the generation-0 LISTENER socket (ephemeral port); `try_clone()` it so quinn owns one fd and the registrar uses the other. Spawn its registrar — every 30s a signed `[CTRL_MAGIC | REGISTER | routing_key]` packet to each UDP relay; the relay updates `routing_key -> A_addr`. One `RegisterSigner` (strictly-increasing timestamps) is shared across ALL generations.
+3. Per accepted+authenticated session, `run_share_loop` ROLLS: the session keeps the socket/endpoint it arrived on (its own port, its own relay flow, its own quinn endpoint), and a fresh listener socket + registrar generation takes over the routing key (old listener: registrar aborted, `set_server_config(None)`). The relay's binding therefore always points at a flow-free port — no "actively-serving" lockout for dead predecessors, no same-DCID Initial swallow — and a REGISTER from the new port displaces the old binding (no relay changes needed). Demoted endpoints are tracked and closed once no session can use them.
+4. `Direct` endpoints get a separate PERMANENT endpoint on the advertised port (never rolls, never registers); direct-dialing clients use random initial DCIDs (the routing-key DCID exists only for relay routing). The nz carrier rolls its dedicated socket the same way (dispatcher demotes, keeps serving its session, exits when its tables empty).
+5. Per session: wrap `transport` in `UpgradableTransport → KeepAliveTransport`; spawn `try_direct_upgrade` (responder role, with the identity); spawn the netstack tunnel. New peer kicks previous (two LIVE clients on one URL will alternate at `reconnect_delay` cadence — the fixed delay is the anti-storm pacing; real multi-client is future work, structurally easy now that each session owns an endpoint).
+
+NAT caveat: a listener's NAT mapping is kept alive only by outbound REGISTERs (relay never replies); on NATs with unreplied-UDP timeout <= register interval the mapping can lapse between REGISTERs. Planned fix: relay REGISTER-ACK (see `QuicListenerCtx` doc).
 
 ### Client (B) flow — `spora_core::connect(url)`
 

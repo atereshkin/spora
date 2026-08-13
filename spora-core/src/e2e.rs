@@ -184,6 +184,23 @@ pub fn client_endpoint(
     routing_key: [u8; ROUTING_KEY_LEN],
     timings: &Timings,
 ) -> Result<quinn::Endpoint, String> {
+    client_endpoint_with_dcid(socket, routing_key, timings, true)
+}
+
+/// [`client_endpoint`] with the initial-DCID override selectable. The
+/// routing-key DCID exists ONLY so a dumb relay can route the first Initial;
+/// on a relay-less (`Direct`) dial it buys nothing and actively hurts: every
+/// client shares the same DCID, so while any previous connection is alive or
+/// draining on the sharer's endpoint, quinn routes a new client's Initials
+/// into it and they are swallowed without a response. `rk_initial_dcid:
+/// false` keeps quinn's random DCIDs (cert pinning is unaffected — that runs
+/// on `routing_key` regardless).
+pub fn client_endpoint_with_dcid(
+    socket: std::net::UdpSocket,
+    routing_key: [u8; ROUTING_KEY_LEN],
+    timings: &Timings,
+    rk_initial_dcid: bool,
+) -> Result<quinn::Endpoint, String> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(RoutingKeyVerifier::new(routing_key, provider.clone()));
 
@@ -208,8 +225,11 @@ pub fn client_endpoint(
         timings.quic_idle_timeout,
         timings.quic_keep_alive,
     )));
-    let rk_bytes = routing_key.to_vec();
-    client_config.initial_dst_cid_provider(Arc::new(move || quinn::ConnectionId::new(&rk_bytes)));
+    if rk_initial_dcid {
+        let rk_bytes = routing_key.to_vec();
+        client_config
+            .initial_dst_cid_provider(Arc::new(move || quinn::ConnectionId::new(&rk_bytes)));
+    }
 
     let runtime = quinn::default_runtime().ok_or_else(|| "no async runtime".to_string())?;
     let mut endpoint =
@@ -338,7 +358,7 @@ mod tests {
             Arc::new(tokio_clone),
             vec![relay_addr],
             Duration::from_millis(50), // tight for tests
-            signer,
+            Arc::new(std::sync::Mutex::new(signer)),
         ));
         (std_sock, h)
     }
