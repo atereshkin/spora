@@ -51,6 +51,11 @@ pub struct LabPeerOpts {
     /// (`Config::conn_log`). The connlog suite points this at a per-scenario
     /// temp dir and asserts on the resulting database.
     pub conn_log: Option<spora_core::connlog::ConnLogConfig>,
+    /// Share side only: identity to share as. `None` (default) generates a
+    /// fresh one per `start_sharer` call; recovery scenarios that restart the
+    /// sharer pass the SAME identity so the share URL — and the routing key
+    /// the relay and the surviving client hold — stays stable.
+    pub identity: Option<Identity>,
 }
 
 impl LabPeerOpts {
@@ -63,6 +68,7 @@ impl LabPeerOpts {
             relays: vec![relay_endpoint(relay)],
             stun_server: stun_server.into(),
             conn_log: None,
+            identity: None,
         }
     }
 
@@ -230,10 +236,11 @@ impl SharerHandle {
 /// `share()` reports its URL (or its error).
 pub fn start_sharer(ns: &Netns, opts: &LabPeerOpts) -> Result<SharerHandle, String> {
     let (config, events) = opts.config();
+    let identity = opts.identity.clone().unwrap_or_else(Identity::generate);
     let (url_tx, url_rx) = mpsc::channel::<Result<Url, String>>();
 
     let host = ns.spawn_host("sharer", move |cancel| async move {
-        match spora_core::share(Identity::generate(), config).await {
+        match spora_core::share(identity, config).await {
             Ok(session) => {
                 let _ = url_tx.send(Ok(session.url.clone()));
                 // Keep the host alive until cancelled. NOTE: spawn_host
@@ -277,6 +284,11 @@ pub struct ClientHandle {
     events: EventStream,
     cmds: tokio::sync::mpsc::UnboundedSender<TrafficCmd>,
     host: Option<HostHandle>,
+    /// The client's adaptive-keepalive knob + waker (see
+    /// `ConnectResult::keepalive_knob`): 0 = dormant ("screen off"), N>0 =
+    /// probe every N seconds. Starts at 0.
+    keepalive_knob: Arc<std::sync::atomic::AtomicU64>,
+    keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
 }
 
 impl ClientHandle {
@@ -387,6 +399,52 @@ impl ClientHandle {
         recv_result(rx, timeout, "tcp upload")
     }
 
+    /// Send one tagged echo probe through the tunnel and wait up to `grace`
+    /// for the reply: `Ok(Some(rtt))` = tunnel is passing traffic,
+    /// `Ok(None)` = probe lost. Cheap enough to call in a loop for
+    /// outage-window timelines (unlike `udp_echo`, no 3s reply grace).
+    pub fn udp_probe(
+        &self,
+        server: impl Into<SocketAddr>,
+        grace: Duration,
+    ) -> Result<Option<Duration>, String> {
+        let server = server.into();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmds
+            .send(TrafficCmd::UdpProbe {
+                server,
+                grace,
+                respond: tx,
+            })
+            .map_err(|_| "client traffic pump is gone".to_string())?;
+        // The pump answers within `grace` + scheduling slack.
+        recv_result(rx, grace + Duration::from_secs(5), "udp probe")
+    }
+
+    /// Close the session CLEANLY: the pump drops the composed transport
+    /// chain while the host runtime is still alive, so the carrier's clean
+    /// close (QUIC CONNECTION_CLOSE(0) / nz CH_CLOSE) actually reaches the
+    /// wire — unlike [`ClientHandle::stop`], whose runtime teardown is
+    /// deliberately abrupt. Call `stop()` afterwards to join the host.
+    pub fn shutdown_clean(&self, timeout: Duration) -> Result<(), String> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmds
+            .send(TrafficCmd::Shutdown { respond: tx })
+            .map_err(|_| "client traffic pump is gone".to_string())?;
+        recv_result(rx, timeout, "clean shutdown")
+    }
+
+    /// Drive the adaptive-keepalive knob at runtime, exactly as the apps do:
+    /// store the new value, then wake the possibly-parked keepalive task.
+    /// 0 = dormant (screen off), N>0 = probe every N seconds.
+    pub fn set_keepalive(&self, secs: u64) {
+        self.keepalive_knob
+            .store(secs, std::sync::atomic::Ordering::Relaxed);
+        if let Some(w) = self.keepalive_waker.lock().unwrap().take() {
+            w.wake();
+        }
+    }
+
     /// CPU time of the pump THREAD (`CLOCK_THREAD_CPUTIME_ID`, measured on
     /// the pump task). On a lab host this equals [`host_cpu_time`]
     /// (current-thread runtime), but it also works for pumps driven outside
@@ -434,14 +492,21 @@ fn recv_result<T>(
 /// returned as `Err`, it is never logged-and-hung (resilience scenarios
 /// assert on failed connects).
 pub fn start_client(ns: &Netns, url: Url, opts: &LabPeerOpts) -> Result<ClientHandle, String> {
+    type KnobPair = (
+        Arc<std::sync::atomic::AtomicU64>,
+        Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+    );
     let (config, events) = opts.config();
-    let (result_tx, result_rx) = mpsc::channel::<Result<(), String>>();
+    let (result_tx, result_rx) = mpsc::channel::<Result<KnobPair, String>>();
     let (cmd_tx, cmd_rx) = tokio::sync::mpsc::unbounded_channel::<TrafficCmd>();
 
     let host = ns.spawn_host("client", move |_cancel| async move {
         match spora_core::connect(url, &config).await {
             Ok(connected) => {
-                let _ = result_tx.send(Ok(()));
+                let _ = result_tx.send(Ok((
+                    connected.keepalive_knob.clone(),
+                    connected.keepalive_waker.clone(),
+                )));
                 drive_client(connected, cmd_rx).await;
             }
             Err(e) => {
@@ -451,10 +516,12 @@ pub fn start_client(ns: &Netns, url: Url, opts: &LabPeerOpts) -> Result<ClientHa
     })?;
 
     match result_rx.recv_timeout(CONNECT_TIMEOUT) {
-        Ok(Ok(())) => Ok(ClientHandle {
+        Ok(Ok((keepalive_knob, keepalive_waker))) => Ok(ClientHandle {
             events,
             cmds: cmd_tx,
             host: Some(host),
+            keepalive_knob,
+            keepalive_waker,
         }),
         Ok(Err(e)) => {
             host.stop();

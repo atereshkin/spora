@@ -87,3 +87,13 @@ harness = false
 [[test]]
 name = "shaper"
 harness = false
+
+# Recovery/UX spec suite: reconnect, roaming, sleep/dormancy, and NAT-expiry
+# behavior across carriers, asserted against DESIRED user-experience budgets
+# (seconds, not the current ~minute). Deliberately RED on today's code —
+# budget misses are tagged known_gap(<root-cause>); SPORA_LAB_RECOVERY=xfail
+# (CI) reports them as expected failures instead of failing the suite and
+# flags a tagged budget that starts passing so the marker gets removed.
+[[test]]
+name = "recovery"
+harness = false

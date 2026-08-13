@@ -155,6 +155,25 @@ pub enum TrafficCmd {
     CpuTime {
         respond: tokio::sync::oneshot::Sender<Result<Duration, String>>,
     },
+    /// Send ONE tagged echo datagram and wait up to `grace` for its reply:
+    /// `Ok(Some(rtt))` = echoed, `Ok(None)` = lost. The cheap primitive for
+    /// probing "is the tunnel passing traffic right now" on a timeline
+    /// (outage-window measurement) without `UdpEcho`'s 3s reply grace.
+    UdpProbe {
+        server: std::net::SocketAddr,
+        grace: Duration,
+        respond: tokio::sync::oneshot::Sender<Result<Option<Duration>, String>>,
+    },
+    /// Drop the composed transport chain while the host runtime is still
+    /// alive and end the pump. Unlike host teardown (which drops the whole
+    /// runtime mid-poll — abrupt, no clean close on the wire), this lets the
+    /// transport's Drop path run and be polled: the upgradable router task
+    /// notices, drops the carrier transport, and a clean close (QUIC
+    /// CONNECTION_CLOSE(0) / nz CH_CLOSE) actually goes out. The respond
+    /// fires after a short settle so the close datagram has left the socket.
+    Shutdown {
+        respond: tokio::sync::oneshot::Sender<Result<(), String>>,
+    },
 }
 
 /// The pump: owns the transport, serves `TrafficCmd`s. Runs inside the
@@ -183,12 +202,26 @@ impl TrafficPump {
         }
     }
 
-    /// Run until the command channel closes or the transport dies.
+    /// Run until the command channel closes, the transport dies, or a
+    /// [`TrafficCmd::Shutdown`] asks for a clean close.
     pub async fn run(mut self) {
         loop {
             tokio::select! {
                 cmd = self.cmds.recv() => {
                     let Some(cmd) = cmd else { return };
+                    if let TrafficCmd::Shutdown { respond } = cmd {
+                        // Swap the transport chain out and drop it on the
+                        // live runtime; the sleep yields so the upgradable
+                        // router task and the carrier's endpoint driver get
+                        // polled and the clean-close datagram is flushed.
+                        let transport =
+                            std::mem::replace(&mut self.transport, Box::new(ClosedTransport));
+                        drop(transport);
+                        self.dead = true;
+                        tokio::time::sleep(Duration::from_millis(200)).await;
+                        let _ = respond.send(Ok(()));
+                        return;
+                    }
                     self.handle_cmd(cmd).await;
                 }
                 pkt = self.transport.next(), if !self.dead => {
@@ -262,6 +295,22 @@ impl TrafficPump {
             }
             TrafficCmd::CpuTime { respond } => {
                 let _ = respond.send(thread_cpu_time());
+            }
+            TrafficCmd::UdpProbe {
+                server,
+                grace,
+                respond,
+            } => {
+                let result = if self.dead {
+                    Err("transport is closed".to_string())
+                } else {
+                    self.udp_probe(server, grace).await
+                };
+                let _ = respond.send(result);
+            }
+            // Handled inline in `run` (it must end the pump loop).
+            TrafficCmd::Shutdown { respond } => {
+                let _ = respond.send(Err("shutdown must be handled by run()".into()));
             }
         }
     }
@@ -357,6 +406,48 @@ impl TrafficPump {
             rtt_p50: percentile(&rtts, 50.0),
             rtt_p95: percentile(&rtts, 95.0),
         })
+    }
+
+    /// Send one tagged echo datagram to `server` and wait up to `grace` for
+    /// the reply. `Ok(Some(rtt))` on echo, `Ok(None)` on loss. Unrelated
+    /// inbound (keepalives, stale replies from earlier probes — each probe
+    /// gets a fresh port + nonce) is ignored.
+    async fn udp_probe(
+        &mut self,
+        server: SocketAddr,
+        grace: Duration,
+    ) -> Result<Option<Duration>, String> {
+        let local_port = self.alloc_port();
+        let nonce = fresh_nonce();
+        let mut reasm = Reassembler::default();
+
+        let pkt = build_echo_request(local_port, server, 0, nonce, 32);
+        self.transport
+            .send(pkt)
+            .await
+            .map_err(|e| format!("udp probe send: {e}"))?;
+        let sent_at = std::time::Instant::now();
+
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            tokio::select! {
+                pkt = self.transport.next() => match pkt {
+                    Some(Ok(p)) => {
+                        if let Some(full) = reasm.push(p)
+                            && match_echo_reply(&full, server, local_port, nonce) == Some(0)
+                        {
+                            return Ok(Some(sent_at.elapsed()));
+                        }
+                    }
+                    Some(Err(e)) => log::debug!("udp probe: transport error: {e}"),
+                    None => {
+                        self.dead = true;
+                        return Err("transport closed mid-probe".into());
+                    }
+                },
+                _ = tokio::time::sleep_until(deadline) => return Ok(None),
+            }
+        }
     }
 
     /// Run a real TCP connection (smoltcp) against `server`, write `bytes`
@@ -1271,6 +1362,47 @@ impl smoltcp::phy::Device for SmolDevice {
 }
 
 // ---------------------------------------------------------------------------
+
+/// What the pump's transport slot holds after [`TrafficCmd::Shutdown`]
+/// dropped the real chain: stream ended, sink refuses. Never polled in
+/// practice (`dead` is set and the pump returns), but the slot must hold a
+/// valid `IpTransport`.
+struct ClosedTransport;
+
+impl futures_util::Stream for ClosedTransport {
+    type Item = std::io::Result<Vec<u8>>;
+    fn poll_next(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        std::task::Poll::Ready(None)
+    }
+}
+
+impl futures_util::Sink<Vec<u8>> for ClosedTransport {
+    type Error = std::io::Error;
+    fn poll_ready(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Err(std::io::ErrorKind::BrokenPipe.into()))
+    }
+    fn start_send(self: std::pin::Pin<&mut Self>, _item: Vec<u8>) -> Result<(), Self::Error> {
+        Err(std::io::ErrorKind::BrokenPipe.into())
+    }
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+    fn poll_close(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Result<(), Self::Error>> {
+        std::task::Poll::Ready(Ok(()))
+    }
+}
 
 #[cfg(test)]
 mod tests {

@@ -83,6 +83,13 @@ jobs:
           # otherwise a runner-image change could disable all e2e coverage
           # while the build stays green.
           SPORA_LAB: require
+          # The recovery suite asserts DESIRED reconnect/roam/sleep budgets
+          # and is deliberately red on today's code (tests/recovery.rs). In
+          # CI its tagged budget misses report as expected failures; a
+          # tagged budget that starts PASSING fails, forcing the marker to
+          # be removed together with the fix. Run locally without this env
+          # to see the true state.
+          SPORA_LAB_RECOVERY: xfail
           # Perf-suite metrics snapshot (test binaries run with the package
           # dir as cwd, so the path must be absolute), uploaded below for
           # trend tracking / perf-diff between commits (docs/lab.md,
