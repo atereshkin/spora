@@ -170,10 +170,10 @@ The sharer keeps a local NetFlow-style per-flow record ("which client connected 
 
 The `Transport` trait = `Stream<Item=io::Result<Vec<u8>>> + Sink<Vec<u8>>`. Implementations:
 
-- `QuicPeerTransport` (in `transport/quic.rs`) — wraps a `quinn::Connection`'s datagram channel as IP packets. Uses `NoopCc` so QUIC's congestion control doesn't fight inner TCP. Used by both relay-via and direct paths.
+- `QuicPeerTransport` (in `transport/quic.rs`) — wraps a `quinn::Connection`'s datagram channel as IP packets. Uses quinn **BBR** to pace datagrams to the bottleneck (replaced `NoopCc`, which paced nothing and let the share-side smoltcp download sender burst the path into congestion collapse — see `docs/lab.md`). Used by both relay-via and direct paths.
 - `UpgradableTransport` (in `transport/upgradable.rs`) — wraps any transport; can be swapped to a new inner transport via `UpgradeSender`.
-- `KeepAliveTransport` (in `transport/keepalive.rs`) — injects ICMP Echo Requests at configurable intervals; supports an `Adaptive` mode driven by an atomic knob (used for Android battery-aware behavior).
-- `ReconnectTransport` (in `transport/mod.rs`) — wraps any transport; on error/close, re-dials via a closure.
+- `KeepAliveTransport` (in `transport/keepalive.rs`) — injects ICMP Echo Requests at configurable intervals. This is the SINGLE, transport-agnostic keepalive of record for all carriers (QUIC/nz/TCP): quinn's own `keep_alive_interval` was removed (only `max_idle_timeout` remains, as a passive reaper) so there is one knob-honoring control point. **Client** side is `Adaptive` (atomic knob: 0 = dormant/screen-off/radio-silent, >0 = probe every N s). **Share** side is reactive `Periodic` with an `active_window`: it pings only while it has heard from the client recently, and goes quiet once the client goes dormant — so a dormant client is never forced to ACK share-side pings (true radio silence). Cooperate-with-sleep: a dormancy longer than the idle timeout drops the connection (`max_idle_timeout` reaps it) and it reconnects on wake — cheap now via per-port.
+- `ReconnectTransport` (in `transport/mod.rs`) — wraps any transport; on error/close, re-dials via a closure. Parks (does not redial) while the app is dormant (keepalive knob 0), waking on `set_keepalive(N>0)` — a screen-off phone stays radio-silent instead of spinning the radio on a dead tunnel.
 - `MeteredTransport` (in `transport/meter.rs`) — share side, `ExitMode::Custom` only: passive connection-log flow meter (see "Connection log").
 
 Composition (client side): `QuicPeerTransport → UpgradableTransport → KeepAliveTransport → ReconnectTransport`. Server side omits the outermost `ReconnectTransport` (a new peer just opens a new QUIC connection at the QUIC server endpoint).
@@ -185,7 +185,7 @@ Composition (client side): `QuicPeerTransport → UpgradableTransport → KeepAl
 - Routing-key length: 20 bytes (fits in a QUIC v1 DCID)
 - Secret length: 16 bytes
 - Register interval: 30s. Relay registration timeout: 120s. Flow timeout: 60s.
-- QUIC: initial_mtu=1200, PMTUD enabled, NoopCc, idle 30s, keepalive 10s.
+- QUIC: initial_mtu=1200, PMTUD enabled, BBR, idle 30s. NO quinn keep-alive (the ICMP `KeepAliveTransport` is the single keepalive; `Timings.quic_keep_alive` now sets the SHARE-side ICMP interval, not a quinn setting).
 
 ## Conventions
 

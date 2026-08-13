@@ -106,9 +106,15 @@ pub struct ConnectResult {
 pub struct Timings {
     /// Cadence of the sharer's REGISTER packets to the relay.
     pub register_interval: Duration,
-    /// QUIC max idle timeout (both relay-via and direct connections).
+    /// QUIC max idle timeout (both relay-via and direct connections). Also
+    /// the nz carrier's recv-idle deadline. This is the passive backstop
+    /// reaper for a dead/quiet session (no packets → connection torn down).
     pub quic_idle_timeout: Duration,
-    /// QUIC keep-alive interval.
+    /// Interval of the SHARE side's reactive ICMP keepalive (NOT a quinn
+    /// keep-alive anymore — quinn's periodic keepalive was removed so the
+    /// transport-agnostic keepalive layer is the single, knob-honoring
+    /// control point; see `transport::quic::build_transport_config`). The
+    /// client side is knob-driven (Adaptive), not this.
     pub quic_keep_alive: Duration,
     /// `ReconnectTransport` sleep after a failed dial.
     pub reconnect_delay: Duration,
@@ -1144,7 +1150,31 @@ fn spawn_responder_tunnel(
 
     let (upgradable, upgrade_sender, router_handle) =
         upgradable_transport(transport, config.timings.upgrade_rescue_grace);
-    let keepalive_cfg = KeepAliveConfig::default();
+    // Share-side keepalive: reactive, not always-on. It pings only while the
+    // client is active (recently heard from) and goes quiet once the client
+    // goes silent — so a dormant client is never forced to ACK share-side
+    // pings and gets true radio silence. An active client always pings (its
+    // Adaptive knob is on), so the return path stays warm whenever it should.
+    let ka_interval = config.timings.quic_keep_alive;
+    // Quiet after ~3 ping intervals of client silence: long enough to span an
+    // active client's own keepalive cadence (so we don't flap off between its
+    // pings), short enough to reach radio silence soon after it goes dormant.
+    let active_window = ka_interval * 3;
+    let keepalive_cfg = KeepAliveConfig {
+        mode: KeepAliveMode::Periodic {
+            interval: ka_interval,
+            // Declare a silent peer dead after the idle timeout, so the
+            // session is reaped even on the TCP carrier — which, unlike QUIC
+            // (max_idle_timeout) and nz (reader idle deadline), has NO
+            // transport-level idle timeout, so without this a silently-dead
+            // TCP client would linger forever (held fd, open connlog record,
+            // no SessionEnded). `.max(active_window)` keeps the reaper from
+            // firing before the share side has even stopped pinging.
+            recv_timeout: Some(config.timings.quic_idle_timeout.max(active_window)),
+        },
+        active_window: Some(active_window),
+        ..Default::default()
+    };
     // The meter (Custom exit mode) must ignore the synthetic keepalive pings
     // riding the tunnel; tell it which inner address pair they use.
     let keepalive_pair = (keepalive_cfg.src_ip, keepalive_cfg.dst_ip);
@@ -1331,6 +1361,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         initial,
         dialer,
         config.timings.reconnect_delay,
+        Some((keepalive_knob.clone(), keepalive_waker.clone())),
     ));
     Ok(ConnectResult {
         transport,

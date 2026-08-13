@@ -300,15 +300,21 @@ fn send_datagram_logged(conn: &Connection, pkt: Vec<u8>) -> io::Result<()> {
 /// [`build_transport_config`]).
 const DATAGRAM_SEND_BUFFER: usize = 512 * 1024;
 
-/// Build the shared QUIC transport config. `idle_timeout` / `keep_alive`
-/// come from [`crate::Timings`] (defaults: 30s / 10s).
-pub fn build_transport_config(
-    idle_timeout: Duration,
-    keep_alive: Duration,
-) -> quinn::TransportConfig {
+/// Build the shared QUIC transport config. `idle_timeout` comes from
+/// [`crate::Timings::quic_idle_timeout`] (default 30s).
+///
+/// Deliberately NO quinn `keep_alive_interval`: the transport-agnostic ICMP
+/// [`KeepAliveTransport`](crate::transport::keepalive) layer is the single
+/// keepalive of record across ALL carriers (QUIC / nz / TCP) — it is the one
+/// that honors the dormancy knob, so a second quinn-level keepalive that
+/// ignores the knob would defeat radio silence (it kept a dormant client
+/// transmitting a PING every interval plus ACKing the peer's). `max_idle_timeout`
+/// stays as a cheap PASSIVE backstop reaper: it transmits nothing (no battery
+/// cost, no dormancy break) and cleanly tears a connection down once both ends
+/// have gone quiet.
+pub fn build_transport_config(idle_timeout: Duration) -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(idle_timeout.try_into().unwrap()));
-    transport.keep_alive_interval(Some(keep_alive));
     transport.datagram_receive_buffer_size(Some(8 * 1024 * 1024));
     // Size the datagram *send* buffer to about one bandwidth-delay product. The
     // 8 MiB it used to be was sized for NoopCc (infinite window — the buffer just

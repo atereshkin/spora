@@ -72,7 +72,6 @@ pub fn server_endpoint(
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_crypto));
     server_config.transport_config(Arc::new(build_transport_config(
         timings.quic_idle_timeout,
-        timings.quic_keep_alive,
     )));
 
     let runtime = quinn::default_runtime().ok_or_else(|| "no async runtime".to_string())?;
@@ -223,7 +222,6 @@ pub fn client_endpoint_with_dcid(
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
     client_config.transport_config(Arc::new(build_transport_config(
         timings.quic_idle_timeout,
-        timings.quic_keep_alive,
     )));
     if rk_initial_dcid {
         let rk_bytes = routing_key.to_vec();

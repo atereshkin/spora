@@ -17,7 +17,9 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::Poll::Ready;
-use std::task::{Context, Poll};
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::{Context, Poll, Waker};
 use tokio::net::UdpSocket;
 use tokio::time::{Sleep, sleep};
 
@@ -114,9 +116,18 @@ pub(crate) const RECONNECT_DELAY: std::time::Duration = std::time::Duration::fro
 pub(crate) type DialFuture = Pin<Box<dyn Future<Output = io::Result<IpTransport>> + Send>>;
 type Dialer = Box<dyn FnMut() -> DialFuture + Send>;
 
+/// The client's dormancy knob + its wake channel, shared with the keepalive
+/// layer. Knob 0 = dormant (screen off); the reconnect loop parks instead of
+/// redialing, and `set_keepalive(N>0)` wakes it.
+pub(crate) type Dormancy = (Arc<AtomicU64>, Arc<Mutex<Option<Waker>>>);
+
 enum ReconnectState {
     Connected(IpTransport),
     Sleeping(Pin<Box<Sleep>>),
+    /// Parked because the app is dormant (knob 0): a dead tunnel while the
+    /// screen is off must NOT spin the radio redialing. Waits for the knob
+    /// to go positive (set_keepalive wakes us via the shared waker).
+    DormantPark,
     Dialing(DialFuture),
 }
 
@@ -129,19 +140,29 @@ enum ReconnectState {
 ///   short-lived session (e.g. a client repeatedly evicted by the share side's
 ///   single-session policy) would otherwise redial instantly and, with the peer
 ///   doing the same, spin in a tight mutual-eviction storm.
+/// - while the app is dormant (knob 0) a dead tunnel parks instead of
+///   redialing — cooperate-with-sleep, so a screen-off phone is radio-silent;
+///   the redial fires on wake. Per-port sessions make that wake-redial cheap.
 /// - outbound packets are *dropped* while reconnecting
 pub struct ReconnectTransport {
     dialer: Dialer,
     state: ReconnectState,
     delay: std::time::Duration,
+    dormancy: Option<Dormancy>,
 }
 
 impl ReconnectTransport {
-    pub fn new(initial: IpTransport, dialer: Dialer, delay: std::time::Duration) -> Self {
+    pub fn new(
+        initial: IpTransport,
+        dialer: Dialer,
+        delay: std::time::Duration,
+        dormancy: Option<Dormancy>,
+    ) -> Self {
         Self {
             dialer,
             state: ReconnectState::Connected(initial),
             delay,
+            dormancy,
         }
     }
 
@@ -151,6 +172,37 @@ impl ReconnectTransport {
             self.delay.as_secs()
         );
         self.state = ReconnectState::Sleeping(Box::pin(sleep(self.delay)));
+    }
+
+    fn is_dormant(&self) -> bool {
+        self.dormancy
+            .as_ref()
+            .is_some_and(|(knob, _)| knob.load(Ordering::Relaxed) == 0)
+    }
+
+    /// Register this task's waker (so `set_keepalive(N>0)` re-polls us) and
+    /// then RE-CHECK the knob, returning whether we should stay parked. The
+    /// re-check after registering closes the store-vs-register race: a
+    /// `set_keepalive(N)` that ran between an earlier `is_dormant()` and this
+    /// registration stores knob>0 but finds no waker to wake — the re-read
+    /// here sees that knob>0 and reports "don't park". Sharing the keepalive
+    /// layer's waker slot is safe: while parked we do not poll the inner
+    /// keepalive layer, so nothing else writes the slot.
+    fn stay_parked(&mut self, cx: &Context<'_>) -> bool {
+        if let Some((_, waker)) = &self.dormancy {
+            *waker.lock().unwrap() = Some(cx.waker().clone());
+        }
+        self.is_dormant()
+    }
+
+    /// After the reconnect delay: dial, unless the app is dormant — then park.
+    fn dial_or_park(&mut self, cx: &Context<'_>) {
+        if self.is_dormant() && self.stay_parked(cx) {
+            debug!("Dormant (knob 0): parking reconnect instead of dialing.");
+            self.state = ReconnectState::DormantPark;
+        } else {
+            self.begin_dial();
+        }
     }
 
     fn begin_dial(&mut self) {
@@ -187,11 +239,20 @@ impl Stream for ReconnectTransport {
                 }
                 ReconnectState::Sleeping(timer) => match timer.as_mut().poll(cx) {
                     Poll::Ready(()) => {
-                        this.begin_dial();
+                        this.dial_or_park(cx);
                         continue;
                     }
                     Poll::Pending => return Poll::Pending,
                 },
+                ReconnectState::DormantPark => {
+                    // Re-register our waker and re-read the knob atomically
+                    // enough to close the race with set_keepalive.
+                    if this.stay_parked(cx) {
+                        return Poll::Pending;
+                    }
+                    this.begin_dial();
+                    continue;
+                }
                 ReconnectState::Dialing(fut) => match fut.as_mut().poll(cx) {
                     Poll::Ready(Ok(new_inner)) => {
                         info!("Reconnected successfully");
@@ -218,7 +279,9 @@ impl Sink<Vec<u8>> for ReconnectTransport {
         let this = self.get_mut();
         let ret = match &mut this.state {
             ReconnectState::Connected(inner) => Pin::new(inner).poll_ready(cx),
-            ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
+            ReconnectState::Sleeping(_) | ReconnectState::DormantPark | ReconnectState::Dialing(_) => {
+                Poll::Ready(Ok(()))
+            } // drop policy
         };
         ret
     }
@@ -233,7 +296,9 @@ impl Sink<Vec<u8>> for ReconnectTransport {
                 }
                 Ok(())
             }
-            ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Ok(()), // drop policy
+            ReconnectState::Sleeping(_) | ReconnectState::DormantPark | ReconnectState::Dialing(_) => {
+                Ok(())
+            } // drop policy
         }
     }
 
@@ -243,12 +308,18 @@ impl Sink<Vec<u8>> for ReconnectTransport {
             ReconnectState::Connected(inner) => match Pin::new(inner).poll_flush(cx) {
                 Ready(Err(e)) => {
                     warn!("poll_flush failed: {}. Reconnecting...", e);
-                    this.begin_dial();
+                    // begin_sleep (not begin_dial) so this reconnect path also
+                    // honors the dormancy park + reconnect-delay pacing that
+                    // the Sleeping->dial_or_park transition applies. (Latent:
+                    // the current inner chain never errors on flush/close.)
+                    this.begin_sleep();
                     Ready(Ok(()))
                 }
                 p => p,
             },
-            ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
+            ReconnectState::Sleeping(_) | ReconnectState::DormantPark | ReconnectState::Dialing(_) => {
+                Poll::Ready(Ok(()))
+            } // drop policy
         }
     }
 
@@ -258,12 +329,14 @@ impl Sink<Vec<u8>> for ReconnectTransport {
             ReconnectState::Connected(inner) => match Pin::new(inner).poll_close(cx) {
                 Ready(Err(e)) => {
                     warn!("poll_close failed: {}. Reconnecting...", e);
-                    this.begin_dial();
+                    this.begin_sleep(); // see poll_flush
                     Ready(Ok(()))
                 }
                 p => p,
             },
-            ReconnectState::Sleeping(_) | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
+            ReconnectState::Sleeping(_) | ReconnectState::DormantPark | ReconnectState::Dialing(_) => {
+                Poll::Ready(Ok(()))
+            } // drop policy
         }
     }
 }
@@ -283,7 +356,7 @@ mod tests {
     async fn reconnect_passes_packets_through() {
         let (local, mut remote) = mock_transport_pair();
         let dialer: Dialer = Box::new(|| Box::pin(async { unreachable!("should not dial") }));
-        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY, None);
 
         // Send from remote, receive on reconnect transport
         remote.send(vec![1, 2, 3]).await.unwrap();
@@ -318,7 +391,7 @@ mod tests {
             })
         });
 
-        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY, None);
 
         // First poll sees None and enters the paced sleep — it must NOT dial yet.
         tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
@@ -364,7 +437,7 @@ mod tests {
             })
         });
 
-        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY, None);
 
         // The stream error enters the paced sleep — no immediate redial.
         tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
@@ -418,7 +491,7 @@ mod tests {
             })
         });
 
-        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY, None);
 
         // Drive the transport: it should fail twice, sleep between, then succeed
         tokio::time::timeout(std::time::Duration::from_secs(30), async {
@@ -468,7 +541,7 @@ mod tests {
             })
         });
 
-        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY, None);
 
         // Drive past the None; the redial is paced, so advance past the delay.
         tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
@@ -525,7 +598,7 @@ mod tests {
             })
         });
 
-        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY, None);
 
         // Poll to drive: None → Sleeping (the paced reconnect delay)
         tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
@@ -549,7 +622,7 @@ mod tests {
         // Dialer hangs forever
         let dialer: Dialer = Box::new(|| Box::pin(futures_util::future::pending()));
 
-        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY);
+        let mut rt = ReconnectTransport::new(Box::new(local), dialer, RECONNECT_DELAY, None);
 
         // None → Sleeping → (advance past the delay) → begin_dial → Dialing (hangs)
         tokio::time::timeout(std::time::Duration::from_millis(10), rt.next())
@@ -581,6 +654,7 @@ mod tests {
             Box::new(local),
             dialer,
             RECONNECT_DELAY,
+            None,
         )) as IpTransport;
 
         let ka_cfg = KeepAliveConfig {
@@ -646,6 +720,7 @@ mod tests {
             Box::new(local),
             dialer,
             RECONNECT_DELAY,
+            None,
         )) as IpTransport;
 
         let ka_cfg = KeepAliveConfig {

@@ -52,6 +52,15 @@ pub struct KeepAliveConfig {
     /// Adaptive mode: inbound within this window keeps the peer alive when
     /// the response deadline fires.
     pub inbound_grace: std::time::Duration,
+    /// Periodic mode only: if `Some`, suppress proactive pings once inbound
+    /// has been silent for this long, and resume on the next inbound. This
+    /// is how the share side becomes dormancy-aware WITHOUT a protocol
+    /// signal: an active client always pings (its Adaptive knob is on), so
+    /// the share side keeps hearing from it and keeps the return path warm;
+    /// a dormant client goes silent, so after `active_window` the share side
+    /// goes quiet too — no pings to a dormant peer means it isn't forced to
+    /// ACK, giving true radio silence. `None` = always ping (legacy).
+    pub active_window: Option<std::time::Duration>,
 }
 
 impl Default for KeepAliveConfig {
@@ -67,6 +76,7 @@ impl Default for KeepAliveConfig {
             idle_threshold: IDLE_THRESHOLD,
             response_timeout: RESPONSE_TIMEOUT,
             inbound_grace: INBOUND_GRACE,
+            active_window: None,
         }
     }
 }
@@ -111,6 +121,8 @@ enum ModeState {
         recv_timer: Option<Pin<Box<Sleep>>>,
         interval: std::time::Duration,
         recv_timeout: Option<std::time::Duration>,
+        /// Last time an inbound packet arrived — gates `active_window`.
+        last_inbound: Instant,
     },
     Adaptive {
         knob: Arc<AtomicU64>,
@@ -228,6 +240,7 @@ impl KeepAliveTransport {
                     recv_timer: recv_timeout.map(|d| Box::pin(sleep(d))),
                     interval: *interval,
                     recv_timeout: *recv_timeout,
+                    last_inbound: Instant::now(),
                 }
             }
             KeepAliveMode::Adaptive { knob, waker } => {
@@ -259,14 +272,30 @@ impl KeepAliveTransport {
     fn poll_maybe_probe(&mut self, cx: &mut Context<'_>) -> Poll<()> {
         match &mut self.mode_state {
             ModeState::Periodic {
-                timer, interval, ..
+                timer,
+                interval,
+                last_inbound,
+                ..
             } => {
                 if matches!(self.send_state, KeepAliveSendState::Idle) {
                     if let Poll::Ready(()) = timer.as_mut().poll(cx) {
-                        let pkt = build_icmp_echo(&self.cfg, &mut self.seq);
-                        debug!("Keepalive: periodic ping (seq={})", self.seq);
-                        self.send_state = KeepAliveSendState::Sending(pkt);
                         timer.as_mut().reset(Instant::now() + *interval);
+                        // Dormancy-aware: stay quiet while the peer has been
+                        // silent longer than active_window (it's dormant, so
+                        // pinging it would only force ACKs and break its radio
+                        // silence). The next inbound resets last_inbound and
+                        // proactive pinging resumes.
+                        let quiet = self
+                            .cfg
+                            .active_window
+                            .is_some_and(|w| Instant::now().duration_since(*last_inbound) > w);
+                        if quiet {
+                            trace!("Keepalive: periodic ping suppressed (peer quiet)");
+                        } else {
+                            let pkt = build_icmp_echo(&self.cfg, &mut self.seq);
+                            debug!("Keepalive: periodic ping (seq={})", self.seq);
+                            self.send_state = KeepAliveSendState::Sending(pkt);
+                        }
                     }
                 }
                 flush_send_state(&mut self.inner, &mut self.send_state, cx)
@@ -299,6 +328,13 @@ impl KeepAliveTransport {
                         if knob_val == 0 {
                             info!("Keepalive: Probing -> Dormant (knob set to 0)");
                             state.probe = ProbeState::Dormant;
+                            // Re-arm the knob waker. The set_keepalive(0) call
+                            // that just flipped the knob consumed the previous
+                            // waker to wake us; without re-registering here, a
+                            // Dormant task with no other timers (a dead TCP
+                            // carrier) would miss the next set_keepalive(N>0)
+                            // and never resume probing.
+                            *waker.lock().unwrap() = Some(cx.waker().clone());
                             return flush_send_state(&mut self.inner, &mut self.send_state, cx);
                         }
 
@@ -362,7 +398,9 @@ impl KeepAliveTransport {
                 recv_timer,
                 interval,
                 recv_timeout,
+                last_inbound,
             } => {
+                *last_inbound = Instant::now();
                 timer.as_mut().reset(Instant::now() + *interval);
                 if let (Some(rt), Some(timeout)) = (recv_timer.as_mut(), recv_timeout) {
                     rt.as_mut().reset(Instant::now() + *timeout);
@@ -1025,6 +1063,87 @@ mod tests {
             .expect("should get immediate ping after knob 0→20")
             .unwrap();
         assert!(is_icmp_echo_request(&pkt));
+    }
+
+    #[tokio::test]
+    async fn adaptive_knob_zero_then_positive_after_probing_wakes() {
+        // Regression: set_keepalive(0) while Probing must re-arm the waker so a
+        // following set_keepalive(N>0) is seen even on a transport with no
+        // timers of its own. Before the fix the Probing->Dormant branch dropped
+        // the waker and the knob change was lost.
+        tokio::time::pause();
+
+        let (local, mut handle) = mock_transport();
+        let knob = Arc::new(AtomicU64::new(5));
+        let waker_slot: Arc<std::sync::Mutex<Option<std::task::Waker>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        let cfg = KeepAliveConfig {
+            mode: KeepAliveMode::Adaptive {
+                knob: knob.clone(),
+                waker: waker_slot.clone(),
+            },
+            ..Default::default()
+        };
+        let mut ka = KeepAliveTransport::new(Box::new(local), cfg);
+
+        // Activate (Probing) and consume the initial ping.
+        drive_poll(&mut ka).await;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(100), handle.recv()).await;
+
+        // set_keepalive(0): go dormant. This poll must leave a waker registered.
+        knob.store(0, Ordering::Relaxed);
+        drive_poll(&mut ka).await;
+        assert!(
+            waker_slot.lock().unwrap().is_some(),
+            "Probing->Dormant must re-arm the knob waker"
+        );
+
+        // set_keepalive(20): the app can now wake the parked task.
+        knob.store(20, Ordering::Relaxed);
+        let w = waker_slot.lock().unwrap().take();
+        assert!(w.is_some(), "waker should still be there to wake");
+        w.unwrap().wake();
+
+        // Next poll sends a ping (proving the knob change took effect).
+        drive_poll(&mut ka).await;
+        let pkt = tokio::time::timeout(std::time::Duration::from_millis(100), handle.recv())
+            .await
+            .expect("should ping after 5->0->20 knob dance")
+            .unwrap();
+        assert!(is_icmp_echo_request(&pkt));
+    }
+
+    #[tokio::test]
+    async fn periodic_active_window_suppresses_pings_when_peer_quiet() {
+        tokio::time::pause();
+
+        let (local, mut handle) = mock_transport();
+        let cfg = KeepAliveConfig {
+            mode: KeepAliveMode::Periodic {
+                interval: std::time::Duration::from_secs(5),
+                recv_timeout: None,
+            },
+            active_window: Some(std::time::Duration::from_secs(12)),
+            ..Default::default()
+        };
+        let mut ka = KeepAliveTransport::new(Box::new(local), cfg);
+
+        // Within active_window (no inbound yet, but last_inbound = start): the
+        // first couple of intervals still ping.
+        tokio::time::advance(std::time::Duration::from_secs(6)).await;
+        drive_poll(&mut ka).await;
+        let first = tokio::time::timeout(std::time::Duration::from_millis(50), handle.recv()).await;
+        assert!(first.is_ok(), "should ping while within active_window");
+
+        // Advance well past active_window with NO inbound → pings suppressed.
+        tokio::time::advance(std::time::Duration::from_secs(30)).await;
+        drive_poll(&mut ka).await;
+        let suppressed =
+            tokio::time::timeout(std::time::Duration::from_millis(50), handle.recv()).await;
+        assert!(
+            suppressed.is_err(),
+            "should suppress pings once peer has been silent past active_window"
+        );
     }
 
     #[tokio::test]
