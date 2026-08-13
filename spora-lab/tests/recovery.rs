@@ -27,13 +27,12 @@
 //! Punch timings stay at production defaults (punching is not under test;
 //! direct upgrade is disabled everywhere).
 //!
-//! IMPORTANT scale caveat for the relay lockout: `relay::REVERSE_ACTIVITY_GRACE`
-//! (20s) is a hardcoded const, so in this scaled lab the one-flow slot is
-//! freed by FLOW EVICTION (sharer idle 3s + flow 3s + sweep 0.5s ~= 6.5s),
-//! not by the grace expiring as it is on production timings (idle 30s + 20s
-//! grace ~= 50s, inside flow_timeout 60s). The measured lockouts here are
-//! therefore the SCALED-OPTIMISTIC lower bound of the production pain; the
-//! per-scenario comments give the production-timing arithmetic.
+//! State of the world (2026-08-13, after the rolling-listener/per-port fix):
+//! every takeover budget is GREEN and strict (regression tests — see the
+//! FIXED block below); the remaining known_gap tags are all client-side:
+//! detection latency (`slow-rebind-detection`: roam + NAT rebind) and
+//! dormancy (`quinn-keepalive-ignores-dormancy`,
+//! `reconnect-ignores-dormancy`).
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::{Duration, Instant};
@@ -90,31 +89,18 @@ fn main() {
 // redesign work item; when the fix lands, the xfail run flags the budget as
 // "unexpectedly PASSED" and the marker gets deleted with the fix's PR.
 
-/// The relay's one-flow-per-sharer slot stays reserved for a DEAD client:
-/// the sharer's own keepalives refresh the flow's `reverse` timestamp until
-/// the sharer's QUIC idle timeout, then `REVERSE_ACTIVITY_GRACE` (20s,
-/// hardcoded) still protects it; every new Initial is silently dropped
-/// meanwhile (relay/src/lib.rs:283-294). Production arithmetic: ~30s idle +
-/// 20s grace ~= 50s lockout. Fix direction: per-accept sharer re-register on
-/// a fresh port (rolling listener) — proven viable by
-/// `quic_sharer_restart_same_identity`, which passes TODAY because a
-/// new-port registration displaces the old one and bypasses the slot check —
-/// and/or releasing the flow on session end.
-const GAP_RELAY_LOCKOUT: &str = "relay-lockout";
-
-/// A clean client close (QUIC CONNECTION_CLOSE reaches the sharer) still
-/// deregisters NOTHING at the relay: the flow lives until it idles out, so
-/// even the politest disconnect leaves the slot locked. Fix: sharer releases
-/// its relay flow (or re-registers) when a session ends.
-const GAP_NO_CLOSE_DEREG: &str = "no-close-deregistration";
-
-/// Every Spora client's first Initial carries DCID = routing_key
-/// (e2e.rs:212), so while ANY previous connection with that DCID is alive or
-/// draining on the sharer's quinn endpoint, a new client's Initials are
-/// routed into it and swallowed without a response — visible in pure form on
-/// the Direct (relay-less) carrier. Fix: per-connection DCIDs (per-port
-/// sessions give this for free: one endpoint per client).
-const GAP_DCID_SWALLOW: &str = "dcid-swallow";
+// FIXED 2026-08-13 (rolling listener, per-port sessions): the former
+// `relay-lockout`, `no-close-deregistration`, and `dcid-swallow` gaps. The
+// sharer now re-registers from a FRESH socket the moment a session is
+// accepted, so the routing key always points at a flow-free relay port (no
+// one-flow lockout for crashed OR cleanly-closed predecessors, no
+// REVERSE_ACTIVITY_GRACE exposure — production arithmetic used to be ~30s
+// idle + 20s grace ~= 50s of "restart the relay to connect"), and every
+// session gets its own quinn endpoint (no same-DCID Initial swallow);
+// Direct dials use random initial DCIDs (the routing-key DCID exists only
+// for relay routing). The takeover scenarios below are the strict
+// regression tests: they measured 3.5-6s and 2-4 dial attempts before, and
+// single-digit milliseconds on the first attempt after.
 
 /// quinn's own keep-alive (Timings.quic_keep_alive, both endpoints) ignores
 /// the dormancy knob: a knob-0 ("screen off") client still transmits every
@@ -147,15 +133,11 @@ const TAKEOVER_BUDGET: Duration = Duration::from_secs(3);
 /// Same, after the previous client closed CLEANLY: the close was delivered,
 /// so every resource should already be released.
 const GRACEFUL_TAKEOVER_BUDGET: Duration = Duration::from_secs(2);
-/// Same-client recovery once the network is back (post-unblock/wake/rebind):
-/// one redial cycle (delay 500ms + dial) with margin.
-const RESUME_BUDGET: Duration = Duration::from_secs(2);
 /// Roam: detection + one redial. On the QUIC relay path today's detection
 /// alone is 2x idle = 6s (the client keeps RECEIVING sharer keepalives via
 /// the old return path until the sharer idles out, then idles out itself),
-/// so a 5s budget is deterministically red until BOTH the flow-slot release
-/// AND fast blackhole detection land. Production-timing equivalent of the
-/// current mechanism is ~40-90s.
+/// so a 5s budget is deterministically red until fast blackhole detection
+/// lands (the redial itself is instant since the per-port fix).
 const ROAM_BUDGET: Duration = Duration::from_secs(5);
 /// Roam on the TCP carrier: adaptive-keepalive detection (probe 1s +
 /// response 1s + grace 1s) + one redial cycle.
@@ -487,7 +469,7 @@ fn takeover(
     name: &str,
     graceful: bool,
     budget: Duration,
-    gap: &str,
+    gap: Option<&str>,
 ) -> Result<(), String> {
     let topo = pr_pr()?;
     let wan = services::start_wan(&topo.wan, scaled_relay_state)?;
@@ -507,17 +489,18 @@ fn takeover(
     record_attempts(name, attempts);
     log::info!("{name}: takeover in {elapsed:.1?} after {attempts} attempt(s)");
 
-    known_gap(
-        gap,
-        if elapsed <= budget && attempts == 1 {
-            Ok(())
-        } else {
-            Err(format!(
-                "takeover took {elapsed:.1?} and {attempts} dial attempts \
-                 (budget {budget:?} on the first attempt)"
-            ))
-        },
-    )?;
+    let budget_check = if elapsed <= budget && attempts == 1 {
+        Ok(())
+    } else {
+        Err(format!(
+            "takeover took {elapsed:.1?} and {attempts} dial attempts \
+             (budget {budget:?} on the first attempt)"
+        ))
+    };
+    match gap {
+        Some(tag) => known_gap(tag, budget_check)?,
+        None => budget_check?,
+    }
 
     // Eventual recovery is strict regardless of the budget: the sharer
     // accepted a NEW session and traffic flows.
@@ -534,48 +517,49 @@ fn takeover(
     Ok(())
 }
 
-/// Client crashes (no close on the wire); the next client should get in
-/// immediately. Today the relay's one-flow slot stays "actively serving"
-/// (sharer keepalives refresh it until the sharer's own idle timeout) and
-/// the sharer's quinn endpoint swallows same-DCID Initials while the old
-/// connection drains — scaled here to ~6-7s, ~50s on production timings
-/// (the live-debug "restart the relay to connect" bug).
+/// Client crashes (no close on the wire); the next client gets in on the
+/// first dial. REGRESSION TEST for the rolling listener: before it, the
+/// relay's one-flow slot stayed "actively serving" the dead client (sharer
+/// keepalives refreshed it until the sharer's own idle timeout, then the
+/// 20s grace) and the sharer's shared endpoint swallowed same-DCID
+/// Initials — measured 6.0s / 4 dial attempts here, ~50s on production
+/// timings (the live-debug "restart the relay to connect" bug). With
+/// per-port sessions: ~6ms, first attempt.
 fn quic_crash_takeover() -> Result<(), String> {
     takeover(
         RelayProtocol::UdpQuic,
         "quic_crash_takeover",
         false,
         TAKEOVER_BUDGET,
-        GAP_RELAY_LOCKOUT,
+        None,
     )
 }
 
-/// Client closes CLEANLY (CONNECTION_CLOSE delivered end to end) — every
-/// resource should be released the moment the close lands, yet the relay
-/// flow still only dies by idling out.
+/// Client closes CLEANLY — every resource is released the moment the close
+/// lands. REGRESSION TEST for the rolling listener (before it, even the
+/// politest disconnect left the relay flow to die by idling out: 4.0s / 3
+/// attempts; after: ~7ms, first attempt).
 fn quic_graceful_close_takeover() -> Result<(), String> {
     takeover(
         RelayProtocol::UdpQuic,
         "quic_graceful_close_takeover",
         true,
         GRACEFUL_TAKEOVER_BUDGET,
-        GAP_NO_CLOSE_DEREG,
+        None,
     )
 }
 
 /// nz rides the identical relay flow table (routing-key prefix instead of
-/// QUIC DCID) — identical lockout. Tighter budget than the QUIC twin: nz
-/// flow eviction is not prolonged by quinn keepalives (the dormant nz
-/// client sends nothing), so the slot frees at flow-timeout ~3s after the
-/// last echo — a 2s budget keeps the red deterministic (a success before
-/// eviction is impossible), while the desired first-dial takeover is ~0.5s.
+/// QUIC DCID) and rolls its listener the same way. REGRESSION TEST (before:
+/// 3.5s / 2 attempts against the flow-timeout eviction; after: ~20ms, first
+/// attempt).
 fn nz_crash_takeover() -> Result<(), String> {
     takeover(
         RelayProtocol::NoiseUdp,
         "nz_crash_takeover",
         false,
         GRACEFUL_TAKEOVER_BUDGET,
-        GAP_RELAY_LOCKOUT,
+        None,
     )
 }
 
@@ -613,9 +597,12 @@ fn tcp_crash_takeover() -> Result<(), String> {
 }
 
 /// Direct (relay-less) carrier: no relay in the picture, so a crashed
-/// client's replacement meets ONLY the sharer-side quinn DCID routing — the
-/// swallow in pure form. New Initials (DCID = routing_key) are absorbed by
-/// the previous connection until it idles out and drains.
+/// client's replacement used to meet the sharer-side quinn DCID routing in
+/// pure form — new Initials (DCID = routing_key) absorbed by the previous
+/// connection until it idled out and drained. REGRESSION TEST for the
+/// random-initial-DCID fix on Direct dials (before: 3.0s / 2 attempts;
+/// after: ~5ms, first attempt). A Direct sharer cannot roll its advertised
+/// port, so the DCID fix is what carries this scenario.
 fn direct_crash_takeover() -> Result<(), String> {
     const DIRECT_PORT: u16 = 51000;
     let topo = Topology::build(&TopologySpec::new(
@@ -641,18 +628,13 @@ fn direct_crash_takeover() -> Result<(), String> {
     record_attempts("direct_crash_takeover", attempts);
     log::info!("direct takeover in {elapsed:.1?} after {attempts} attempt(s)");
 
-    known_gap(
-        GAP_DCID_SWALLOW,
-        if elapsed <= GRACEFUL_TAKEOVER_BUDGET && attempts == 1 {
-            Ok(())
-        } else {
-            Err(format!(
-                "direct takeover took {elapsed:.1?} and {attempts} attempts \
-                 (budget {GRACEFUL_TAKEOVER_BUDGET:?} on the first attempt) — \
-                 same-DCID Initials swallowed while the old connection drains"
-            ))
-        },
-    )?;
+    if elapsed > GRACEFUL_TAKEOVER_BUDGET || attempts != 1 {
+        return Err(format!(
+            "PRODUCT REGRESSION — direct takeover took {elapsed:.1?} and \
+             {attempts} attempts (budget {GRACEFUL_TAKEOVER_BUDGET:?} on the \
+             first attempt); is the Direct dial back on a routing-key DCID?"
+        ));
+    }
 
     let mut client2 = client2;
     client2
@@ -672,15 +654,10 @@ fn direct_crash_takeover() -> Result<(), String> {
 /// outage, and once the network returns traffic must resume within a couple
 /// of redial cycles. STRICT with a 5s post-unblock ceiling.
 ///
-/// Why this one is NOT the lockout probe: at scaled timings the relay's
-/// flow eviction (~6.5s: sharer idle 3s + flow 3s + sweep 0.5s) races the
-/// 2.5s redial cadence, so whether a post-unblock dial meets the protected
-/// slot is phase luck (observed 1.0s and 2.5s resumes; the relay's
-/// "dropping client ... for actively-serving sharer" debug line appears
-/// only in the slow runs). The takeover scenarios pin the lockout
-/// deterministically — their first dial always lands inside the protected
-/// window. On PRODUCTION timings this path IS the lockout: redials every
-/// ~13s (5s delay + 8s dial timeout) against a ~50s protected slot.
+/// (Historical note: pre-per-port, post-unblock redials raced the relay's
+/// protected flow slot — observed 1.0-2.5s resumes on phase luck, ~50s
+/// lockouts at production timings. With the rolling listener the redial
+/// meets a fresh port and resume is one clean cycle.)
 fn quic_blackout_same_client_reconnect() -> Result<(), String> {
     let topo = pr_pr()?;
     let wan = services::start_wan(&topo.wan, scaled_relay_state)?;
@@ -727,12 +704,11 @@ fn quic_blackout_same_client_reconnect() -> Result<(), String> {
 }
 
 /// Sharer restarts (crash + relaunch, SAME identity, new socket = new port).
-/// This is the rolling-listener mechanism in miniature and it passes TODAY:
-/// the new instance's REGISTER from a fresh port displaces the old
-/// registration, the one-flow check keys on the NEW sharer address (no flow
-/// entry there), and the surviving client's next redial lands immediately.
-/// STRICT — this green result is the empirical foundation of the per-port
-/// redesign; if it regresses, the redesign premise is broken.
+/// This scenario predates the rolling listener and proved its premise: a
+/// REGISTER from a fresh port displaces the old registration and the
+/// surviving client's next redial lands immediately. Now it doubles as the
+/// restart-shaped regression test for the same mechanism the share loop
+/// performs on every accepted session. STRICT.
 fn quic_sharer_restart_same_identity() -> Result<(), String> {
     let topo = pr_pr()?;
     let wan = services::start_wan(&topo.wan, scaled_relay_state)?;
@@ -812,8 +788,8 @@ fn roam(
     } else {
         Err(format!(
             "roam recovery took {restored:.1?} (budget {budget:?}) — \
-             redials from the new address are dropped while the old \
-             flow entry lives; production equivalent ~40-90s"
+             death detection after an address change is idle-timeout-bound; \
+             production equivalent tens of seconds"
         ))
     };
     match gap {
@@ -836,13 +812,21 @@ fn roam(
 /// QUIC relay path: the roamed client's short-header packets are unknown to
 /// the relay's flow table AND its fresh Initials are dropped while the old
 /// flow entry lives.
+/// QUIC relay-path roam. The relay-lockout half of this budget is FIXED
+/// (per-port sessions: the roamed client's redial lands on a fresh listener
+/// immediately — measured 8.5s -> 7.0s); the residual miss is pure death
+/// detection: the client keeps RECEIVING the sharer's keepalives via the
+/// old return path until the sharer idles out (3s), then idles out itself
+/// (3s more) — a 6s floor against the 5s budget. Green requires
+/// keepalive-deadline blackhole detection (same root cause as the rebind
+/// scenario, hence the shared tag).
 fn quic_roam_recovery() -> Result<(), String> {
     roam(
         RelayProtocol::UdpQuic,
         "quic_roam",
         ROAM_BUDGET,
         None,
-        Some(GAP_RELAY_LOCKOUT),
+        Some(GAP_SLOW_REBIND),
     )
 }
 
@@ -1059,13 +1043,13 @@ fn nat_keepalive_maintains_mapping() -> Result<(), String> {
 /// timeout, 1.5s radio-off), so when the radio returns the client believes
 /// the session is alive — but its packets now egress from a NEW random
 /// port. The relay drops them (unknown source), the sharer keeps sending to
-/// the dead mapping, and NOTHING notices until the 3s idle timeout fires;
-/// only then do redials start, and they meet the relay's stale flow on top.
-/// Deterministic arithmetic at scale: >= 1.5s undetected blackhole + redial
-/// cycles against the protected slot ~= 4-5s, vs. the 2s budget a
-/// keepalive-response-deadline detector would meet. Production equivalent:
-/// 30s idle + ~50s lockout. This is the "morning NAT'd sharer" failure
-/// class from the live debug, client-side edition.
+/// the dead mapping, and NOTHING notices until the 3s idle timeout fires.
+/// The relay-lockout half is FIXED (per-port: the post-detection redial
+/// lands immediately — measured 6.5s -> 3.0s); the residual is pure
+/// detection latency: >= 1.5s of undetected blackhole + redial ~= 2-3.5s,
+/// vs. the 1.5s a keepalive-response-deadline detector would meet
+/// (production equivalent: a 30s idle wait). This is the "morning NAT'd
+/// sharer" failure class from the live debug, client-side edition.
 fn nat_symmetric_rebind_recovery() -> Result<(), String> {
     let topo = Topology::build(&TopologySpec::new(
         NatKind::PortRestricted,
@@ -1094,15 +1078,19 @@ fn nat_symmetric_rebind_recovery() -> Result<(), String> {
     record_outage("symmetric_rebind_resume", restored);
     log::info!("post-rebind resume in {restored:.1?}");
 
+    // 1.5s: what a keepalive-deadline detector + one redial achieves; the
+    // current idle-timeout path floors at ~1.8s post-unblock (idle 3s minus
+    // the 1.5s blackout, plus the redial), keeping this deterministically
+    // red until fast detection lands.
+    let budget = Duration::from_millis(1500);
     known_gap(
         GAP_SLOW_REBIND,
-        if restored <= RESUME_BUDGET {
+        if restored <= budget {
             Ok(())
         } else {
             Err(format!(
-                "rebind recovery took {restored:.1?} (budget {RESUME_BUDGET:?}) — \
-                 the blackhole goes undetected until the idle timeout, then \
-                 redials meet the relay's stale flow"
+                "rebind recovery took {restored:.1?} (budget {budget:?}) — \
+                 the blackhole goes undetected until the idle timeout"
             ))
         },
     )?;

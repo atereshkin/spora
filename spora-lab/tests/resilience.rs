@@ -1,6 +1,6 @@
 //! Failure/recovery scenarios over the RELAY path: relay restart mid-session,
-//! sharer registration blackout, client roaming between gateways, and the
-//! relay's one-flow-per-sharer replacement policy.
+//! sharer registration blackout, client roaming between gateways, and live
+//! session takeover (new peer kicks previous via the rolling listener).
 //!
 //! Direct upgrade is disabled on both peers in every scenario (the relay path
 //! is the subject under test) and both sides sit behind PortRestricted NAT.
@@ -370,11 +370,22 @@ fn roaming_gateway_switch() -> Result<(), String> {
 // ---------------------------------------------------------------------------
 // 4. sharer_session_replacement
 //
-// The relay enforces ONE flow per sharer: while client1's flow is alive, a
-// second client's Initial is dropped (connect fails fast and client1 is
-// untouched). After client1 goes away, the sharer's flow entry keeps being
-// refreshed by its keepalives until its QUIC idle timeout (~3s), then
-// expires (flow 3s + sweep 500ms) — after which client2 connects fine.
+// REGRESSION TEST for the rolling listener (2026-08-13): a second client
+// against the same URL connects IMMEDIATELY — its dial lands on the fresh
+// listener generation, and the sharer kicks the previous session
+// ("new peer kicks previous"). Before the per-port change this scenario
+// asserted the OPPOSITE: the relay's one-flow slot dropped client2's
+// Initials while client1's flow was alive (~50s lockout at production
+// timings; the "restart the relay to connect" bug).
+//
+// Known consequence, deliberate for now: TWO live clients that both
+// auto-reconnect will alternate ownership at reconnect_delay cadence (each
+// kick closes the loser's connection, its ReconnectTransport redials after
+// the fixed delay and kicks back). The fixed, never-shrinking
+// reconnect_delay is the anti-storm pacing (see transport/mod.rs); real
+// multi-client sessions are the eventual fix (per-port already gives each
+// session its own endpoint). The scenario stops client1 right after the
+// takeover so the alternation cannot race the assertions.
 
 fn sharer_session_replacement() -> Result<(), String> {
     let topo = Topology::build(&TopologySpec::new(
@@ -394,45 +405,22 @@ fn sharer_session_replacement() -> Result<(), String> {
         .map_err(|e| format!("sharer session for client1: {e}"))?;
     expect_clean_echo(&client1, "client1 echo")?;
 
-    // One-flow policy, observed from the outside: a second client against
-    // the same URL is dropped at the relay while client1's flow is alive.
-    match peers::start_client(&topo.client, sharer.url().clone(), &opts) {
-        Ok(client2) => {
-            client2.stop();
-            return Err("client2 connected while client1's flow was alive — \
-                        the relay's one-flow policy did not hold"
-                .into());
-        }
-        Err(e) if e.contains("connect() failed") => {
-            log::info!("client2 rejected while client1 active, as expected: {e}");
-        }
-        Err(e) => {
-            return Err(format!(
-                "expected a fail-fast connect() error for client2, got: {e}"
-            ));
-        }
-    }
-
-    // client1 is unaffected by the rejected attempt.
-    expect_clean_echo(&client1, "client1 echo after rejected client2")?;
-
-    // Retire client1. Its host teardown sends no clean QUIC close, so the
-    // sharer keeps refreshing the relay flow with keepalives until its idle
-    // timeout (~3s); the flow then expires 3s later and is swept within
-    // 500ms (the sharer's 1s REGISTERs keep the sweep clock ticking). 8s
-    // covers the ~6.5s worst case with margin.
-    client1.stop();
-    std::thread::sleep(Duration::from_secs(8));
-
+    // A second client takes over while client1 is ALIVE: first dial, no
+    // waiting on any expiry.
     let mut client2 = peers::start_client(&topo.client, sharer.url().clone(), &opts)
-        .map_err(|e| format!("client2 should connect after client1's flow expired: {e}"))?;
+        .map_err(|e| format!("client2 should take over immediately, got: {e}"))?;
+    // Retire client1 before its paced redial can kick client2 back (the
+    // mutual-eviction alternation documented above; reconnect_delay 500ms
+    // scaled leaves comfortable room for these two calls).
+    client1.stop();
+
     client2
         .wait_event(is_relay_established, Duration::from_secs(15))
         .map_err(|e| format!("client2 relay session: {e}"))?;
     sharer
         .wait_event(is_relay_established, Duration::from_secs(15))
         .map_err(|e| format!("sharer session for client2: {e}"))?;
-    expect_clean_echo(&client2, "client2 echo")?;
+    expect_clean_echo(&client2, "client2 echo after live takeover")?;
 
     client2.stop();
     sharer.stop();
