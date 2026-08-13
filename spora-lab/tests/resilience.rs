@@ -163,6 +163,10 @@ fn relay_restart_recovery() -> Result<(), String> {
 
     let mut sharer = peers::start_sharer(&topo.sharer, &opts)?;
     let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)?;
+    // Active client (like the CLI): its reconnect loop redials on a dead
+    // path. A dormant (knob 0) client parks instead — that's the
+    // cooperate-with-sleep path, not what this scenario exercises.
+    client.set_keepalive(1);
     client
         .wait_event(is_relay_established, Duration::from_secs(15))
         .map_err(|e| format!("client relay session: {e}"))?;
@@ -304,6 +308,9 @@ fn roaming_gateway_switch() -> Result<(), String> {
 
     let mut sharer = peers::start_sharer(&topo.sharer, &opts)?;
     let mut client = peers::start_client(&topo.client, sharer.url().clone(), &opts)?;
+    // Active client (see relay_restart_recovery): a roaming user is in use,
+    // so its reconnect loop redials rather than parking.
+    client.set_keepalive(1);
     client
         .wait_event(is_relay_established, Duration::from_secs(15))
         .map_err(|e| format!("client relay session: {e}"))?;

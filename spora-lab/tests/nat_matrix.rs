@@ -427,6 +427,12 @@ fn symmetric_cone_fallback() -> Result<(), String> {
         scaled_relay_state,
         WanLatency::Zero,
     )?;
+    // Active client (knob on): keep the relay-fallback session alive across
+    // the punch-failure + no-upgrade waits below. With quinn keepalive gone
+    // and scaled timings (3s idle), a dormant client's session would idle out
+    // before the echo — that's the cooperate-with-sleep behavior, but this
+    // scenario is about the relay PATH, so it models an in-use client.
+    client.set_keepalive(1);
 
     let reason = expect_punch_failure(&mut client, pairing, FALLBACK_TIMEOUT)?;
     log::info!("{pairing}: punch failed as expected: {reason:?}");
