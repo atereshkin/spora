@@ -48,7 +48,10 @@ pub async fn register_loop(
             // socket per accepted session): one strictly-increasing
             // timestamp series means a new instance's first REGISTER can
             // never be rejected as a replay of the old instance's last.
-            let pkt = signer.lock().expect("register signer").next_register_packet();
+            let pkt = signer
+                .lock()
+                .expect("register signer")
+                .next_register_packet();
             if let Err(e) = socket.send_to(&pkt, relay_addr).await {
                 warn!("register_loop: send_to {} failed: {}", relay_addr, e);
             }

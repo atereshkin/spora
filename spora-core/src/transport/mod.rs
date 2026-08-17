@@ -16,9 +16,9 @@ use std::io;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::Arc;
-use std::task::Poll::Ready;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::task::Poll::Ready;
 use std::task::{Context, Poll, Waker};
 use tokio::net::UdpSocket;
 use tokio::time::{Sleep, sleep};
@@ -279,9 +279,9 @@ impl Sink<Vec<u8>> for ReconnectTransport {
         let this = self.get_mut();
         let ret = match &mut this.state {
             ReconnectState::Connected(inner) => Pin::new(inner).poll_ready(cx),
-            ReconnectState::Sleeping(_) | ReconnectState::DormantPark | ReconnectState::Dialing(_) => {
-                Poll::Ready(Ok(()))
-            } // drop policy
+            ReconnectState::Sleeping(_)
+            | ReconnectState::DormantPark
+            | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
         };
         ret
     }
@@ -296,9 +296,9 @@ impl Sink<Vec<u8>> for ReconnectTransport {
                 }
                 Ok(())
             }
-            ReconnectState::Sleeping(_) | ReconnectState::DormantPark | ReconnectState::Dialing(_) => {
-                Ok(())
-            } // drop policy
+            ReconnectState::Sleeping(_)
+            | ReconnectState::DormantPark
+            | ReconnectState::Dialing(_) => Ok(()), // drop policy
         }
     }
 
@@ -317,9 +317,9 @@ impl Sink<Vec<u8>> for ReconnectTransport {
                 }
                 p => p,
             },
-            ReconnectState::Sleeping(_) | ReconnectState::DormantPark | ReconnectState::Dialing(_) => {
-                Poll::Ready(Ok(()))
-            } // drop policy
+            ReconnectState::Sleeping(_)
+            | ReconnectState::DormantPark
+            | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
         }
     }
 
@@ -334,9 +334,9 @@ impl Sink<Vec<u8>> for ReconnectTransport {
                 }
                 p => p,
             },
-            ReconnectState::Sleeping(_) | ReconnectState::DormantPark | ReconnectState::Dialing(_) => {
-                Poll::Ready(Ok(()))
-            } // drop policy
+            ReconnectState::Sleeping(_)
+            | ReconnectState::DormantPark
+            | ReconnectState::Dialing(_) => Poll::Ready(Ok(())), // drop policy
         }
     }
 }

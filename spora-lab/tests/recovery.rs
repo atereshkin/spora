@@ -381,7 +381,10 @@ fn wait_traffic_restored(
 
 /// Count already-emitted events matching `pred` (drains the buffer; a 500ms
 /// settle catches in-flight emissions without eating a whole redial cycle).
-fn count_events<P: Fn(&TunnelEvent) -> bool + Copy>(events_of: &mut ClientHandle, pred: P) -> usize {
+fn count_events<P: Fn(&TunnelEvent) -> bool + Copy>(
+    events_of: &mut ClientHandle,
+    pred: P,
+) -> usize {
     let mut n = 0;
     while events_of
         .wait_event(pred, Duration::from_millis(500))
@@ -401,15 +404,19 @@ fn count_events<P: Fn(&TunnelEvent) -> bool + Copy>(events_of: &mut ClientHandle
 /// budgets that hold here hold there).
 fn radio_off(topo: &Topology) -> Result<(), String> {
     topo.client.run("iptables -w -A OUTPUT -j DROP")?;
-    topo.wan
-        .run(&format!("iptables -w -A OUTPUT -d {} -j DROP", topo.ext_ip_b))?;
+    topo.wan.run(&format!(
+        "iptables -w -A OUTPUT -d {} -j DROP",
+        topo.ext_ip_b
+    ))?;
     Ok(())
 }
 
 fn radio_on(topo: &Topology) -> Result<(), String> {
     topo.client.run("iptables -w -D OUTPUT -j DROP")?;
-    topo.wan
-        .run(&format!("iptables -w -D OUTPUT -d {} -j DROP", topo.ext_ip_b))?;
+    topo.wan.run(&format!(
+        "iptables -w -D OUTPUT -d {} -j DROP",
+        topo.ext_ip_b
+    ))?;
     Ok(())
 }
 
@@ -419,7 +426,10 @@ fn radio_on(topo: &Topology) -> Result<(), String> {
 /// per-scenario analogue of the harness's suite-level skip.
 fn conntrack_sysctls_available(gw: &Netns) -> bool {
     gw.command("sh")
-        .args(["-c", "test -w /proc/sys/net/netfilter/nf_conntrack_udp_timeout"])
+        .args([
+            "-c",
+            "test -w /proc/sys/net/netfilter/nf_conntrack_udp_timeout",
+        ])
         .status()
         .map(|s| s.success())
         .unwrap_or(false)
@@ -463,7 +473,13 @@ fn iface_tx_packets(ns: &Netns, dev: &str) -> Result<u64, String> {
 }
 
 fn record_outage(name: &str, d: Duration) {
-    metrics::record(&format!("outage_s.{name}"), d.as_secs_f64(), "s", false, 50.0);
+    metrics::record(
+        &format!("outage_s.{name}"),
+        d.as_secs_f64(),
+        "s",
+        false,
+        50.0,
+    );
 }
 
 fn record_attempts(name: &str, attempts: usize) {
@@ -633,10 +649,7 @@ fn tcp_crash_takeover() -> Result<(), String> {
 /// port, so the DCID fix is what carries this scenario.
 fn direct_crash_takeover() -> Result<(), String> {
     const DIRECT_PORT: u16 = 51000;
-    let topo = Topology::build(&TopologySpec::new(
-        NatKind::Open,
-        NatKind::PortRestricted,
-    ))?;
+    let topo = Topology::build(&TopologySpec::new(NatKind::Open, NatKind::PortRestricted))?;
     let wan = services::start_wan(&topo.wan, scaled_relay_state)?;
     let mut opts = carrier_opts(&wan, RelayProtocol::UdpQuic);
     opts.relays = vec![RelayEndpoint::with_protocol(
@@ -694,8 +707,10 @@ fn quic_blackout_same_client_reconnect() -> Result<(), String> {
 
     // Bidirectional cut, client-side only (sharer keeps registering).
     netem::block(&topo.wan, topo.ext_ip_b, svc_ip())?;
-    topo.wan
-        .run(&format!("iptables -w -A OUTPUT -d {} -j DROP", topo.ext_ip_b))?;
+    topo.wan.run(&format!(
+        "iptables -w -A OUTPUT -d {} -j DROP",
+        topo.ext_ip_b
+    ))?;
     client.discard_events();
     sharer.discard_events();
 
@@ -706,8 +721,10 @@ fn quic_blackout_same_client_reconnect() -> Result<(), String> {
         .map_err(|e| format!("client never detected the blackout: {e}"))?;
 
     netem::unblock(&topo.wan, topo.ext_ip_b, svc_ip())?;
-    topo.wan
-        .run(&format!("iptables -w -D OUTPUT -d {} -j DROP", topo.ext_ip_b))?;
+    topo.wan.run(&format!(
+        "iptables -w -D OUTPUT -d {} -j DROP",
+        topo.ext_ip_b
+    ))?;
     let t0 = Instant::now();
 
     let restored = wait_traffic_restored(&client, t0, RECOVERY_CEILING)?;
@@ -854,7 +871,12 @@ fn quic_roam_recovery() -> Result<(), String> {
 /// scenarios and quic_roam; this pins "an nz roam recovers at all, within
 /// a few redial cycles".
 fn nz_roam_recovery() -> Result<(), String> {
-    roam(RelayProtocol::NoiseUdp, "nz_roam", Duration::from_secs(10), None)
+    roam(
+        RelayProtocol::NoiseUdp,
+        "nz_roam",
+        Duration::from_secs(10),
+        None,
+    )
 }
 
 /// TCP carrier roam. Detection is the adaptive ICMP keepalive (knob 1 here —
