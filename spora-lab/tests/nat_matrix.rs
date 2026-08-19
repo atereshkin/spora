@@ -30,6 +30,7 @@
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
 
+use spora_core::record::Reason;
 use spora_core::{Timings, TunnelEvent};
 use spora_lab::peers::{self, ClientHandle, LabPeerOpts, SharerHandle};
 use spora_lab::services::{self, WanHandle};
@@ -234,14 +235,16 @@ fn expect_punch_failure(
     timeout: Duration,
 ) -> Result<String, String> {
     match client.wait_event(is_upgrade_outcome, timeout)? {
-        TunnelEvent::DirectUpgradeFailed { reason } => {
+        TunnelEvent::DirectUpgradeFailed { code, reason } => {
             // Both punch-phase failures are acceptable shapes; anything else
-            // (STUN, endpoint exchange, QUIC) means the punch never ran.
-            if reason.contains("punch exchange") || reason.contains("bidirectional") {
+            // (STUN, endpoint exchange, QUIC) means the punch never ran. This
+            // asserts on the code, not the wording: the wording may change,
+            // the vocabulary may not.
+            if matches!(code, Reason::PunchTimeout | Reason::VerifyTimeout) {
                 Ok(reason)
             } else {
                 Err(format!(
-                    "{pairing}: upgrade failed before/after the punch instead of in it: {reason:?}"
+                    "{pairing}: upgrade failed before/after the punch instead of in it: {code} ({reason:?})"
                 ))
             }
         }

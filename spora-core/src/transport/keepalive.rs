@@ -1,4 +1,5 @@
 use crate::IpTransport;
+use crate::record::{Reason, Recorder, StepKind};
 use futures_util::{Sink, Stream};
 use log::{debug, info, trace, warn};
 use std::future::Future;
@@ -10,6 +11,43 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use tokio::time::Instant;
 use tokio::time::{Sleep, sleep};
+
+/// Traffic and liveness-probe counters, maintained by the keepalive layer.
+///
+/// This layer sits on every carrier and on both sides of a direct upgrade, so
+/// it is the only vantage point that can produce a single continuous series
+/// across a path swap — which is why the counters live here rather than in a
+/// carrier.
+///
+/// What is counted is **tunnel payload**: the packets the application handed
+/// over or received. Deliberately not the same quantity as a carrier's wire
+/// bytes (which include its framing and its retransmissions), nor as the
+/// exit's post-netstack goodput. Probes are counted separately and never
+/// folded into the traffic counters, so an idle tunnel reads as idle.
+#[derive(Debug, Default)]
+pub struct LinkCounters {
+    pub tx_pkts: AtomicU64,
+    pub tx_bytes: AtomicU64,
+    pub rx_pkts: AtomicU64,
+    pub rx_bytes: AtomicU64,
+    /// Liveness probes sent, and the ones that came back. Their ratio is the
+    /// only loss figure available on every carrier.
+    pub probes_sent: AtomicU64,
+    pub probes_answered: AtomicU64,
+    /// Round trip of the most recently answered probe, in microseconds. This
+    /// one includes the tunnel itself, unlike a carrier's own estimate.
+    pub last_rtt_us: AtomicU64,
+}
+
+impl LinkCounters {
+    /// Round trip of the most recently answered probe, if there has been one.
+    pub fn last_rtt(&self) -> Option<std::time::Duration> {
+        match self.last_rtt_us.load(Ordering::Relaxed) {
+            0 => None,
+            us => Some(std::time::Duration::from_micros(us)),
+        }
+    }
+}
 
 /// How the keepalive layer decides when to probe.
 #[derive(Clone)]
@@ -61,6 +99,13 @@ pub struct KeepAliveConfig {
     /// goes quiet too — no pings to a dormant peer means it isn't forced to
     /// ACK, giving true radio silence. `None` = always ping (legacy).
     pub active_window: Option<std::time::Duration>,
+    /// Where to accumulate traffic and probe counters, for whoever is keeping
+    /// a diagnostic record. `None` skips the bookkeeping entirely.
+    pub counters: Option<Arc<LinkCounters>>,
+    /// Where to write the verdicts this layer reaches — chiefly the peer
+    /// going quiet. Nobody else can see that one: from the outside, a tunnel
+    /// killed by silence and one killed by an error look identical.
+    pub recorder: Option<Recorder>,
 }
 
 impl Default for KeepAliveConfig {
@@ -77,6 +122,8 @@ impl Default for KeepAliveConfig {
             response_timeout: RESPONSE_TIMEOUT,
             inbound_grace: INBOUND_GRACE,
             active_window: None,
+            counters: None,
+            recorder: None,
         }
     }
 }
@@ -152,6 +199,8 @@ fn build_icmp_echo(cfg: &KeepAliveConfig, seq: &mut u16) -> Vec<u8> {
 fn flush_send_state(
     inner: &mut IpTransport,
     send_state: &mut KeepAliveSendState,
+    counters: &Option<Arc<LinkCounters>>,
+    sent_at: &mut Option<Instant>,
     cx: &mut Context<'_>,
 ) -> Poll<()> {
     loop {
@@ -178,6 +227,10 @@ fn flush_send_state(
                 match Pin::new(&mut **inner).poll_flush(cx) {
                     Poll::Ready(Ok(())) => {
                         trace!("Keepalive sent");
+                        *sent_at = Some(Instant::now());
+                        if let Some(c) = counters {
+                            c.probes_sent.fetch_add(1, Ordering::Relaxed);
+                        }
                         *send_state = KeepAliveSendState::Idle;
                         continue;
                     }
@@ -222,6 +275,9 @@ pub struct KeepAliveTransport {
     seq: u16,
     send_state: KeepAliveSendState,
     mode_state: ModeState,
+    /// When the probe currently awaiting an answer went out. Taken by the
+    /// reply that matches it, which is where the round trip comes from.
+    probe_sent_at: Option<Instant>,
 }
 
 impl KeepAliveTransport {
@@ -266,6 +322,7 @@ impl KeepAliveTransport {
             send_state: KeepAliveSendState::Idle,
             mode_state,
             cfg,
+            probe_sent_at: None,
         }
     }
 
@@ -298,7 +355,13 @@ impl KeepAliveTransport {
                         }
                     }
                 }
-                flush_send_state(&mut self.inner, &mut self.send_state, cx)
+                flush_send_state(
+                    &mut self.inner,
+                    &mut self.send_state,
+                    &self.cfg.counters,
+                    &mut self.probe_sent_at,
+                    cx,
+                )
             }
             ModeState::Adaptive { knob, waker, state } => {
                 let knob_val = knob.load(Ordering::Relaxed);
@@ -309,6 +372,11 @@ impl KeepAliveTransport {
                             let interval = std::time::Duration::from_secs(knob_val);
                             let pkt = build_icmp_echo(&self.cfg, &mut self.seq);
                             info!("Keepalive: Dormant -> Probing (knob={}s)", knob_val);
+                            if let Some(rec) = self.cfg.recorder.as_ref() {
+                                rec.mark(StepKind::Wake)
+                                    .detail(format!("probing every {knob_val}s"))
+                                    .ok();
+                            }
                             self.send_state = KeepAliveSendState::Sending(pkt);
                             state.probe = ProbeState::Probing {
                                 ping_timer: Box::pin(sleep(interval)),
@@ -327,6 +395,15 @@ impl KeepAliveTransport {
                         // knob == 0 means screen OFF — go dormant immediately.
                         if knob_val == 0 {
                             info!("Keepalive: Probing -> Dormant (knob set to 0)");
+                            // Radio silence is deliberate, so it is recorded
+                            // as a decision: a tunnel that goes quiet because
+                            // the screen went off must not read like one that
+                            // went quiet because the network did.
+                            if let Some(rec) = self.cfg.recorder.as_ref() {
+                                rec.mark(StepKind::Dormant)
+                                    .detail("probing stopped: the application went dormant")
+                                    .ok();
+                            }
                             state.probe = ProbeState::Dormant;
                             // Re-arm the knob waker. The set_keepalive(0) call
                             // that just flipped the knob consumed the previous
@@ -335,7 +412,13 @@ impl KeepAliveTransport {
                             // carrier) would miss the next set_keepalive(N>0)
                             // and never resume probing.
                             *waker.lock().unwrap() = Some(cx.waker().clone());
-                            return flush_send_state(&mut self.inner, &mut self.send_state, cx);
+                            return flush_send_state(
+                                &mut self.inner,
+                                &mut self.send_state,
+                                &self.cfg.counters,
+                                &mut self.probe_sent_at,
+                                cx,
+                            );
                         }
 
                         if matches!(self.send_state, KeepAliveSendState::Idle) {
@@ -353,7 +436,13 @@ impl KeepAliveTransport {
                     }
                 }
 
-                flush_send_state(&mut self.inner, &mut self.send_state, cx)
+                flush_send_state(
+                    &mut self.inner,
+                    &mut self.send_state,
+                    &self.cfg.counters,
+                    &mut self.probe_sent_at,
+                    cx,
+                )
             }
         }
     }
@@ -378,6 +467,9 @@ impl KeepAliveTransport {
                         self.cfg.idle_threshold
                     };
                     info!("Keepalive: Dormant -> Probing (outbound after idle gap)");
+                    if let Some(rec) = self.cfg.recorder.as_ref() {
+                        rec.mark(StepKind::Wake).detail("traffic resumed").ok();
+                    }
                     if matches!(self.send_state, KeepAliveSendState::Idle) {
                         let pkt = build_icmp_echo(&self.cfg, &mut self.seq);
                         self.send_state = KeepAliveSendState::Sending(pkt);
@@ -422,6 +514,8 @@ impl KeepAliveTransport {
 
     /// Check if peer appears dead. Returns true if we should yield None.
     fn check_dead(&mut self, cx: &mut Context<'_>) -> Option<Poll<Option<io::Result<Vec<u8>>>>> {
+        let recorder = self.cfg.recorder.clone();
+        let inbound_grace = self.cfg.inbound_grace;
         match &mut self.mode_state {
             ModeState::Periodic {
                 recv_timer,
@@ -435,6 +529,15 @@ impl KeepAliveTransport {
                                 "No inbound traffic for {:?}, peer appears dead",
                                 recv_timeout
                             );
+                            // Nobody else can see this: a tunnel killed by
+                            // silence and one killed by an error look
+                            // identical from the outside.
+                            if let Some(rec) = recorder.as_ref() {
+                                rec.mark(StepKind::Liveness).fail(
+                                    Reason::KeepaliveTimeout,
+                                    format!("nothing inbound for {recv_timeout:?}"),
+                                );
+                            }
                             Some(Poll::Ready(None))
                         }
                         Poll::Pending => None,
@@ -477,8 +580,16 @@ impl KeepAliveTransport {
                             } else {
                                 warn!(
                                     "Keepalive: peer dead (no response to rescue ping, no inbound for {:?})",
-                                    self.cfg.inbound_grace
+                                    inbound_grace
                                 );
+                                if let Some(rec) = recorder.as_ref() {
+                                    rec.mark(StepKind::Liveness).fail(
+                                        Reason::KeepaliveTimeout,
+                                        format!(
+                                            "no answer to the rescue probe, nothing inbound for {inbound_grace:?}"
+                                        ),
+                                    );
+                                }
                                 return Some(Poll::Ready(None));
                             }
                         } else {
@@ -507,10 +618,25 @@ impl Stream for KeepAliveTransport {
 
         match Pin::new(&mut this.inner).poll_next(cx) {
             Poll::Ready(Some(Ok(pkt))) => {
-                if is_icmp_echo_reply(&pkt, this.cfg.icmp_id) {
+                let reply = is_icmp_echo_reply(&pkt, this.cfg.icmp_id);
+                if reply {
                     debug!("Keepalive: received ICMP echo reply (ping response)");
                 } else {
                     trace!("Keepalive: inbound packet ({} bytes)", pkt.len());
+                }
+                if let Some(c) = this.cfg.counters.as_ref() {
+                    if reply {
+                        c.probes_answered.fetch_add(1, Ordering::Relaxed);
+                        // Only the probe still outstanding measures anything;
+                        // a duplicate or late reply is counted, not timed.
+                        if let Some(t0) = this.probe_sent_at.take() {
+                            let us = t0.elapsed().as_micros().min(u64::MAX as u128) as u64;
+                            c.last_rtt_us.store(us.max(1), Ordering::Relaxed);
+                        }
+                    } else {
+                        c.rx_pkts.fetch_add(1, Ordering::Relaxed);
+                        c.rx_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                    }
                 }
                 this.on_inbound();
                 Poll::Ready(Some(Ok(pkt)))
@@ -538,6 +664,10 @@ impl Sink<Vec<u8>> for KeepAliveTransport {
 
     fn start_send(self: Pin<&mut Self>, item: Vec<u8>) -> Result<(), Self::Error> {
         let this = self.get_mut();
+        if let Some(c) = this.cfg.counters.as_ref() {
+            c.tx_pkts.fetch_add(1, Ordering::Relaxed);
+            c.tx_bytes.fetch_add(item.len() as u64, Ordering::Relaxed);
+        }
         this.on_outbound();
         Pin::new(&mut this.inner).start_send(item)
     }

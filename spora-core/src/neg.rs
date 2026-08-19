@@ -55,7 +55,9 @@ fn parse_endpoint(data: &[u8]) -> Result<SocketAddr, TunnelError> {
     // STUN-derived endpoint is a unicast address; same-LAN peers with private
     // reflexive addresses are still allowed.)
     if !is_valid_punch_target(&addr) {
-        return Err(ProtocolError(format!("refusing punch target {}", addr)));
+        return Err(TunnelError::PunchTargetRefused(format!(
+            "refusing punch target {addr}"
+        )));
     }
     Ok(addr)
 }

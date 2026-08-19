@@ -44,7 +44,9 @@ pub enum SporaEvent {
     /// transport router; the actual swap applies shortly after.
     DirectUpgradeSucceeded { local: String, peer: String },
     /// One direct-upgrade attempt failed (the upgrade task may retry).
-    DirectUpgradeFailed { reason: String },
+    /// `code` is the stable vocabulary entry (`spora_core::record::Reason`);
+    /// `reason` is the same thing in words. Count the first, show the second.
+    DirectUpgradeFailed { code: String, reason: String },
     /// Client only: a re-dial is starting after the transport died.
     Reconnecting,
     /// Client only: the re-dial succeeded.
@@ -66,7 +68,10 @@ impl From<spora_core::TunnelEvent> for SporaEvent {
                 local: local.to_string(),
                 peer: peer.to_string(),
             },
-            T::DirectUpgradeFailed { reason } => SporaEvent::DirectUpgradeFailed { reason },
+            T::DirectUpgradeFailed { code, reason } => SporaEvent::DirectUpgradeFailed {
+                code: code.to_string(),
+                reason,
+            },
             T::Reconnecting => SporaEvent::Reconnecting,
             T::Reconnected => SporaEvent::Reconnected,
             T::SessionEnded { reason } => SporaEvent::SessionEnded { reason },

@@ -51,6 +51,10 @@ pub struct LabPeerOpts {
     /// (`Config::conn_log`). The connlog suite points this at a per-scenario
     /// temp dir and asserts on the resulting database.
     pub conn_log: Option<spora_core::connlog::ConnLogConfig>,
+    /// Keep a diagnostic record of how each connection went
+    /// (`Config::record`). The record suite points this at a per-scenario
+    /// temp dir and asserts on what the peers wrote there.
+    pub record: Option<spora_core::record::RecordConfig>,
     /// Share side only: identity to share as. `None` (default) generates a
     /// fresh one per `start_sharer` call; recovery scenarios that restart the
     /// sharer pass the SAME identity so the share URL — and the routing key
@@ -68,6 +72,7 @@ impl LabPeerOpts {
             relays: vec![relay_endpoint(relay)],
             stun_server: stun_server.into(),
             conn_log: None,
+            record: None,
             identity: None,
         }
     }
@@ -91,6 +96,7 @@ impl LabPeerOpts {
             enable_direct_upgrade: self.enable_direct_upgrade,
             event_hook: Some(hook),
             conn_log: self.conn_log.clone(),
+            record: self.record.clone(),
             ..Config::default()
         };
         (config, events)

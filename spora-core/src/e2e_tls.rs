@@ -19,6 +19,7 @@ use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 use tokio_rustls::{TlsAcceptor, TlsConnector};
 
 use crate::identity::{Identity, ROUTING_KEY_LEN, RoutingKeyVerifier, SECRET_LEN};
+use crate::record::{Fault, Reason};
 use crate::transport::IpTransport;
 use crate::transport::stream::StreamPeerTransport;
 
@@ -37,36 +38,46 @@ fn ring_provider() -> Arc<rustls::crypto::CryptoProvider> {
 
 /// Server (A): TLS-accept `stream` with the identity cert, read and verify the
 /// client's secret, ack, and return the IP-packet transport.
-pub async fn accept<S>(stream: S, identity: &Identity) -> Result<IpTransport, String>
+pub async fn accept<S>(stream: S, identity: &Identity) -> Result<IpTransport, Fault>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
     let mut server_crypto = rustls::ServerConfig::builder_with_provider(ring_provider())
         .with_safe_default_protocol_versions()
-        .map_err(|e| format!("tls server version: {e}"))?
+        .map_err(|e| Fault::new(Reason::CryptoError, format!("tls server version: {e}")))?
         .with_no_client_auth()
         .with_single_cert(vec![identity.cert_der()], identity.key_der())
-        .map_err(|e| format!("tls server config: {e}"))?;
+        .map_err(|e| Fault::new(Reason::CryptoError, format!("tls server config: {e}")))?;
     server_crypto.alpn_protocols = vec![E2E_ALPN.to_vec()];
     let acceptor = TlsAcceptor::from(Arc::new(server_crypto));
 
     let mut tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, acceptor.accept(stream))
         .await
-        .map_err(|_| "tls accept timed out".to_string())?
-        .map_err(|e| format!("tls accept: {e}"))?;
+        .map_err(|_| {
+            Fault::new(
+                Reason::HandshakeTimeout,
+                format!("tls accept timed out after {HANDSHAKE_TIMEOUT:?}"),
+            )
+        })?
+        .map_err(|e| Fault::new(Reason::HandshakeRejected, format!("tls accept: {e}")))?;
 
     // Secret auth, mirroring e2e::authenticate_incoming (constant-time compare).
     let mut got = [0u8; SECRET_LEN];
     tokio::time::timeout(AUTH_TIMEOUT, tls.read_exact(&mut got))
         .await
-        .map_err(|_| "secret read timed out".to_string())?
-        .map_err(|e| format!("read secret: {e}"))?;
+        .map_err(|_| {
+            Fault::new(
+                Reason::AuthTimeout,
+                format!("secret read timed out after {AUTH_TIMEOUT:?}"),
+            )
+        })?
+        .map_err(|e| Fault::new(Reason::RecvFailed, format!("read secret: {e}")))?;
     if !bool::from(got.ct_eq(&identity.secret)) {
-        return Err("bad secret".into());
+        return Err(Fault::new(Reason::AuthRejected, "bad secret"));
     }
     tls.write_all(&[AUTH_ACK])
         .await
-        .map_err(|e| format!("write ack: {e}"))?;
+        .map_err(|e| Fault::new(Reason::SendFailed, format!("write ack: {e}")))?;
     let _ = tls.flush().await;
     Ok(Box::new(StreamPeerTransport::new(tls)))
 }
@@ -77,7 +88,7 @@ pub async fn connect<S>(
     stream: S,
     routing_key: [u8; ROUTING_KEY_LEN],
     secret: &[u8; SECRET_LEN],
-) -> Result<IpTransport, String>
+) -> Result<IpTransport, Fault>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -85,7 +96,7 @@ where
     let verifier = Arc::new(RoutingKeyVerifier::new(routing_key, provider.clone()));
     let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .map_err(|e| format!("tls client version: {e}"))?
+        .map_err(|e| Fault::new(Reason::CryptoError, format!("tls client version: {e}")))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
@@ -95,24 +106,50 @@ where
     client_crypto.enable_sni = false;
     let connector = TlsConnector::from(Arc::new(client_crypto));
     let name = rustls::pki_types::ServerName::try_from(SERVER_NAME)
-        .map_err(|e| format!("server name: {e}"))?;
+        .map_err(|e| Fault::new(Reason::Misconfigured, format!("server name: {e}")))?;
 
     let mut tls = tokio::time::timeout(HANDSHAKE_TIMEOUT, connector.connect(name, stream))
         .await
-        .map_err(|_| "tls connect timed out".to_string())?
-        .map_err(|e| format!("tls connect (cert pin/handshake): {e}"))?;
+        .map_err(|_| {
+            Fault::new(
+                Reason::HandshakeTimeout,
+                format!("tls connect timed out after {HANDSHAKE_TIMEOUT:?}"),
+            )
+        })?
+        .map_err(|e| {
+            // The pinned-certificate check fails here too; rustls does not
+            // hand back a distinguishable error, so this cannot claim more
+            // than "the handshake was refused".
+            Fault::new(
+                Reason::HandshakeRejected,
+                format!("tls connect (cert pin/handshake): {e}"),
+            )
+        })?;
 
     tls.write_all(secret)
         .await
-        .map_err(|e| format!("write secret: {e}"))?;
+        .map_err(|e| Fault::new(Reason::SendFailed, format!("write secret: {e}")))?;
     let _ = tls.flush().await;
     let mut ack = [0u8; 1];
     tokio::time::timeout(AUTH_TIMEOUT, tls.read_exact(&mut ack))
         .await
-        .map_err(|_| "auth ack timed out".to_string())?
-        .map_err(|e| format!("auth not acked (bad/expired secret?): {e}"))?;
+        .map_err(|_| {
+            Fault::new(
+                Reason::AuthTimeout,
+                format!("auth ack timed out after {AUTH_TIMEOUT:?}"),
+            )
+        })?
+        .map_err(|e| {
+            Fault::new(
+                Reason::AuthRejected,
+                format!("auth not acked (bad/expired secret?): {e}"),
+            )
+        })?;
     if ack[0] != AUTH_ACK {
-        return Err(format!("unexpected auth ack byte {:#x}", ack[0]));
+        return Err(Fault::new(
+            Reason::ProtocolViolation,
+            format!("unexpected auth ack byte {:#x}", ack[0]),
+        ));
     }
     Ok(Box::new(StreamPeerTransport::new(tls)))
 }

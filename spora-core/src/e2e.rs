@@ -21,6 +21,7 @@ use subtle::ConstantTimeEq;
 
 use crate::Timings;
 use crate::identity::{Identity, ROUTING_KEY_LEN, RoutingKeyVerifier, SECRET_LEN};
+use crate::record::{Fault, Reason};
 use crate::signal::SignalChannel;
 use crate::transport::quic::{QuicPeerTransport, build_transport_config};
 
@@ -59,27 +60,28 @@ pub fn server_endpoint(
     socket: std::net::UdpSocket,
     identity: &Identity,
     timings: &Timings,
-) -> Result<quinn::Endpoint, String> {
+) -> Result<quinn::Endpoint, Fault> {
     let mut server_crypto = rustls::ServerConfig::builder()
         .with_no_client_auth()
         .with_single_cert(vec![identity.cert_der()], identity.key_der())
-        .map_err(|e| format!("server TLS config: {}", e))?;
+        .map_err(|e| Fault::new(Reason::CryptoError, format!("server TLS config: {e}")))?;
     server_crypto.alpn_protocols = vec![E2E_ALPN.to_vec()];
 
     let quic_server_crypto = quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)
-        .map_err(|e| format!("QUIC server crypto: {}", e))?;
+        .map_err(|e| Fault::new(Reason::CryptoError, format!("QUIC server crypto: {e}")))?;
 
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(quic_server_crypto));
     server_config.transport_config(Arc::new(build_transport_config(timings.quic_idle_timeout)));
 
-    let runtime = quinn::default_runtime().ok_or_else(|| "no async runtime".to_string())?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| Fault::new(Reason::Misconfigured, "no async runtime"))?;
     let endpoint = quinn::Endpoint::new(
         quinn::EndpointConfig::default(),
         Some(server_config),
         socket,
         runtime,
     )
-    .map_err(|e| format!("endpoint creation: {}", e))?;
+    .map_err(|e| Fault::new(Reason::SocketError, format!("endpoint creation: {e}")))?;
     Ok(endpoint)
 }
 
@@ -91,7 +93,7 @@ pub async fn accept_one(
     endpoint: &quinn::Endpoint,
     expected_secret: &[u8; SECRET_LEN],
     send_ack: bool,
-) -> Option<Result<E2eSession, String>> {
+) -> Option<Result<E2eSession, Fault>> {
     let incoming = endpoint.accept().await?;
     Some(authenticate_incoming(incoming, expected_secret, send_ack).await)
 }
@@ -113,11 +115,16 @@ pub async fn authenticate_incoming(
     incoming: quinn::Incoming,
     expected_secret: &[u8; SECRET_LEN],
     send_ack: bool,
-) -> Result<E2eSession, String> {
+) -> Result<E2eSession, Fault> {
     let conn = match tokio::time::timeout(HANDSHAKE_TIMEOUT, incoming).await {
         Ok(Ok(c)) => c,
-        Ok(Err(e)) => return Err(format!("QUIC handshake failed: {}", e)),
-        Err(_) => return Err("QUIC handshake timed out".into()),
+        Ok(Err(e)) => return Err(Fault::from_quinn_handshake(&e).context("QUIC handshake")),
+        Err(_) => {
+            return Err(Fault::new(
+                Reason::HandshakeTimeout,
+                format!("QUIC handshake timed out after {HANDSHAKE_TIMEOUT:?}"),
+            ));
+        }
     };
     let peer = conn.remote_address();
     debug!("e2e accept: handshake from {} complete", peer);
@@ -126,12 +133,12 @@ pub async fn authenticate_incoming(
         let (send, mut recv) = conn
             .accept_bi()
             .await
-            .map_err(|e| format!("accept_bi: {}", e))?;
+            .map_err(|e| Fault::from_quinn(&e).context("accept_bi"))?;
         let mut got = [0u8; SECRET_LEN];
         recv.read_exact(&mut got)
             .await
-            .map_err(|e| format!("read secret: {}", e))?;
-        Ok::<_, String>((send, recv, got))
+            .map_err(|e| Fault::new(Reason::RecvFailed, format!("read secret: {e}")))?;
+        Ok::<_, Fault>((send, recv, got))
     })
     .await;
 
@@ -139,18 +146,24 @@ pub async fn authenticate_incoming(
         Ok(Ok(x)) => x,
         Ok(Err(e)) => {
             conn.close(1u32.into(), b"auth-error");
-            return Err(format!("auth from {}: {}", peer, e));
+            return Err(e.context(&format!("auth from {peer}")));
         }
         Err(_) => {
             conn.close(1u32.into(), b"auth-timeout");
-            return Err(format!("auth from {} timed out", peer));
+            return Err(Fault::new(
+                Reason::AuthTimeout,
+                format!("auth from {peer} timed out after {AUTH_TIMEOUT:?}"),
+            ));
         }
     };
     // Constant-time compare so the secret can't be recovered by timing the
     // reply (both are fixed 16-byte arrays).
     if !bool::from(presented.ct_eq(expected_secret)) {
         conn.close(1u32.into(), b"bad-secret");
-        return Err(format!("auth from {}: bad secret", peer));
+        return Err(Fault::new(
+            Reason::AuthRejected,
+            format!("auth from {peer}: bad secret"),
+        ));
     }
     // Acknowledge so the client knows the secret was accepted. A rejected
     // client gets the connection closed above instead of this byte, which is
@@ -158,7 +171,10 @@ pub async fn authenticate_incoming(
     // the relay path (see `send_ack`).
     if send_ack && let Err(e) = send.write_all(&[AUTH_ACK]).await {
         conn.close(1u32.into(), b"ack-failed");
-        return Err(format!("auth ack to {}: {}", peer, e));
+        return Err(Fault::new(
+            Reason::SendFailed,
+            format!("auth ack to {peer}: {e}"),
+        ));
     }
     info!("e2e accept: authenticated peer {}", peer);
 
@@ -180,7 +196,7 @@ pub fn client_endpoint(
     socket: std::net::UdpSocket,
     routing_key: [u8; ROUTING_KEY_LEN],
     timings: &Timings,
-) -> Result<quinn::Endpoint, String> {
+) -> Result<quinn::Endpoint, Fault> {
     client_endpoint_with_dcid(socket, routing_key, timings, true)
 }
 
@@ -197,13 +213,13 @@ pub fn client_endpoint_with_dcid(
     routing_key: [u8; ROUTING_KEY_LEN],
     timings: &Timings,
     rk_initial_dcid: bool,
-) -> Result<quinn::Endpoint, String> {
+) -> Result<quinn::Endpoint, Fault> {
     let provider = Arc::new(rustls::crypto::ring::default_provider());
     let verifier = Arc::new(RoutingKeyVerifier::new(routing_key, provider.clone()));
 
     let mut client_crypto = rustls::ClientConfig::builder_with_provider(provider)
         .with_safe_default_protocol_versions()
-        .map_err(|e| format!("client TLS version: {}", e))?
+        .map_err(|e| Fault::new(Reason::CryptoError, format!("client TLS version: {e}")))?
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_no_client_auth();
@@ -215,7 +231,7 @@ pub fn client_endpoint_with_dcid(
     client_crypto.enable_sni = false;
 
     let quic_client_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)
-        .map_err(|e| format!("QUIC client crypto: {}", e))?;
+        .map_err(|e| Fault::new(Reason::CryptoError, format!("QUIC client crypto: {e}")))?;
 
     let mut client_config = quinn::ClientConfig::new(Arc::new(quic_client_crypto));
     client_config.transport_config(Arc::new(build_transport_config(timings.quic_idle_timeout)));
@@ -225,10 +241,11 @@ pub fn client_endpoint_with_dcid(
             .initial_dst_cid_provider(Arc::new(move || quinn::ConnectionId::new(&rk_bytes)));
     }
 
-    let runtime = quinn::default_runtime().ok_or_else(|| "no async runtime".to_string())?;
+    let runtime = quinn::default_runtime()
+        .ok_or_else(|| Fault::new(Reason::Misconfigured, "no async runtime"))?;
     let mut endpoint =
         quinn::Endpoint::new(quinn::EndpointConfig::default(), None, socket, runtime)
-            .map_err(|e| format!("endpoint creation: {}", e))?;
+            .map_err(|e| Fault::new(Reason::SocketError, format!("endpoint creation: {e}")))?;
     endpoint.set_default_client_config(client_config);
     Ok(endpoint)
 }
@@ -241,14 +258,19 @@ pub async fn client_connect(
     peer_addr: SocketAddr,
     secret: &[u8; SECRET_LEN],
     expect_ack: bool,
-) -> Result<E2eSession, String> {
+) -> Result<E2eSession, Fault> {
     let connecting = endpoint
         .connect(peer_addr, SERVER_NAME)
-        .map_err(|e| format!("QUIC connect setup: {}", e))?;
+        .map_err(|e| Fault::from_quinn_connect(&e).context("QUIC connect setup"))?;
     let conn = tokio::time::timeout(HANDSHAKE_TIMEOUT, connecting)
         .await
-        .map_err(|_| "QUIC client handshake timed out".to_string())?
-        .map_err(|e| format!("QUIC handshake: {}", e))?;
+        .map_err(|_| {
+            Fault::new(
+                Reason::HandshakeTimeout,
+                format!("QUIC client handshake timed out after {HANDSHAKE_TIMEOUT:?}"),
+            )
+        })?
+        .map_err(|e| Fault::from_quinn_handshake(&e).context("QUIC handshake"))?;
     debug!(
         "e2e client: handshake via {} complete (remote={})",
         peer_addr,
@@ -259,10 +281,10 @@ pub async fn client_connect(
         let (mut send, mut recv) = conn
             .open_bi()
             .await
-            .map_err(|e| format!("open_bi: {}", e))?;
+            .map_err(|e| Fault::from_quinn(&e).context("open_bi"))?;
         send.write_all(secret)
             .await
-            .map_err(|e| format!("write secret: {}", e))?;
+            .map_err(|e| Fault::new(Reason::SendFailed, format!("write secret: {e}")))?;
         // On the relay path, wait for the sharer's accept ack. A wrong/expired
         // secret makes the sharer close the connection instead of acking, so
         // this fails fast and the auth failure propagates to the caller —
@@ -271,25 +293,38 @@ pub async fn client_connect(
         // `expect_ack` / `authenticate_incoming`).
         if expect_ack {
             let mut ack = [0u8; 1];
-            recv.read_exact(&mut ack)
-                .await
-                .map_err(|e| format!("auth not acked (bad/expired secret?): {}", e))?;
+            // A wrong secret makes the exit close the connection instead of
+            // acking, so a read error here is the shape a rejected secret
+            // arrives in — hence `auth_rejected` rather than a receive
+            // failure.
+            recv.read_exact(&mut ack).await.map_err(|e| {
+                Fault::new(
+                    Reason::AuthRejected,
+                    format!("auth not acked (bad/expired secret?): {e}"),
+                )
+            })?;
             if ack[0] != AUTH_ACK {
-                return Err(format!("unexpected auth ack byte {:#x}", ack[0]));
+                return Err(Fault::new(
+                    Reason::ProtocolViolation,
+                    format!("unexpected auth ack byte {:#x}", ack[0]),
+                ));
             }
         }
-        Ok::<_, String>((send, recv))
+        Ok::<_, Fault>((send, recv))
     })
     .await;
     let (send, recv) = match auth {
         Ok(Ok(x)) => x,
         Ok(Err(e)) => {
             conn.close(1u32.into(), b"auth-error");
-            return Err(format!("auth: {}", e));
+            return Err(e.context("auth"));
         }
         Err(_) => {
             conn.close(1u32.into(), b"auth-timeout");
-            return Err("auth send timed out".into());
+            return Err(Fault::new(
+                Reason::AuthTimeout,
+                format!("auth send timed out after {AUTH_TIMEOUT:?}"),
+            ));
         }
     };
 
@@ -548,7 +583,7 @@ mod tests {
             Ok(_) => panic!("A should reject bad secret"),
             Err(e) => e,
         };
-        assert!(err.contains("bad secret"), "got: {}", err);
+        assert_eq!(err.reason, Reason::AuthRejected, "got: {err}");
     }
 
     /// Accept any server cert — only for the raw stalling client below.

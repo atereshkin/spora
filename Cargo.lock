@@ -2172,6 +2172,8 @@ dependencies = [
  "rusqlite",
  "rustls",
  "rustls-webpki",
+ "serde",
+ "serde_json",
  "snow",
  "socket2 0.5.10",
  "stunclient",

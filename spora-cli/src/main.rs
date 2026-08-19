@@ -1,4 +1,5 @@
 use clap::{Parser, Subcommand};
+use spora_core::record::Record;
 #[cfg(not(windows))]
 use spora_core::{Config, ExitMode, connect, identity::Identity, share, tun_util};
 use std::path::PathBuf;
@@ -119,6 +120,20 @@ enum Mode {
         /// destination records.
         #[arg(long, conflicts_with = "no_conn_log")]
         conn_log_sessions_only: bool,
+        /// Don't keep a diagnostic record of how each connection went.
+        #[arg(long)]
+        no_record: bool,
+        /// Override the diagnostic-record directory (default:
+        /// $XDG_STATE_HOME/spora/records/).
+        #[arg(long, conflicts_with = "no_record")]
+        record_dir: Option<PathBuf>,
+        /// Label this machine in every record it writes.
+        #[arg(long, conflicts_with = "no_record")]
+        record_label: Option<String>,
+        /// Tie the records from this run to something outside it — a ticket,
+        /// a test run.
+        #[arg(long, conflicts_with = "no_record")]
+        record_id: Option<String>,
     },
     Use {
         url: String,
@@ -126,11 +141,72 @@ enum Mode {
         /// endpoint discovery.
         #[arg(long)]
         stun: Option<String>,
+        /// Don't keep a diagnostic record of how the connection went.
+        #[arg(long)]
+        no_record: bool,
+        /// Override the diagnostic-record directory (default:
+        /// $XDG_STATE_HOME/spora/records/).
+        #[arg(long, conflicts_with = "no_record")]
+        record_dir: Option<PathBuf>,
+        /// Label this machine in every record it writes.
+        #[arg(long, conflicts_with = "no_record")]
+        record_label: Option<String>,
+        /// Tie this run's record to something outside it — a ticket, a test
+        /// run.
+        #[arg(long, conflicts_with = "no_record")]
+        record_id: Option<String>,
     },
     /// Inspect the share's connection log (see docs/connection-logging.md).
     Log {
         #[command(subcommand)]
         cmd: LogCmd,
+    },
+    /// Read the diagnostic records of past connections: what was attempted,
+    /// what failed, and why (see docs/diagnostic-record.md).
+    Record {
+        #[command(subcommand)]
+        cmd: RecordCmd,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+enum RecordCmd {
+    /// One line per record: when, which end, how it ended, and the first
+    /// thing that failed.
+    List {
+        /// Record directory (default: $XDG_STATE_HOME/spora/records/).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// How many records to list, newest first.
+        #[arg(long, short = 'n', default_value_t = 20)]
+        count: usize,
+        /// Machine-readable JSON output.
+        #[arg(long)]
+        json: bool,
+    },
+    /// The full story of one record: every step, in order, with its verdict.
+    Show {
+        /// Record id (or its first characters). Defaults to the newest.
+        id: Option<String>,
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Machine-readable JSON output — the whole record, folded.
+        #[arg(long)]
+        json: bool,
+        /// Include the quality samples taken while the tunnel was up.
+        #[arg(long)]
+        samples: bool,
+    },
+    /// Write records out as JSON, for handing to someone else.
+    Export {
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// How many records to export, newest first.
+        #[arg(long, short = 'n', default_value_t = 20)]
+        count: usize,
+        /// Write to this file instead of standard output.
+        #[arg(long, short = 'o')]
+        out: Option<PathBuf>,
     },
 }
 
@@ -272,6 +348,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             conn_log_dir,
             conn_log_retention_days,
             conn_log_sessions_only,
+            no_record,
+            record_dir,
+            record_label,
+            record_id,
         } => {
             let path = identity_file.unwrap_or_else(default_identity_path);
             let identity = load_or_create_identity(&path, fresh)?;
@@ -332,6 +412,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.conn_log = Some(cl);
                 Some(dir)
             };
+            let record_dir =
+                record_config(&mut config, no_record, record_dir, record_label, record_id);
             let mut routing = None;
             if os_routing {
                 let opts = os_route::Options::parse(&tun_addr, &tun_addr6, tun_mtu, !no_nat)?;
@@ -364,6 +446,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "Connection log DISABLED: you will have no record of what clients did with your IP."
                 ),
             }
+            if let Some(dir) = &record_dir {
+                println!(
+                    "Diagnostic record: {} (read it with `spora record`, disable with --no-record)",
+                    dir.display()
+                );
+            }
             println!("Press Ctrl+C to stop sharing.");
             wait_for_shutdown().await?;
             println!("Stopping share session...");
@@ -374,10 +462,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             // or the task panicked.
             drop(routing);
         }
-        Mode::Use { url, stun } => {
+        Mode::Use {
+            url,
+            stun,
+            no_record,
+            record_dir,
+            record_label,
+            record_id,
+        } => {
             #[cfg(windows)]
             {
-                let _ = (url, stun); // silence unused warning
+                let _ = (url, stun, no_record, record_dir, record_label, record_id);
                 return Err(
                     "The 'use' mode is not supported on Windows yet (requires a TUN device)."
                         .into(),
@@ -398,6 +493,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     parse_host_port(&stun).map_err(|e| format!("--stun: {}", e))?;
                     config.stun_server = stun;
                 }
+                if let Some(dir) =
+                    record_config(&mut config, no_record, record_dir, record_label, record_id)
+                {
+                    println!("Diagnostic record: {}", dir.display());
+                }
                 let result = match connect(url, &config).await {
                     Ok(result) => result,
                     Err(e) => return Err(format!("could not connect: {e}").into()),
@@ -415,10 +515,29 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     w.wake();
                 }
                 let tun = Tun::builder().name("").up().try_build().unwrap();
-                tun_util::start(result.transport, tun).await?;
+                // Pump until the tunnel ends or the user stops us, then close
+                // the record explicitly: a process killed mid-run leaves a
+                // truncated record, which is honest but much less useful than
+                // one with an ending.
+                let record = result.record.clone();
+                let cancel = result.cancel.clone();
+                let mut pump = tokio::spawn(tun_util::start(result.transport, tun));
+                tokio::select! {
+                    _ = wait_for_shutdown() => {
+                        println!("Stopping...");
+                        cancel.cancel();
+                        record.close_shutdown(Some(spora_core::record::Reason::LocalShutdown));
+                    }
+                    res = &mut pump => {
+                        record.close_shutdown(None);
+                        res.map_err(|e| format!("tunnel task: {e}"))??;
+                    }
+                }
+                pump.abort();
             }
         }
         Mode::Log { cmd } => run_log_cmd(cmd)?,
+        Mode::Record { cmd } => run_record_cmd(cmd)?,
     }
     Ok(())
 }
@@ -782,6 +901,266 @@ fn connlog_base_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
         .join("spora")
         .join("connlog")
+}
+
+// ---------------------------------------------------------------------------
+// diagnostic records
+
+/// Point `config` at a record directory unless the user opted out. Recording
+/// is on by default here: this is the machine you run when you want to know
+/// what happened, and a diagnostic you have to enable before reproducing a
+/// problem is one you do not have when it matters.
+fn record_config(
+    config: &mut Config,
+    no_record: bool,
+    dir: Option<PathBuf>,
+    label: Option<String>,
+    correlation_id: Option<String>,
+) -> Option<PathBuf> {
+    if no_record {
+        return None;
+    }
+    let dir = dir.unwrap_or_else(default_record_dir);
+    let mut rc = spora_core::record::RecordConfig::in_dir(&dir);
+    rc.label = label;
+    rc.correlation_id = correlation_id;
+    config.record = Some(rc);
+    Some(dir)
+}
+
+#[cfg(not(windows))]
+fn default_record_dir() -> PathBuf {
+    std::env::var_os("XDG_STATE_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| PathBuf::from(h).join(".local").join("state")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("spora")
+        .join("records")
+}
+
+#[cfg(windows)]
+fn default_record_dir() -> PathBuf {
+    std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("spora")
+        .join("records")
+}
+
+fn load_records(dir: Option<PathBuf>, limit: usize) -> Result<Vec<Record>, String> {
+    let dir = dir.unwrap_or_else(default_record_dir);
+    if !dir.exists() {
+        return Err(format!(
+            "no records at {} (run with recording on, or pass --dir)",
+            dir.display()
+        ));
+    }
+    let mut records = Record::read_dir(&dir)
+        .map_err(|e| format!("reading {}: {e}", dir.display()))?
+        .into_iter()
+        .map(|(_, r)| r)
+        .collect::<Vec<_>>();
+    records.truncate(limit);
+    Ok(records)
+}
+
+fn run_record_cmd(cmd: RecordCmd) -> Result<(), String> {
+    match cmd {
+        RecordCmd::List { dir, count, json } => {
+            let records = load_records(dir, count)?;
+            if json {
+                println!("{}", spora_core::record::records_to_json(&records));
+                return Ok(());
+            }
+            if records.is_empty() {
+                println!("no records");
+                return Ok(());
+            }
+            println!(
+                "{:<21} {:<10} {:<6} {:<16} {:>8}  first failure",
+                "when", "id", "role", "outcome", "took"
+            );
+            for r in &records {
+                let took = r
+                    .close
+                    .as_ref()
+                    .map(|c| format!("{:.1}s", c.at_ms as f64 / 1000.0))
+                    .unwrap_or_else(|| "-".into());
+                let first = match r.first_failure() {
+                    Some(step) => format!(
+                        "{} {}",
+                        step.kind,
+                        step.reason
+                            .map(|x| x.to_string())
+                            .unwrap_or_else(|| "-".into())
+                    ),
+                    None => "-".into(),
+                };
+                println!(
+                    "{:<21} {:<10} {:<6} {:<16} {:>8}  {}",
+                    spora_core::record::utc_timestamp(r.open.at_unix_ms),
+                    short_id(&r.open.id),
+                    r.open.role,
+                    if r.truncated {
+                        "unknown (cut)".to_string()
+                    } else {
+                        r.outcome().to_string()
+                    },
+                    took,
+                    first
+                );
+            }
+        }
+        RecordCmd::Show {
+            id,
+            dir,
+            json,
+            samples,
+        } => {
+            let records = load_records(dir, 200)?;
+            let record = match &id {
+                Some(want) => records
+                    .into_iter()
+                    .find(|r| r.open.id.starts_with(want))
+                    .ok_or_else(|| format!("no record whose id starts with {want}"))?,
+                None => records
+                    .into_iter()
+                    .next()
+                    .ok_or_else(|| "no records".to_string())?,
+            };
+            if json {
+                println!("{}", record.to_json_pretty());
+                return Ok(());
+            }
+            print_record(&record, samples);
+        }
+        RecordCmd::Export { dir, count, out } => {
+            let records = load_records(dir, count)?;
+            let json = spora_core::record::records_to_json(&records);
+            match out {
+                Some(path) => {
+                    std::fs::write(&path, json.as_bytes())
+                        .map_err(|e| format!("writing {}: {e}", path.display()))?;
+                    eprintln!("{} record(s) written to {}", records.len(), path.display());
+                }
+                None => println!("{json}"),
+            }
+        }
+    }
+    Ok(())
+}
+
+fn short_id(id: &str) -> String {
+    id.chars().take(8).collect()
+}
+
+fn print_record(r: &Record, samples: bool) {
+    let b = &r.open.build;
+    println!(
+        "{} {} record {}",
+        spora_core::record::utc_timestamp(r.open.at_unix_ms),
+        r.open.role,
+        r.open.id
+    );
+    println!(
+        "  build   {} {}{}  ({} {})",
+        b.version,
+        b.commit.as_deref().unwrap_or("unknown commit"),
+        if b.dirty { " +uncommitted" } else { "" },
+        b.target,
+        b.profile
+    );
+    if let Some(rk) = &r.open.routing_key {
+        println!("  identity {rk}");
+    }
+    if !r.open.endpoints.is_empty() {
+        let eps: Vec<String> = r
+            .open
+            .endpoints
+            .iter()
+            .map(|e| format!("{}:{} ({})", e.host, e.port, e.carrier))
+            .collect();
+        println!("  endpoints {}", eps.join(", "));
+    }
+    if let Some(label) = &r.open.label {
+        println!("  label   {label}");
+    }
+    println!();
+    for step in &r.steps {
+        let mut where_ = Vec::new();
+        if let Some(v) = &step.via {
+            where_.push(format!("via {v}"));
+        }
+        if let Some(p) = &step.peer {
+            where_.push(format!("peer {p}"));
+        }
+        if let Some(c) = step.carrier {
+            where_.push(c.to_string());
+        }
+        if let Some(p) = step.path {
+            where_.push(p.to_string());
+        }
+        println!(
+            "{:>8}ms  {:<17} {:<9} {:<18} {:<32} {}",
+            step.at_ms,
+            step.kind,
+            step.outcome,
+            step.reason
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "-".into()),
+            where_.join(" "),
+            step.dur_ms.map(|d| format!("{d}ms")).unwrap_or_default(),
+        );
+        if let Some(detail) = &step.detail {
+            println!("           {detail}");
+        }
+    }
+    for gap in &r.gaps {
+        println!("{:>8}ms GAP: {} entries dropped", gap.at_ms, gap.dropped);
+    }
+    if samples {
+        println!();
+        for s in &r.samples {
+            println!(
+                "{:>8}ms sample {} {} rtt={} tx={}B rx={}B probes={}/{} mtu={}",
+                s.at_ms,
+                s.path,
+                s.carrier,
+                s.rtt_ms
+                    .map(|v| format!("{v:.0}ms"))
+                    .unwrap_or_else(|| "-".into()),
+                s.tx_bytes,
+                s.rx_bytes,
+                s.probes_sent.unwrap_or(0) - s.probes_lost.unwrap_or(0),
+                s.probes_sent.unwrap_or(0),
+                s.mtu.map(|m| m.to_string()).unwrap_or_else(|| "-".into()),
+            );
+        }
+    }
+    println!();
+    match &r.close {
+        Some(c) => {
+            println!(
+                "ended {} after {:.1}s: {} session(s), {} reconnect(s), {:.1}s connected, {}B up / {}B down",
+                c.outcome,
+                c.at_ms as f64 / 1000.0,
+                c.sessions,
+                c.reconnects,
+                c.connected_ms as f64 / 1000.0,
+                c.tx_bytes,
+                c.rx_bytes
+            );
+            if let Some(t) = c.first_connect_ms {
+                println!("first connected after {:.1}s", t as f64 / 1000.0);
+            }
+            if let Some(t) = c.direct_ms {
+                println!("direct path after {:.1}s", t as f64 / 1000.0);
+            }
+        }
+        // Not the same as "it failed": the process went away before it could
+        // say how this ended.
+        None => println!("no ending recorded — the process went away mid-run"),
+    }
 }
 
 /// Wait for an interactive (Ctrl+C / SIGINT) or service (SIGTERM) shutdown

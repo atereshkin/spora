@@ -654,6 +654,11 @@ pub const BASE_PORT: u16 = 54321;
 pub enum TunnelError {
     NegChannelClosed,
     ProtocolError(String),
+    /// The peer offered a candidate address policy refuses to punch at. Its
+    /// own variant rather than a `ProtocolError`, so the diagnostic record
+    /// can name it without reading error text: a refused candidate is a
+    /// decision about the address, not a broken peer.
+    PunchTargetRefused(String),
     PierceError(String),
 }
 

@@ -31,6 +31,8 @@ snow = { version = "0.10", features = ["ring-accelerated"] }
 rustls-webpki = { version = "0.103", default-features = false, features = ["std", "ring"] }
 subtle = "2"
 base64 = "0.22"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
 rusqlite = { version = "0.32", features = ["bundled"] }
 lru = "0.18"
 

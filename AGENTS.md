@@ -21,15 +21,17 @@ The FFI build requires Android NDK linkers configured in `~/.cargo/config.toml` 
 ### e2e network lab
 
 `cargo test -p spora-lab` runs end-to-end suites (smoke, nat_matrix, resilience,
-conditions) in Linux network namespaces with real kernel NAT (iptables) and tc
+conditions, record, connlog, ipv6, …) in Linux network namespaces with real kernel NAT (iptables) and tc
 netem — no root needed (unprivileged userns; suites self-skip if unavailable;
 `SPORA_LAB=skip` opts out). Architecture, NAT recipes, and the product findings
 the suites encode live in `docs/lab.md`. Suites are `harness = false` binaries;
 filter scenarios with e.g. `cargo test -p spora-lab --test nat_matrix -- cone`.
 Protocol timings are configurable via `Config.timings` (`Timings`, prod
-defaults); lifecycle events via `Config.event_hook` (`TunnelEvent`); the direct
-upgrade can be disabled via `Config.enable_direct_upgrade` — these exist for the
-lab but are usable by the apps (e.g. path-state display).
+defaults); lifecycle events via `Config.event_hook` (`TunnelEvent`); the
+machine-readable account of a whole run via `Config.record` (see "Connection
+record"); the direct upgrade can be disabled via `Config.enable_direct_upgrade`
+— these exist for the lab but are usable by the apps (e.g. path-state
+display).
 
 **Reading suite results reliably.** ERROR log lines interleave between a
 scenario's name and its verdict, so `scenario X ... FAILED` is often NOT one
@@ -166,6 +168,44 @@ The sharer keeps a local NetFlow-style per-flow record ("which client connected 
 - Retention default 90 days, swept in the writer; `spora log hold` pins ranges (preservation requests); logs are deliberately NOT deleted with the identity. Query via `spora log query --ip ... --from ... --to ... [--json]`.
 - e2e coverage: `cargo test -p spora-lab --test connlog`.
 
+### Connection record (`spora-core/src/record.rs`, see `docs/diagnostic-record.md`)
+
+A structured, versioned account of ONE RUN of `connect()`/`share()`: every step
+timestamped, every failure carrying a code from a **closed vocabulary** (never
+free text), quality samples while the tunnel is up, and a terminal outcome.
+Counting is the point — a reworded `format!` must not be able to change what a
+failure counts as. `Config.record: Option<RecordConfig>`; core defaults to off
+(the CLI turns it on: `$XDG_STATE_HOME/spora/records/`, `--no-record` to
+disable). Read it with `spora record list|show|export [--json]`. Key facts:
+
+- Vocabularies: `StepKind`, `Reason`, `StepOutcome` (incl. `skipped` and
+  `abandoned`), `Carrier` (quic/tcp_tls/nz) x `PathKind`
+  (relay/direct_advertised/direct_punched), `Outcome`, `MtuSource`. Adding a
+  code does NOT bump `FORMAT_VERSION`; unknown codes degrade to `unknown` in an
+  older reader instead of failing the parse.
+- Classification happens where the error is BORN: `record::Fault { reason,
+  detail }` is the crate-internal error type in the dial/handshake/upgrade
+  paths (`e2e*.rs`, `carrier.rs`, `noise.rs`), and `impl From<Fault> for String`
+  keeps the old `Result<_, String>` boundaries source-compatible. By the time an
+  error reaches `io::Error::other`, its kind is gone.
+- On disk: append-only JSON Lines, one file per run, flushed per entry on a
+  dedicated writer thread behind a bounded channel (overflow → visible `gap`
+  entries). A step is written twice — `started`, then its conclusion — and a
+  LATER ENTRY SUPERSEDES AN EARLIER ONE WITH THE SAME `seq`, so a record that
+  ends at a `started` entry is a record of something still running. Records
+  close on Drop, so an unplanned exit still gets an ending.
+- Numbers: traffic/probe counters live in `KeepAliveTransport` (`LinkCounters`)
+  — the one layer on every carrier and on both sides of a path swap, so one
+  series survives the upgrade; carrier stats (QUIC rtt/cwnd/lost/MTU) are added
+  when available. Probe RTT and probe loss are the only carrier-agnostic
+  figures. `mtu_src` distinguishes `discovered` from `declared`.
+- Honest limits are part of the design, not omissions: a relay-via session
+  never observes the peer's address; REGISTER is unacknowledged so `register`
+  records intent, not receipt; `no_response` is used ONLY where the code can
+  prove nothing arrived (nz handshake, punch) — QUIC timeouts are
+  `handshake_timeout`; the two ends' records are not automatically joinable.
+- e2e coverage: `cargo test -p spora-lab --test record`.
+
 ### Transport Layer (`spora-core/src/transport/`)
 
 The `Transport` trait = `Stream<Item=io::Result<Vec<u8>>> + Sink<Vec<u8>>`. Implementations:
@@ -191,6 +231,9 @@ Composition (client side): `QuicPeerTransport → UpgradableTransport → KeepAl
 
 - Edition 2024 across the workspace (spora-core now too).
 - Async throughout using tokio with full features.
+- `spora-core/build.rs` stamps the git commit + a dirty flag into the binary
+  (overridable with `SPORA_BUILD_COMMIT`/`SPORA_BUILD_DIRTY` for release
+  pipelines); every connection record names the build that produced it.
 - Logging via `log` crate (env_logger in CLI, android_logger in FFI).
 - Public API error type is currently `Result<T, String>`.
 - The companion Android app lives in a sibling `../spora-android/` repo.

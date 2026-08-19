@@ -62,6 +62,12 @@ harness = false
 name = "connlog"
 harness = false
 
+# Diagnostic record: the record spora-core writes must be a true account of
+# what a real session did (steps, verdicts, samples, and the closing summary).
+[[test]]
+name = "record"
+harness = false
+
 # Plain tokio test (no namespaces): validates the traffic drivers over a
 # loopback relay so it can run on any platform/CI without userns.
 [[test]]

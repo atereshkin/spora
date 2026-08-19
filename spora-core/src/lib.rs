@@ -6,6 +6,7 @@ pub mod e2e_tls;
 pub mod identity;
 mod neg;
 mod reassembly;
+pub mod record;
 pub mod server;
 pub mod signal;
 pub mod transport;
@@ -16,7 +17,7 @@ use std::future::Future;
 use std::net::{SocketAddr, ToSocketAddrs};
 use std::pin::Pin;
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use log::{debug, info, warn};
@@ -31,13 +32,19 @@ use crate::connlog::{AddrKind, ConnLog, ConnLogConfig, SessionLog};
 use crate::e2e::{authenticate_incoming, client_connect, client_endpoint, server_endpoint};
 use crate::identity::{Identity, ROUTING_KEY_LEN, RelayEndpoint, RelayProtocol, SECRET_LEN, Token};
 use crate::neg::{NegChannel, SignalNegChannel};
+use crate::record::{
+    Carrier, EndpointRef, Fault, MtuSource, Outcome, PathKind, PathState, Reason, Recorder, Role,
+    RttSource, StepKind,
+};
 use crate::server::TunnelError;
 pub use crate::server::is_local_address;
 use crate::signal::SignalChannel;
 use crate::transport::DialFuture;
 pub use crate::transport::IpTransport;
 use crate::transport::ReconnectTransport;
-use crate::transport::keepalive::{KeepAliveConfig, KeepAliveMode, KeepAliveTransport};
+use crate::transport::keepalive::{
+    KeepAliveConfig, KeepAliveMode, KeepAliveTransport, LinkCounters,
+};
 use crate::transport::upgradable::{UpgradeSender, upgradable_transport};
 /// Capability-token authorization helpers (issuer keys, token encode/decode).
 /// Re-exported so platform front-ends can present a `Config::relay_token`
@@ -97,6 +104,10 @@ pub struct ConnectResult {
     pub cancel: CancellationToken,
     pub keepalive_knob: Arc<AtomicU64>,
     pub keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
+    /// This run's diagnostic record (see [`record`]). Disabled — and inert —
+    /// unless `Config::record` asked for one. It is closed when `cancel`
+    /// fires; a caller that ends the session another way should close it.
+    pub record: Recorder,
 }
 
 /// Every protocol interval/timeout that used to be a hardcoded constant.
@@ -178,7 +189,10 @@ pub enum TunnelEvent {
     /// may ride the relay for a brief moment after this event fires.
     DirectUpgradeSucceeded { local: SocketAddr, peer: SocketAddr },
     /// One direct-upgrade attempt failed (the upgrade task may retry).
-    DirectUpgradeFailed { reason: String },
+    /// `code` is the vocabulary entry (see [`record::Reason`]) and is what
+    /// anything counting failures should use; `reason` is the same thing in
+    /// words, for a human reading a log.
+    DirectUpgradeFailed { code: Reason, reason: String },
     /// Client only: a re-dial is starting after the transport died.
     Reconnecting,
     /// Client only: the re-dial succeeded.
@@ -230,6 +244,12 @@ pub struct Config {
     /// enable it by default with a platform-appropriate directory. When set
     /// but unwritable, `share()` fails loudly rather than running unlogged.
     pub conn_log: Option<ConnLogConfig>,
+    /// Whether, and where, to keep a diagnostic record of how each
+    /// connection went (see [`record`]). `None` — the default — records
+    /// nothing: writing to a user's disk is the platform's decision, not the
+    /// core's. Platforms that want the "send logs" story, and the lab, set a
+    /// directory here.
+    pub record: Option<record::RecordConfig>,
     /// Share side only: an opaque capability token attached to every relay
     /// registration, proving this sharer is authorized to use the relay(s).
     /// `None` registers in open mode (accepted by relays configured without
@@ -250,6 +270,7 @@ impl Default for Config {
             event_hook: None,
             enable_direct_upgrade: true,
             conn_log: None,
+            record: None,
             relay_token: None,
         }
     }
@@ -356,6 +377,12 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     ));
 
     let cancel = CancellationToken::new();
+    let rec = open_record(
+        &config,
+        Role::Exit,
+        Some(&routing_key),
+        endpoint_refs(&config.relays),
+    );
     let listener_ctx = QuicListenerCtx {
         protector: config.protector.clone(),
         want_v6,
@@ -365,6 +392,7 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
         identity: identity.clone(),
         timings: config.timings.clone(),
         cancel: cancel.clone(),
+        rec: rec.clone(),
     };
     // Direct endpoints get their own PERMANENT endpoint on the advertised
     // port: it never rolls (the port is in the URL) and never registers.
@@ -373,13 +401,33 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     // Direct + relay config gets the full per-port behavior on its relay
     // path instead of falling back to the legacy shared endpoint.
     let direct_endpoint = if bind_port != 0 {
-        let sock = bind_share_udp(&config.protector, want_v6, bind_port)?;
-        Some(server_endpoint(sock, &identity, &config.timings)?)
+        let binding = rec
+            .step(StepKind::ListenerBind)
+            .path(PathKind::DirectAdvertised);
+        let sock = match bind_share_udp(&config.protector, want_v6, bind_port) {
+            Ok(s) => s,
+            Err(e) => {
+                binding.fail(Reason::BindFailed, e.clone());
+                rec.close(Outcome::NeverConnected, Some(Reason::BindFailed), None);
+                return Err(e);
+            }
+        };
+        match sock.local_addr() {
+            Ok(a) => binding.local(a).ok(),
+            Err(_) => binding.ok(),
+        }
+        Some(server_endpoint(sock, &identity, &config.timings).map_err(|f| f.detail)?)
     } else {
         None
     };
     // Generation 0; bind errors surface from share() itself.
-    let listener = listener_ctx.spawn_listener(0)?;
+    let listener = match listener_ctx.spawn_listener(0) {
+        Ok(l) => l,
+        Err(e) => {
+            rec.close(Outcome::NeverConnected, Some(Reason::BindFailed), None);
+            return Err(e);
+        }
+    };
     info!(
         "share: e2e endpoint up, rk {:x?}, registering with {:?}, direct bind_port {}",
         &routing_key[..4],
@@ -390,11 +438,17 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
     // Connection log: opened before the share goes live, so a default-on log
     // that cannot be written fails here loudly instead of running unlogged.
     let conn_log = match &config.conn_log {
-        Some(cfg) => Some(ConnLog::open(
-            cfg.clone(),
-            &identity,
-            config.event_hook.clone(),
-        )?),
+        Some(cfg) => match ConnLog::open(cfg.clone(), &identity, config.event_hook.clone()) {
+            Ok(cl) => Some(cl),
+            Err(e) => {
+                rec.close(
+                    Outcome::NeverConnected,
+                    Some(Reason::StorageError),
+                    Some(e.clone()),
+                );
+                return Err(e);
+            }
+        },
         None => None,
     };
 
@@ -409,9 +463,20 @@ pub async fn share(identity: Identity, config: Config) -> Result<ShareSession, S
         cancel_child,
         config_for_loop,
         conn_log,
+        rec,
     ));
 
     Ok(ShareSession { url, cancel, task })
+}
+
+/// Closes the exit's record however `run_share_loop` ends — including the
+/// endings nobody planned.
+struct ShareRecordGuard(Recorder);
+
+impl Drop for ShareRecordGuard {
+    fn drop(&mut self) {
+        self.0.close_shutdown(Some(Reason::LocalShutdown));
+    }
 }
 
 /// Everything needed to mint a fresh QUIC listener generation. The rolling
@@ -444,6 +509,7 @@ struct QuicListenerCtx {
     identity: Arc<Identity>,
     timings: Timings,
     cancel: CancellationToken,
+    rec: Recorder,
 }
 
 /// One listener generation: the quinn endpoint clients currently land on and
@@ -457,7 +523,18 @@ impl QuicListenerCtx {
     /// Bind a socket (`bind_port` 0 except for generation 0 of a Direct
     /// sharer), build the endpoint, and start registering from it.
     fn spawn_listener(&self, bind_port: u16) -> Result<QuicListener, String> {
-        let std_socket = bind_share_udp(&self.protector, self.want_v6, bind_port)?;
+        let binding = self.rec.step(StepKind::ListenerBind);
+        let std_socket = match bind_share_udp(&self.protector, self.want_v6, bind_port) {
+            Ok(s) => s,
+            Err(e) => {
+                binding.fail(Reason::BindFailed, e.clone());
+                return Err(e);
+            }
+        };
+        match std_socket.local_addr() {
+            Ok(a) => binding.local(a).ok(),
+            Err(_) => binding.ok(),
+        }
         let std_clone = std_socket
             .try_clone()
             .map_err(|e| format!("socket try_clone: {}", e))?;
@@ -468,13 +545,27 @@ impl QuicListenerCtx {
             tokio::net::UdpSocket::from_std(std_clone)
                 .map_err(|e| format!("tokio::from_std: {}", e))?,
         );
-        let endpoint = server_endpoint(std_socket, &self.identity, &self.timings)?;
+        let endpoint =
+            server_endpoint(std_socket, &self.identity, &self.timings).map_err(|f| f.detail)?;
 
         // The registrar selects on the share's cancel token, so `stop()` and
         // `abort()` (which cancels before aborting) both end it; a roll ends
         // it via `QuicListener::demote`. `register_loop`'s first tick fires
         // immediately, so a fresh generation displaces the old registration
         // within one packet's flight time.
+        // There is no acknowledgement to wait for: relays never answer a
+        // REGISTER, so this records that we started announcing, and nothing
+        // about whether anyone accepted it. A registration rejected for a bad
+        // token, a stale timestamp or an unauthorized source looks exactly
+        // like this, and then like clients that never arrive.
+        self.rec
+            .mark(StepKind::Register)
+            .detail(format!(
+                "announcing to {} relay(s) every {:?}; relays do not acknowledge",
+                self.register_addrs.len(),
+                self.register_interval
+            ))
+            .ok();
         let registrar = (!self.register_addrs.is_empty()).then(|| {
             let addrs = self.register_addrs.clone();
             let interval = self.register_interval;
@@ -515,6 +606,7 @@ fn spawn_tcp_registrars(
     identity: Arc<Identity>,
     session_tx: tokio::sync::mpsc::UnboundedSender<(carrier::PeerSession, Option<u64>)>,
     cancel: CancellationToken,
+    rec: &Recorder,
 ) {
     // Connections kept parked per relay so a client always finds one.
     const POOL_SIZE: usize = 4;
@@ -541,6 +633,7 @@ fn spawn_tcp_registrars(
                     cancel.clone(),
                     config.protector.clone(),
                     token.clone(),
+                    rec.clone(),
                 ));
             }
         }
@@ -549,6 +642,7 @@ fn spawn_tcp_registrars(
 
 /// One pool worker: keep a connection parked at `relay_addr`, delivering a
 /// session whenever a client is spliced in, until cancelled.
+#[allow(clippy::too_many_arguments)]
 async fn tcp_park_worker(
     relay_addr: SocketAddr,
     identity: Arc<Identity>,
@@ -556,13 +650,19 @@ async fn tcp_park_worker(
     cancel: CancellationToken,
     protector: SocketProtector,
     token: Vec<u8>,
+    rec: Recorder,
 ) {
     loop {
         if cancel.is_cancelled() {
             return;
         }
+        let parking = rec
+            .step_now(StepKind::RelayPark)
+            .via(relay_addr)
+            .carrier(Carrier::TcpTls);
         match park_and_accept(relay_addr, identity.as_ref(), &protector, &token, &cancel).await {
             Ok(Some(session)) => {
+                parking.detail("a client was spliced in").ok();
                 if session_tx.send((session, None)).is_err() {
                     return; // the share loop is gone
                 }
@@ -571,6 +671,12 @@ async fn tcp_park_worker(
             // token) — re-park after a short pause so a refusal doesn't become a
             // tight reconnect loop.
             Ok(None) => {
+                // The relay does not say which of the two this was, and this
+                // is not the place to guess.
+                parking.fail(
+                    Reason::PeerClosed,
+                    "the relay closed the parked connection (idle reap, or a refused token)",
+                );
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(Duration::from_millis(500)) => {}
@@ -578,6 +684,7 @@ async fn tcp_park_worker(
             }
             Err(e) => {
                 debug!("tcp registrar {}: {}", relay_addr, e);
+                parking.fail_with(&e);
                 tokio::select! {
                     _ = cancel.cancelled() => return,
                     _ = tokio::time::sleep(Duration::from_secs(1)) => {}
@@ -596,11 +703,11 @@ async fn park_and_accept(
     protector: &SocketProtector,
     token: &[u8],
     cancel: &CancellationToken,
-) -> Result<Option<carrier::PeerSession>, String> {
+) -> Result<Option<carrier::PeerSession>, Fault> {
     use tokio::io::AsyncWriteExt;
     let mut tcp = tokio::net::TcpStream::connect(relay_addr)
         .await
-        .map_err(|e| format!("connect relay: {}", e))?;
+        .map_err(|e| Fault::from_io(&e).context("connect relay"))?;
     let _ = tcp.set_nodelay(true);
     carrier::protect_tcp(protector, &tcp);
     tcp.write_all(&relay_client::tcp::build_preamble(
@@ -609,15 +716,17 @@ async fn park_and_accept(
         token,
     ))
     .await
-    .map_err(|e| format!("register preamble: {}", e))?;
+    .map_err(|e| Fault::from_io(&e).context("register preamble"))?;
 
     // Park: wait (no timeout, cancellable) for the first byte — a client was
     // spliced in. EOF (0) means the relay reaped this idle parked connection
     // (its PARK_TTL); the caller re-parks.
     let mut peek = [0u8; 1];
     let n = tokio::select! {
-        _ = cancel.cancelled() => return Err("cancelled while parked".into()),
-        r = tcp.peek(&mut peek) => r.map_err(|e| format!("park peek: {}", e))?,
+        _ = cancel.cancelled() => {
+            return Err(Fault::new(Reason::Cancelled, "cancelled while parked"));
+        }
+        r = tcp.peek(&mut peek) => r.map_err(|e| Fault::from_io(&e).context("park peek"))?,
     };
     if n == 0 {
         return Ok(None);
@@ -949,6 +1058,7 @@ async fn noise_accept_dispatcher(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_share_loop(
     mut listener: QuicListener,
     roll_ctx: QuicListenerCtx,
@@ -957,6 +1067,7 @@ async fn run_share_loop(
     cancel: CancellationToken,
     config: Config,
     conn_log: Option<ConnLog>,
+    rec: Recorder,
 ) {
     // EVERY exit from this loop — cancellation, endpoint death, a panic in
     // an event hook — must stop the detached registrar generations and
@@ -965,6 +1076,10 @@ async fn run_share_loop(
     // death would leave the last registrar re-announcing a dead socket to
     // the relays forever.
     let _cancel_guard = cancel.clone().drop_guard();
+    // Any exit from this loop ends the run, so the record gets its ending
+    // here — including the exits nobody planned (endpoint death, a panic in
+    // a hook), which is when having one matters most.
+    let _record_guard = ShareRecordGuard(rec.clone());
     let secret = identity.secret;
     let mut tunnel_cancel: Option<CancellationToken> = None;
     let mut iteration: u32 = 0;
@@ -993,6 +1108,7 @@ async fn run_share_loop(
         identity.clone(),
         session_tx.clone(),
         cancel.clone(),
+        &rec,
     );
 
     // Sharer-side Noise UDP carrier: register each NoiseUdp relay from a
@@ -1033,14 +1149,29 @@ async fn run_share_loop(
                         let tx = session_tx.clone();
                         let cancel = cancel.clone();
                         let listener_gen = generation;
+                        let accept_rec = rec.clone();
                         tokio::spawn(async move {
+                            // Written as `started` immediately: a handshake
+                            // that hangs, or a task cancelled mid-flight,
+                            // then leaves a step saying so rather than
+                            // leaving nothing at all.
+                            let accepting = accept_rec
+                                .step_now(StepKind::Accept)
+                                .carrier(Carrier::Quic)
+                                .path(PathKind::Relay);
                             tokio::select! {
-                                _ = cancel.cancelled() => {}
+                                _ = cancel.cancelled() => {
+                                    accepting.skip(Reason::Cancelled, "share stopping");
+                                }
                                 res = authenticate_incoming(incoming, &secret, true) => match res {
                                     Ok(session) => {
+                                        accepting.peer(session.conn.remote_address()).ok();
                                         let _ = tx.send((carrier::PeerSession::from_quic(session), Some(listener_gen)));
                                     }
-                                    Err(e) => warn!("[share] accept failed: {}", e),
+                                    Err(e) => {
+                                        warn!("[share] accept failed: {}", e);
+                                        accepting.fail_with(&e);
+                                    }
                                 }
                             }
                         });
@@ -1057,14 +1188,25 @@ async fn run_share_loop(
                     Some(incoming) => {
                         let tx = session_tx.clone();
                         let cancel = cancel.clone();
+                        let accept_rec = rec.clone();
                         tokio::spawn(async move {
+                            let accepting = accept_rec
+                                .step_now(StepKind::Accept)
+                                .carrier(Carrier::Quic)
+                                .path(PathKind::DirectAdvertised);
                             tokio::select! {
-                                _ = cancel.cancelled() => {}
+                                _ = cancel.cancelled() => {
+                                    accepting.skip(Reason::Cancelled, "share stopping");
+                                }
                                 res = authenticate_incoming(incoming, &secret, true) => match res {
                                     Ok(session) => {
+                                        accepting.peer(session.conn.remote_address()).ok();
                                         let _ = tx.send((carrier::PeerSession::from_quic(session), None));
                                     }
-                                    Err(e) => warn!("[share] direct accept failed: {}", e),
+                                    Err(e) => {
+                                        warn!("[share] direct accept failed: {}", e);
+                                        accepting.fail_with(&e);
+                                    }
                                 }
                             }
                         });
@@ -1086,15 +1228,23 @@ async fn run_share_loop(
                 // the share degrades to the legacy shared-endpoint behavior
                 // instead of dying.
                 if from_gen == Some(generation) {
+                    let rolling = rec.step(StepKind::ListenerRoll);
                     match roll_ctx.spawn_listener(0) {
                         Ok(next) => {
                             let mut old = std::mem::replace(&mut listener, next);
                             old.demote();
                             demoted.insert(generation, old.endpoint);
                             generation += 1;
+                            rolling.detail(format!("generation {generation}")).ok();
                             debug!("[share #{iteration}] rolled listener to generation {generation}");
                         }
-                        Err(e) => warn!("[share] listener roll failed: {e}; keeping current listener"),
+                        Err(e) => {
+                            // Not fatal — the share degrades to a shared
+                            // endpoint — but that degraded mode is the cause
+                            // of failures much later, so it is a step.
+                            rolling.fail(Reason::BindFailed, e.clone());
+                            warn!("[share] listener roll failed: {e}; keeping current listener");
+                        }
                     }
                 }
 
@@ -1127,19 +1277,40 @@ async fn run_share_loop(
 
                 let child_cancel = cancel.child_token();
                 tunnel_cancel = Some(child_cancel.clone());
-                spawn_responder_tunnel(session, identity.clone(), &config, child_cancel, slog);
+                // A QUIC session that did not arrive on a listener generation
+                // came in on the advertised (relay-less) endpoint; every
+                // other carrier reaches us through a relay.
+                let carrier_kind = session.carrier();
+                let path_kind = if carrier_kind == Carrier::Quic && from_gen.is_none() {
+                    PathKind::DirectAdvertised
+                } else {
+                    PathKind::Relay
+                };
+                spawn_responder_tunnel(
+                    session,
+                    identity.clone(),
+                    &config,
+                    child_cancel,
+                    slog,
+                    rec.for_session(iteration),
+                    path_kind,
+                );
             }
         }
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn spawn_responder_tunnel(
     session: carrier::PeerSession,
     identity: Arc<Identity>,
     config: &Config,
     tunnel_cancel: CancellationToken,
     slog: Option<Arc<SessionLog>>,
+    rec: Recorder,
+    path_kind: PathKind,
 ) {
+    let carrier_kind = session.carrier();
     let carrier::PeerSession {
         transport,
         remote_addr,
@@ -1147,6 +1318,17 @@ fn spawn_responder_tunnel(
         signal,
         fixed_mtu,
     } = session;
+
+    // On a relayed carrier `remote_addr` is the *relay's* address: the exit
+    // never observes the client's own address unless a punch lands later.
+    // `path` is what says which of the two this is.
+    rec.mark(StepKind::SessionUp)
+        .peer(remote_addr)
+        .carrier(carrier_kind)
+        .path(path_kind)
+        .ok();
+    let meters = SessionMeters::new(&rec, carrier_kind, path_kind, quic_conn.clone(), fixed_mtu);
+    spawn_sampler(meters.clone(), tunnel_cancel.clone());
 
     let (upgradable, upgrade_sender, router_handle) =
         upgradable_transport(transport, config.timings.upgrade_rescue_grace);
@@ -1173,6 +1355,8 @@ fn spawn_responder_tunnel(
             recv_timeout: Some(config.timings.quic_idle_timeout.max(active_window)),
         },
         active_window: Some(active_window),
+        counters: Some(meters.counters.clone()),
+        recorder: Some(rec.clone()),
         ..Default::default()
     };
     // The meter (Custom exit mode) must ignore the synthetic keepalive pings
@@ -1198,6 +1382,7 @@ fn spawn_responder_tunnel(
             let role = DirectRole::Responder { identity };
             let path_ipv6 = remote_addr.is_ipv6();
             let upgrade_slog = slog.clone();
+            let upgrade_meters = meters.clone();
             tokio::spawn(async move {
                 try_direct_upgrade(
                     signal,
@@ -1212,6 +1397,7 @@ fn spawn_responder_tunnel(
                     timings,
                     event_hook,
                     upgrade_slog,
+                    upgrade_meters,
                 )
                 .await;
             })
@@ -1220,6 +1406,17 @@ fn spawn_responder_tunnel(
         // UpgradeSender (the router drains, by design) and hold the signal (if
         // any) until the session ends so a QUIC peer's stream doesn't see EOF.
         (_, held_signal) => {
+            // Not attempted, and for two quite different reasons — recorded
+            // as `skipped`, because "we chose not to" is a different fact
+            // from "we tried and it failed".
+            let reason = if config.enable_direct_upgrade {
+                Reason::UpgradeUnsupported
+            } else {
+                Reason::UpgradeDisabled
+            };
+            rec.mark(StepKind::PathSwap)
+                .carrier(carrier_kind)
+                .skip(reason, "no direct upgrade attempted");
             drop(upgrade_sender);
             tokio::spawn(async move {
                 upgrade_cancel.cancelled().await;
@@ -1229,19 +1426,33 @@ fn spawn_responder_tunnel(
     };
 
     // MTU: dynamic (PMTUD) for QUIC, fixed for a stream carrier.
+    let mtu_rec = rec.clone();
     match quic_conn {
         Some(conn) => {
-            if let Some(cb) = config.mtu_callback.clone() {
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(1500)).await;
-                    if let Some(mds) = conn.max_datagram_size() {
+            let cb = config.mtu_callback.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                match conn.max_datagram_size() {
+                    Some(mds) => {
                         info!("e2e max datagram size (post-PMTUD): {}", mds);
-                        cb(mds as u16);
+                        mtu_rec
+                            .mark(StepKind::Mtu)
+                            .detail(format!("discovered {mds}"))
+                            .ok();
+                        if let Some(cb) = cb {
+                            cb(mds as u16);
+                        }
                     }
-                });
-            }
+                    None => mtu_rec
+                        .mark(StepKind::Mtu)
+                        .fail(Reason::Unknown, "no datagram size after PMTUD"),
+                }
+            });
         }
         None => {
+            rec.mark(StepKind::Mtu)
+                .detail(format!("declared {fixed_mtu}"))
+                .ok();
             if let Some(cb) = config.mtu_callback.clone() {
                 cb(fixed_mtu);
             }
@@ -1250,6 +1461,12 @@ fn spawn_responder_tunnel(
 
     let exit_slog = slog.clone();
     let end_cancel = tunnel_cancel.clone();
+    rec.mark(StepKind::ExitStart)
+        .detail(match &config.exit_mode {
+            ExitMode::Netstack => "netstack",
+            ExitMode::Custom(_) => "custom handler",
+        })
+        .ok();
     let session_fut: SessionFuture = match &config.exit_mode {
         ExitMode::Netstack => Box::pin(async move {
             let _ = server::start_tunnel(
@@ -1290,6 +1507,20 @@ fn spawn_responder_tunnel(
         } else {
             "transport_closed"
         };
+        // The two cases the core can actually tell apart here. A cancelled
+        // session was almost always replaced by a newer peer; a closed one
+        // died on its own, and the carrier's own step (if any) says how.
+        rec.mark(StepKind::SessionEnd)
+            .carrier(carrier_kind)
+            .path(meters.path.get())
+            .fail(
+                if end_cancel.is_cancelled() {
+                    Reason::Replaced
+                } else {
+                    Reason::TransportClosed
+                },
+                reason,
+            );
         if let Some(sl) = &slog {
             sl.end(reason);
         }
@@ -1305,13 +1536,44 @@ fn spawn_responder_tunnel(
 /// Connect to a sharer via the URL. Returns the IP-level transport plus the
 /// keepalive controls so the caller (CLI/FFI) can toggle dormant mode.
 pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String> {
-    let token = Arc::new(Token::from_url(&url)?);
+    let token = match Token::from_url(&url) {
+        Ok(t) => Arc::new(t),
+        Err(e) => {
+            // Worth a record of its own: "the link is malformed" is a
+            // diagnosis, and it is the first thing anyone asks about.
+            let rec = open_record(config, Role::Client, None, Vec::new());
+            rec.mark(StepKind::TokenParse)
+                .fail(Reason::BadToken, e.clone());
+            rec.close(Outcome::NeverConnected, Some(Reason::BadToken), None);
+            return Err(e);
+        }
+    };
+    let rec = open_record(
+        config,
+        Role::Client,
+        Some(&token.routing_key),
+        endpoint_refs(&token.relays),
+    );
+    rec.mark(StepKind::TokenParse).ok();
     // Resolve every relay in the URL (a hostname may expand to v4+v6) and try
     // them IPv6 first: a v6 relay path drives a v6 hole punch, which succeeds
     // far more often (no NAT, just a stateful firewall) than a v4 one. The
     // order is re-derived on each (re)dial, so DNS changes and censorship
     // failover both take effect on reconnect.
-    let relay_addrs = Arc::new(resolve_relays_preferring_v6(&token.relays)?);
+    let resolving = rec.step(StepKind::RelayResolve);
+    let relay_addrs = match resolve_relays_preferring_v6(&token.relays) {
+        Ok(addrs) => {
+            resolving
+                .detail(format!("{} endpoint(s) to try", addrs.len()))
+                .ok();
+            Arc::new(addrs)
+        }
+        Err(e) => {
+            resolving.fail_with(&e);
+            rec.close(Outcome::NeverConnected, Some(e.reason), None);
+            return Err(e.detail);
+        }
+    };
     info!(
         "connect: relays {:?} for rk {:x?}",
         relay_addrs,
@@ -1323,16 +1585,27 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     let keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>> =
         Arc::new(std::sync::Mutex::new(None));
 
-    let initial = dial_relays(
+    let initial = match dial_relays(
         &relay_addrs,
         &token,
         config,
         cancel.clone(),
         keepalive_knob.clone(),
         keepalive_waker.clone(),
+        &rec.for_cycle(0),
     )
     .await
-    .map_err(|e| format!("initial dial: {}", e))?;
+    {
+        Ok(t) => t,
+        Err(e) => {
+            rec.close(
+                Outcome::NeverConnected,
+                Some(e.reason),
+                Some(e.detail.clone()),
+            );
+            return Err(format!("initial dial: {}", e));
+        }
+    };
 
     let dialer_token = token.clone();
     let dialer_config = config.clone();
@@ -1340,6 +1613,10 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     let dialer_knob = keepalive_knob.clone();
     let dialer_waker = keepalive_waker.clone();
     let dialer_relays = relay_addrs.clone();
+    let dialer_rec = rec.clone();
+    // Which re-dial cycle a step belongs to. Without it, forty reconnects in
+    // an hour are forty indistinguishable piles of steps.
+    let cycles = Arc::new(AtomicU64::new(0));
     let dialer: Box<dyn FnMut() -> DialFuture + Send> = Box::new(move || {
         let token = dialer_token.clone();
         let config = dialer_config.clone();
@@ -1347,13 +1624,16 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         let knob = dialer_knob.clone();
         let waker = dialer_waker.clone();
         let relays = dialer_relays.clone();
+        let cycle = cycles.fetch_add(1, Ordering::Relaxed) + 1;
+        let rec = dialer_rec.for_cycle(cycle as u32);
         Box::pin(async move {
             emit(&config.event_hook, TunnelEvent::Reconnecting);
-            let result = dial_relays(&relays, &token, &config, cancel, knob, waker).await;
+            rec.mark(StepKind::Reconnect).ok();
+            let result = dial_relays(&relays, &token, &config, cancel, knob, waker, &rec).await;
             if result.is_ok() {
                 emit(&config.event_hook, TunnelEvent::Reconnected);
             }
-            result
+            result.map_err(std::io::Error::from)
         })
     });
 
@@ -1363,11 +1643,22 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         config.timings.reconnect_delay,
         Some((keepalive_knob.clone(), keepalive_waker.clone())),
     ));
+    // The record outlives the call: it is closed when the caller cancels, so
+    // a session that runs for an hour still gets an ending.
+    let closing = rec.clone();
+    let closing_cancel = cancel.clone();
+    tokio::spawn(async move {
+        closing_cancel.cancelled().await;
+        closing.mark(StepKind::SessionEnd).ok();
+        closing.close_shutdown(Some(Reason::LocalShutdown));
+    });
+
     Ok(ConnectResult {
         transport,
         cancel,
         keepalive_knob,
         keepalive_waker,
+        record: rec,
     })
 }
 
@@ -1376,6 +1667,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
 /// dead/censored relay — or one the sharer never registered with (a family
 /// mismatch looks identical: the Initial is silently dropped) — fails over to
 /// the next instead of stalling. Returns the last error if all fail.
+#[allow(clippy::too_many_arguments)]
 async fn dial_relays(
     relay_addrs: &[(SocketAddr, RelayProtocol)],
     token: &Token,
@@ -1383,9 +1675,18 @@ async fn dial_relays(
     cancel: CancellationToken,
     keepalive_knob: Arc<AtomicU64>,
     keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
-) -> std::io::Result<IpTransport> {
-    let mut last_err: Option<std::io::Error> = None;
+    rec: &Recorder,
+) -> Result<IpTransport, Fault> {
+    let mut last_err: Option<Fault> = None;
     for &(relay_addr, protocol) in relay_addrs {
+        // One step per endpoint tried, so a record shows every relay that was
+        // attempted and how each one refused — not just the last one, which
+        // is all the returned error can carry.
+        let step = rec
+            .step_now(StepKind::RelayDial)
+            .via(relay_addr)
+            .carrier(Carrier::of_protocol(protocol))
+            .path(PathKind::of_protocol(protocol));
         let attempt = dial_initiator(
             relay_addr,
             protocol,
@@ -1394,11 +1695,16 @@ async fn dial_relays(
             cancel.clone(),
             keepalive_knob.clone(),
             keepalive_waker.clone(),
+            rec,
         );
         match tokio::time::timeout(config.timings.relay_dial_timeout, attempt).await {
-            Ok(Ok(transport)) => return Ok(transport),
+            Ok(Ok(transport)) => {
+                step.ok();
+                return Ok(transport);
+            }
             Ok(Err(e)) => {
                 warn!("relay {} dial failed: {}", relay_addr, e);
+                step.fail_with(&e);
                 last_err = Some(e);
             }
             Err(_) => {
@@ -1406,17 +1712,22 @@ async fn dial_relays(
                     "relay {} dial timed out after {:?}",
                     relay_addr, config.timings.relay_dial_timeout
                 );
-                last_err = Some(std::io::Error::new(
-                    std::io::ErrorKind::TimedOut,
-                    format!("relay {} dial timed out", relay_addr),
-                ));
+                let f = Fault::new(
+                    Reason::ConnectTimeout,
+                    format!(
+                        "relay {relay_addr} dial timed out after {:?}",
+                        config.timings.relay_dial_timeout
+                    ),
+                );
+                step.fail_with(&f);
+                last_err = Some(f);
             }
         }
     }
-    Err(last_err
-        .unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no relays to dial")))
+    Err(last_err.unwrap_or_else(|| Fault::new(Reason::NoRelays, "no relays to dial")))
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn dial_initiator(
     relay_addr: SocketAddr,
     protocol: RelayProtocol,
@@ -1425,7 +1736,8 @@ async fn dial_initiator(
     cancel: CancellationToken,
     keepalive_knob: Arc<AtomicU64>,
     keepalive_waker: Arc<std::sync::Mutex<Option<std::task::Waker>>>,
-) -> std::io::Result<IpTransport> {
+    rec: &Recorder,
+) -> Result<IpTransport, Fault> {
     // Select the client-side dialer for this endpoint's protocol. The returned
     // session is end-to-end authenticated (routing-key pinned + secret) whatever
     // the protocol; the relay is never trusted. Relay path: require the sharer's
@@ -1440,9 +1752,9 @@ async fn dial_initiator(
             protector: &config.protector,
             timings: &config.timings,
             expect_ack: true,
+            rec,
         })
-        .await
-        .map_err(std::io::Error::other)?;
+        .await?;
     let carrier::PeerSession {
         transport,
         remote_addr,
@@ -1455,6 +1767,18 @@ async fn dial_initiator(
         &config.event_hook,
         TunnelEvent::RelaySessionEstablished { peer: remote_addr },
     );
+    let carrier_kind = Carrier::of_protocol(protocol);
+    let path_kind = PathKind::of_protocol(protocol);
+    // `remote_addr` is the relay's address on a relayed carrier — the peer's
+    // own address is not observable from here, and the record must not imply
+    // otherwise. `path` says which it is.
+    rec.mark(StepKind::SessionUp)
+        .peer(remote_addr)
+        .carrier(carrier_kind)
+        .path(path_kind)
+        .ok();
+    let meters = SessionMeters::new(rec, carrier_kind, path_kind, quic_conn.clone(), fixed_mtu);
+    spawn_sampler(meters.clone(), cancel.clone());
 
     let (upgradable, upgrade_sender, router_handle) =
         upgradable_transport(transport, config.timings.upgrade_rescue_grace);
@@ -1467,6 +1791,8 @@ async fn dial_initiator(
         idle_threshold: config.timings.keepalive_idle_threshold,
         response_timeout: config.timings.keepalive_response_timeout,
         inbound_grace: config.timings.keepalive_inbound_grace,
+        counters: Some(meters.counters.clone()),
+        recorder: Some(rec.clone()),
         ..Default::default()
     };
     let transport: IpTransport =
@@ -1475,19 +1801,34 @@ async fn dial_initiator(
     // MTU: a QUIC carrier reads the PMTUD-converged max_datagram_size after
     // ~1.5s; a stream carrier has no per-datagram limit, so report a fixed MTU.
     let mtu_cb_relay = config.mtu_callback.clone();
+    let mtu_rec = rec.clone();
     match quic_conn {
         Some(conn) => {
-            if let Some(cb) = mtu_cb_relay {
-                tokio::spawn(async move {
-                    tokio::time::sleep(Duration::from_millis(1500)).await;
-                    if let Some(mds) = conn.max_datagram_size() {
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                match conn.max_datagram_size() {
+                    Some(mds) => {
                         info!("e2e max datagram size (post-PMTUD): {}", mds);
-                        cb(mds as u16);
+                        mtu_rec
+                            .mark(StepKind::Mtu)
+                            .detail(format!("discovered {mds}"))
+                            .ok();
+                        if let Some(cb) = mtu_cb_relay {
+                            cb(mds as u16);
+                        }
                     }
-                });
-            }
+                    // Nothing came of the probing. Silence here used to be
+                    // indistinguishable from a converged path.
+                    None => mtu_rec
+                        .mark(StepKind::Mtu)
+                        .fail(Reason::Unknown, "no datagram size after PMTUD"),
+                }
+            });
         }
         None => {
+            rec.mark(StepKind::Mtu)
+                .detail(format!("declared {fixed_mtu}"))
+                .ok();
             if let Some(cb) = mtu_cb_relay {
                 cb(fixed_mtu);
             }
@@ -1513,6 +1854,7 @@ async fn dial_initiator(
         let timings = config.timings.clone();
         let event_hook = config.event_hook.clone();
         let path_ipv6 = relay_addr.is_ipv6();
+        let upgrade_meters = meters.clone();
         tokio::spawn(async move {
             try_direct_upgrade(
                 signal,
@@ -1527,6 +1869,7 @@ async fn dial_initiator(
                 timings,
                 event_hook,
                 None, // client side: no connection log
+                upgrade_meters,
             )
             .await;
             drop(router_handle);
@@ -1541,6 +1884,16 @@ async fn dial_initiator(
         // holder would accumulate one parked task per redial. The router drops
         // its upgrade receiver when the session ends, so `upgrade_sender.closed()`
         // is exactly the session-death signal.
+        // Recorded as skipped, with which of the three reasons it was: not
+        // attempting is a different fact from attempting and failing.
+        let skip_reason = if !config.enable_direct_upgrade {
+            Reason::UpgradeDisabled
+        } else {
+            Reason::UpgradeUnsupported
+        };
+        rec.mark(StepKind::PathSwap)
+            .carrier(carrier_kind)
+            .skip(skip_reason, "no direct upgrade attempted");
         let drop_signal_now = !protocol.is_relayed();
         tokio::spawn(async move {
             // Direct: drop the signal now (peer's responder stops before STUN).
@@ -1564,6 +1917,149 @@ async fn dial_initiator(
     Ok(transport)
 }
 
+/// Open a record for one run, or a handle that does nothing when the platform
+/// has not asked for one (the core does not write to a user's disk uninvited).
+fn open_record(
+    config: &Config,
+    role: Role,
+    routing_key: Option<&[u8]>,
+    endpoints: Vec<EndpointRef>,
+) -> Recorder {
+    match config.record.as_ref() {
+        Some(cfg) => Recorder::start(
+            cfg,
+            role,
+            routing_key,
+            endpoints,
+            config.enable_direct_upgrade,
+        ),
+        None => Recorder::disabled(),
+    }
+}
+
+/// The configured endpoints, as the record describes them.
+fn endpoint_refs(relays: &[RelayEndpoint]) -> Vec<EndpointRef> {
+    relays
+        .iter()
+        .map(|r| EndpointRef {
+            host: r.host.clone(),
+            port: r.port,
+            carrier: Carrier::of_protocol(r.protocol),
+            path: PathKind::of_protocol(r.protocol),
+            addr: None,
+        })
+        .collect()
+}
+
+/// Everything one live session needs in order to describe itself: where its
+/// traffic is going, how much of it there has been, and whatever the carrier
+/// is willing to say about the path.
+///
+/// It is shared with the direct upgrade, which replaces the path (and the
+/// connection the numbers come from) underneath a running sampler — so a
+/// single series continues across the swap instead of restarting.
+#[derive(Clone)]
+pub(crate) struct SessionMeters {
+    rec: Recorder,
+    carrier: Carrier,
+    path: Arc<PathState>,
+    counters: Arc<LinkCounters>,
+    quic: Arc<std::sync::Mutex<Option<Connection>>>,
+    /// Set for carriers that declare a fixed frame size instead of probing
+    /// for one.
+    fixed_mtu: Option<u16>,
+}
+
+impl SessionMeters {
+    fn new(
+        rec: &Recorder,
+        carrier: Carrier,
+        path: PathKind,
+        quic: Option<Connection>,
+        fixed_mtu: u16,
+    ) -> Self {
+        Self {
+            rec: rec.clone(),
+            carrier,
+            path: Arc::new(PathState::new(path)),
+            counters: Arc::new(LinkCounters::default()),
+            quic: Arc::new(std::sync::Mutex::new(quic.clone())),
+            fixed_mtu: quic.is_none().then_some(fixed_mtu),
+        }
+    }
+
+    /// The direct upgrade landed: from here the numbers come from the new
+    /// path and the new connection.
+    fn on_direct(&self, path: PathKind, quic: Option<Connection>) {
+        self.path.set(path);
+        if let Ok(mut slot) = self.quic.lock() {
+            *slot = quic;
+        }
+    }
+
+    fn take_sample(&self) {
+        let c = &self.counters;
+        let mut s = record::SampleInput {
+            path: self.path.get(),
+            carrier: self.carrier,
+            tx_bytes: c.tx_bytes.load(Ordering::Relaxed),
+            rx_bytes: c.rx_bytes.load(Ordering::Relaxed),
+            tx_pkts: c.tx_pkts.load(Ordering::Relaxed),
+            rx_pkts: c.rx_pkts.load(Ordering::Relaxed),
+            probes_sent: Some(c.probes_sent.load(Ordering::Relaxed)),
+            probes_lost: Some(
+                c.probes_sent
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(c.probes_answered.load(Ordering::Relaxed)),
+            ),
+            ..Default::default()
+        };
+        // The probe's round trip goes through the tunnel, so it is the only
+        // one comparable across carriers; the carrier's own estimate is
+        // better but measures a different thing, so it is labelled.
+        if let Some(rtt) = c.last_rtt() {
+            s.rtt_ms = Some(rtt.as_secs_f64() * 1000.0);
+            s.rtt_src = Some(RttSource::Keepalive);
+        }
+        let conn = self.quic.lock().ok().and_then(|g| g.clone());
+        match conn {
+            Some(conn) => {
+                let st = conn.stats();
+                s.rtt_ms = Some(st.path.rtt.as_secs_f64() * 1000.0);
+                s.rtt_src = Some(RttSource::Quic);
+                s.cwnd = Some(st.path.cwnd);
+                // Send-side only: QUIC tells us what we lost, never what the
+                // peer did.
+                s.lost_pkts = Some(st.path.lost_packets);
+                s.mtu = conn.max_datagram_size().map(|m| m as u16);
+                s.mtu_src = Some(MtuSource::Discovered);
+            }
+            None => {
+                s.mtu = self.fixed_mtu;
+                s.mtu_src = self.fixed_mtu.map(|_| MtuSource::Declared);
+            }
+        }
+        self.rec.sample(s);
+    }
+}
+
+/// Sample this session until it is cancelled. Cheap: a few atomics and one
+/// `stats()` call per interval.
+fn spawn_sampler(meters: SessionMeters, cancel: CancellationToken) {
+    let interval = meters.rec.sample_interval();
+    if !meters.rec.is_enabled() || interval.is_zero() {
+        return;
+    }
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                _ = cancel.cancelled() => break,
+                _ = tokio::time::sleep(interval) => meters.take_sample(),
+            }
+        }
+    });
+}
+
 // ---------- Direct upgrade ----------
 
 pub(crate) enum DirectRole {
@@ -1582,17 +2078,32 @@ pub(crate) enum DirectError {
     /// The signal channel is closed — no further negotiation is possible for
     /// this session. Terminal: `try_direct_upgrade` must return (retrying
     /// would fail instantly and hot-spin on the responder side).
-    SignalClosed(String),
+    SignalClosed(Fault),
     /// Transient failure (STUN, punch, QUIC handshake, ...); a later attempt
     /// may succeed.
-    Transient(String),
+    Transient(Fault),
 }
 
 impl DirectError {
-    fn reason(&self) -> &str {
+    /// A transient failure. Takes anything that converts into a [`Fault`], so
+    /// a call site that has not been given a vocabulary code yet still
+    /// compiles — and records an honest `unknown` rather than a guess.
+    fn transient(e: impl Into<Fault>) -> Self {
+        DirectError::Transient(e.into())
+    }
+
+    fn signal_closed(e: impl Into<Fault>) -> Self {
+        DirectError::SignalClosed(e.into())
+    }
+
+    fn fault(&self) -> &Fault {
         match self {
-            DirectError::SignalClosed(r) | DirectError::Transient(r) => r,
+            DirectError::SignalClosed(f) | DirectError::Transient(f) => f,
         }
+    }
+
+    fn reason(&self) -> &str {
+        &self.fault().detail
     }
 }
 
@@ -1603,8 +2114,18 @@ impl DirectError {
 /// anyway. A garbled endpoint *payload* (`ProtocolError`) is transient.
 fn neg_err(e: TunnelError) -> DirectError {
     match e {
-        TunnelError::NegChannelClosed => DirectError::SignalClosed("signal channel closed".into()),
-        other => DirectError::Transient(format!("{:?}", other)),
+        TunnelError::NegChannelClosed => {
+            DirectError::signal_closed(Fault::new(Reason::SignalClosed, "signal channel closed"))
+        }
+        // A refused candidate is a policy decision about an address the peer
+        // chose, not a broken peer — and on a hostile network the difference
+        // is the whole finding.
+        TunnelError::PunchTargetRefused(msg) => {
+            DirectError::transient(Fault::new(Reason::TargetRejected, msg))
+        }
+        other => {
+            DirectError::transient(Fault::new(Reason::ProtocolViolation, format!("{other:?}")))
+        }
     }
 }
 
@@ -1632,6 +2153,10 @@ pub(crate) async fn try_direct_upgrade(
     // peer's outer address (self-reported endpoint, punch-validated source,
     // verified direct address) and the sharer's own STUN result.
     conn_log: Option<Arc<SessionLog>>,
+    // This session's meters: the upgrade writes its steps here, and on
+    // success it repoints them at the new path so one quality series
+    // continues across the swap.
+    meters: SessionMeters,
 ) {
     const MAX_DORMANT_ATTEMPTS: u32 = 3;
     let mut dormant_attempts: u32 = 0;
@@ -1688,6 +2213,7 @@ pub(crate) async fn try_direct_upgrade(
                     *routing_key,
                     *secret,
                     &timings,
+                    &meters.rec,
                 )
                 .await
             }
@@ -1699,6 +2225,7 @@ pub(crate) async fn try_direct_upgrade(
                     identity,
                     &timings,
                     conn_log.as_deref(),
+                    &meters.rec,
                 )
                 .await
             }
@@ -1706,10 +2233,21 @@ pub(crate) async fn try_direct_upgrade(
         match result {
             Ok((transport, path)) => {
                 info!("Direct connection established, upgrading transport");
+                let swap = meters
+                    .rec
+                    .mark(StepKind::PathSwap)
+                    .local(path.local)
+                    .peer(path.peer)
+                    .path(PathKind::DirectPunched)
+                    .carrier(meters.carrier);
                 if upgrade_sender.send(transport).is_err() {
                     warn!("Failed to send upgrade — tunnel already closed");
+                    swap.fail(Reason::SwapFailed, "tunnel already closed");
                     return;
                 }
+                swap.ok();
+                // From here the numbers describe the direct path.
+                meters.on_direct(PathKind::DirectPunched, path.quic_conn.clone());
                 if let Some(sl) = &conn_log {
                     sl.addr(AddrKind::Verified, path.peer);
                 }
@@ -1722,18 +2260,40 @@ pub(crate) async fn try_direct_upgrade(
                 );
                 // MTU: a QUIC path reports its PMTUD-converged datagram size after
                 // a grace; nz reports its fixed budget immediately.
-                if let Some(cb) = mtu_callback.clone() {
-                    match path.quic_conn {
-                        Some(conn) => {
-                            tokio::spawn(async move {
-                                tokio::time::sleep(Duration::from_millis(1500)).await;
-                                if let Some(mds) = conn.max_datagram_size() {
+                let mtu_rec = meters.rec.clone();
+                match path.quic_conn {
+                    Some(conn) => {
+                        let cb = mtu_callback.clone();
+                        tokio::spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(1500)).await;
+                            match conn.max_datagram_size() {
+                                Some(mds) => {
                                     info!("P2P max datagram size (post-PMTUD): {}", mds);
-                                    cb(mds as u16);
+                                    mtu_rec
+                                        .mark(StepKind::Mtu)
+                                        .path(PathKind::DirectPunched)
+                                        .detail(format!("discovered {mds}"))
+                                        .ok();
+                                    if let Some(cb) = cb {
+                                        cb(mds as u16);
+                                    }
                                 }
-                            });
+                                None => mtu_rec
+                                    .mark(StepKind::Mtu)
+                                    .path(PathKind::DirectPunched)
+                                    .fail(Reason::Unknown, "no datagram size after PMTUD"),
+                            }
+                        });
+                    }
+                    None => {
+                        mtu_rec
+                            .mark(StepKind::Mtu)
+                            .path(PathKind::DirectPunched)
+                            .detail(format!("declared {}", path.fixed_mtu))
+                            .ok();
+                        if let Some(cb) = mtu_callback.clone() {
+                            cb(path.fixed_mtu);
                         }
-                        None => cb(path.fixed_mtu),
                     }
                 }
                 return;
@@ -1743,6 +2303,7 @@ pub(crate) async fn try_direct_upgrade(
                 emit(
                     &event_hook,
                     TunnelEvent::DirectUpgradeFailed {
+                        code: e.fault().reason,
                         reason: e.reason().to_string(),
                     },
                 );
@@ -1784,6 +2345,7 @@ struct DirectPath {
     fixed_mtu: u16,
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn try_direct_as_initiator(
     signal: &mut SignalChannel,
     stun_server: &str,
@@ -1792,31 +2354,61 @@ async fn try_direct_as_initiator(
     routing_key: [u8; ROUTING_KEY_LEN],
     secret: [u8; SECRET_LEN],
     timings: &Timings,
+    rec: &Recorder,
 ) -> Result<(IpTransport, DirectPath), DirectError> {
-    let (socket, external_addr) = pierce_keep_socket(stun_server, protector, path_ipv6)
-        .await
-        .map_err(DirectError::Transient)?;
+    let stun = rec.step_now(StepKind::Stun).via(stun_server);
+    let (socket, external_addr) = match pierce_keep_socket(stun_server, protector, path_ipv6).await
+    {
+        Ok(x) => {
+            stun.local(x.1).ok();
+            x
+        }
+        Err(e) => {
+            stun.fail_with(&e);
+            return Err(DirectError::transient(e));
+        }
+    };
+    let exchange = rec
+        .step_now(StepKind::EndpointExchange)
+        .local(external_addr);
     let peer_addr = {
         let mut neg = SignalNegChannel::new(signal);
         neg.send_endpoint(external_addr).await.map_err(neg_err)?;
         tokio::time::timeout(timings.endpoint_exchange_timeout, neg.recv_endpoint())
             .await
-            .map_err(|_| DirectError::Transient("timed out waiting for peer endpoint".to_string()))?
+            .map_err(|_| {
+                // Not a punch failure: the peer never told us where to aim,
+                // which is a different fact about a different stage.
+                DirectError::transient(Fault::new(
+                    Reason::ExchangeTimeout,
+                    format!(
+                        "no endpoint from the peer within {:?}",
+                        timings.endpoint_exchange_timeout
+                    ),
+                ))
+            })?
             .map_err(neg_err)?
     };
     // The punch socket's family is fixed by our STUN result; a peer endpoint
     // in the other family is unreachable from it. Fail fast (the exchange is
     // one candidate per side, no multi-family negotiation) instead of
     // burning 2x punch_phase_timeout sending packets the OS refuses.
+    exchange.peer(peer_addr).ok();
     if peer_addr.is_ipv6() != external_addr.is_ipv6() {
-        return Err(DirectError::Transient(format!(
-            "address family mismatch: ours {}, peer {}",
-            external_addr, peer_addr
-        )));
+        let f = Fault::new(
+            Reason::FamilyMismatch,
+            format!("address family mismatch: ours {external_addr}, peer {peer_addr}"),
+        );
+        rec.mark(StepKind::Punch).peer(peer_addr).fail_with(&f);
+        return Err(DirectError::transient(f));
     }
 
+    let punching = rec
+        .step_now(StepKind::Punch)
+        .local(external_addr)
+        .peer(peer_addr);
     let (punch_pkt, verify_pkt) = punch_markers(&secret);
-    let (socket, learned_peer) = punch_and_verify(
+    let (socket, learned_peer) = match punch_and_verify(
         socket,
         peer_addr,
         &punch_pkt,
@@ -1825,16 +2417,32 @@ async fn try_direct_as_initiator(
         timings.punch_send_interval,
     )
     .await
-    .map_err(DirectError::Transient)?;
+    {
+        Ok(x) => {
+            // The address that answered, which is not always the one the peer
+            // signalled — that difference is what a symmetric NAT looks like.
+            punching.peer(x.1).ok();
+            x
+        }
+        Err(e) => {
+            punching.fail_with(&e);
+            return Err(DirectError::transient(e));
+        }
+    };
     let local_addr = socket
         .local_addr()
-        .map_err(|e| DirectError::Transient(format!("local_addr: {}", e)))?;
+        .map_err(|e| DirectError::transient(Fault::from_io(&e).context("local_addr")))?;
+    let building = rec
+        .step_now(StepKind::DirectHandshake)
+        .peer(learned_peer)
+        .local(local_addr)
+        .path(PathKind::DirectPunched);
     // Rebuild the direct path with the SAME carrier as the relay path — the
     // signal variant tells us which. nz: a fresh NNpsk0 session over the punched
     // socket (independent keys/counters — a rebuild, not a cipher-state handoff).
     if signal.is_noise() {
         let socket = std::sync::Arc::new(socket);
-        let mut transport = crate::transport::noise::noise_connect(
+        let mut transport = match crate::transport::noise::noise_connect(
             socket,
             learned_peer,
             &routing_key,
@@ -1843,7 +2451,16 @@ async fn try_direct_as_initiator(
             timings.quic_idle_timeout,
         )
         .await
-        .map_err(DirectError::Transient)?;
+        {
+            Ok(t) => {
+                building.carrier(Carrier::NoiseUdp).ok();
+                t
+            }
+            Err(e) => {
+                building.carrier(Carrier::NoiseUdp).fail_with(&e);
+                return Err(DirectError::transient(e));
+            }
+        };
         let _ = transport.take_signal(); // already direct — no further upgrade
         return Ok((
             Box::new(transport),
@@ -1857,16 +2474,23 @@ async fn try_direct_as_initiator(
     }
     let std_sock = socket
         .into_std()
-        .map_err(|e| DirectError::Transient(format!("into_std: {}", e)))?;
+        .map_err(|e| DirectError::transient(Fault::from_io(&e).context("into_std")))?;
     let endpoint =
-        client_endpoint(std_sock, routing_key, timings).map_err(DirectError::Transient)?;
+        client_endpoint(std_sock, routing_key, timings).map_err(DirectError::transient)?;
     // Dial the address the peer's packets actually came from — our NAT has a
     // mapping open toward it, which may not be true of the signaled address.
     // No accept ack on the direct path: the secret is already proven good, and
     // waiting on a reverse-direction byte over a fresh punch only adds failures.
-    let session = client_connect(&endpoint, learned_peer, &secret, false)
-        .await
-        .map_err(DirectError::Transient)?;
+    let session = match client_connect(&endpoint, learned_peer, &secret, false).await {
+        Ok(s) => {
+            building.carrier(Carrier::Quic).ok();
+            s
+        }
+        Err(e) => {
+            building.carrier(Carrier::Quic).fail_with(&e);
+            return Err(DirectError::transient(e));
+        }
+    };
     // Reuse the session's transport: its reader task is already attached to
     // the connection, and building a second QuicPeerTransport here would
     // leave that reader to steal the first inbound datagram before exiting.
@@ -1885,6 +2509,7 @@ async fn try_direct_as_initiator(
 /// Responder (A): wait for peer endpoint, STUN, send own endpoint, punch,
 /// build direct QUIC server using identity, verify peer's secret. On success
 /// also returns the punched socket's local address (for event reporting).
+#[allow(clippy::too_many_arguments)]
 async fn try_direct_as_responder(
     signal: &mut SignalChannel,
     stun_server: &str,
@@ -1892,7 +2517,9 @@ async fn try_direct_as_responder(
     identity: &Identity,
     timings: &Timings,
     conn_log: Option<&SessionLog>,
+    rec: &Recorder,
 ) -> Result<(IpTransport, DirectPath), DirectError> {
+    let exchange = rec.step_now(StepKind::EndpointExchange);
     let (peer_addr, socket) = {
         let mut neg = SignalNegChannel::new(signal);
         let peer_addr = neg.recv_endpoint().await.map_err(neg_err)?;
@@ -1904,10 +2531,18 @@ async fn try_direct_as_responder(
         }
         // Follow the initiator's family: it signaled first, so STUN (and
         // punch) in the family its endpoint lives in.
+        let stun = rec.step_now(StepKind::Stun).via(stun_server);
         let (socket, external_addr) =
-            pierce_keep_socket(stun_server, protector, peer_addr.is_ipv6())
-                .await
-                .map_err(DirectError::Transient)?;
+            match pierce_keep_socket(stun_server, protector, peer_addr.is_ipv6()).await {
+                Ok(x) => {
+                    stun.local(x.1).ok();
+                    x
+                }
+                Err(e) => {
+                    stun.fail_with(&e);
+                    return Err(DirectError::transient(e));
+                }
+            };
         if let Some(sl) = conn_log {
             sl.addr(AddrKind::SharerPublic, external_addr);
         }
@@ -1915,11 +2550,14 @@ async fn try_direct_as_responder(
         // matching-family STUN address resolved): the initiator then detects
         // the mismatch immediately instead of timing out on the exchange.
         neg.send_endpoint(external_addr).await.map_err(neg_err)?;
+        exchange.local(external_addr).peer(peer_addr).ok();
         if peer_addr.is_ipv6() != external_addr.is_ipv6() {
-            return Err(DirectError::Transient(format!(
-                "address family mismatch: ours {}, peer {}",
-                external_addr, peer_addr
-            )));
+            let f = Fault::new(
+                Reason::FamilyMismatch,
+                format!("address family mismatch: ours {external_addr}, peer {peer_addr}"),
+            );
+            rec.mark(StepKind::Punch).peer(peer_addr).fail_with(&f);
+            return Err(DirectError::transient(f));
         }
         (peer_addr, socket)
     };
@@ -1929,7 +2567,8 @@ async fn try_direct_as_responder(
     // address-validated (learned from packets the peer actually sourced), so
     // the connection log records it even when the QUIC build below fails.
     let (punch_pkt, verify_pkt) = punch_markers(&identity.secret);
-    let (socket, learned_peer) = punch_and_verify(
+    let punching = rec.step_now(StepKind::Punch).peer(peer_addr);
+    let (socket, learned_peer) = match punch_and_verify(
         socket,
         peer_addr,
         &punch_pkt,
@@ -1938,13 +2577,27 @@ async fn try_direct_as_responder(
         timings.punch_send_interval,
     )
     .await
-    .map_err(DirectError::Transient)?;
+    {
+        Ok(x) => {
+            punching.peer(x.1).ok();
+            x
+        }
+        Err(e) => {
+            punching.fail_with(&e);
+            return Err(DirectError::transient(e));
+        }
+    };
     if let Some(sl) = conn_log {
         sl.addr(AddrKind::PunchVerified, learned_peer);
     }
     let local_addr = socket
         .local_addr()
-        .map_err(|e| DirectError::Transient(format!("local_addr: {}", e)))?;
+        .map_err(|e| DirectError::transient(Fault::from_io(&e).context("local_addr")))?;
+    let building = rec
+        .step_now(StepKind::DirectHandshake)
+        .peer(learned_peer)
+        .local(local_addr)
+        .path(PathKind::DirectPunched);
     // nz responder: accept a fresh NNpsk0 session on the punched socket (a pump
     // feeds noise_accept, which waits for the initiator's msg1). Same carrier as
     // the relay path; independent keys.
@@ -1952,7 +2605,7 @@ async fn try_direct_as_responder(
         let socket = std::sync::Arc::new(socket);
         let shaper = crate::transport::shaper::nz_shaper(&identity.routing_key, &identity.secret);
         let (rx, pump) = crate::transport::noise::spawn_socket_pump(socket.clone(), shaper);
-        let mut transport = crate::transport::noise::noise_accept(
+        let mut transport = match crate::transport::noise::noise_accept(
             socket,
             rx,
             rand::random(),
@@ -1962,7 +2615,16 @@ async fn try_direct_as_responder(
             timings.quic_idle_timeout,
         )
         .await
-        .map_err(DirectError::Transient)?;
+        {
+            Ok(t) => {
+                building.carrier(Carrier::NoiseUdp).ok();
+                t
+            }
+            Err(e) => {
+                building.carrier(Carrier::NoiseUdp).fail_with(&e);
+                return Err(DirectError::transient(e));
+            }
+        };
         let peer = transport.peer_addr();
         let _ = transport.take_signal(); // already direct — no further upgrade
         return Ok((
@@ -1977,8 +2639,8 @@ async fn try_direct_as_responder(
     }
     let std_sock = socket
         .into_std()
-        .map_err(|e| DirectError::Transient(format!("into_std: {}", e)))?;
-    let endpoint = server_endpoint(std_sock, identity, timings).map_err(DirectError::Transient)?;
+        .map_err(|e| DirectError::transient(Fault::from_io(&e).context("into_std")))?;
+    let endpoint = server_endpoint(std_sock, identity, timings).map_err(DirectError::transient)?;
     // Time-box only the wait for the initiator's connection attempt — not the
     // handshake, which keeps its own deadline inside authenticate_incoming.
     // endpoint.accept() blocks until an Incoming arrives; if the initiator's
@@ -1991,20 +2653,31 @@ async fn try_direct_as_responder(
     let incoming = match tokio::time::timeout(accept_deadline, endpoint.accept()).await {
         Ok(Some(incoming)) => incoming,
         Ok(None) => {
-            return Err(DirectError::Transient(
-                "direct endpoint closed before accept".into(),
-            ));
+            return Err(DirectError::transient(Fault::new(
+                Reason::TransportClosed,
+                "direct endpoint closed before accept",
+            )));
         }
         Err(_) => {
-            return Err(DirectError::Transient(
-                "direct accept timed out (initiator never dialed)".into(),
-            ));
+            return Err(DirectError::transient(Fault::new(
+                Reason::VerifyTimeout,
+                format!(
+                    "direct accept timed out after {accept_deadline:?} (initiator never dialed)"
+                ),
+            )));
         }
     };
     // No accept ack on the direct path (see the initiator-side note).
-    let session = authenticate_incoming(incoming, &identity.secret, false)
-        .await
-        .map_err(DirectError::Transient)?;
+    let session = match authenticate_incoming(incoming, &identity.secret, false).await {
+        Ok(s) => {
+            building.carrier(Carrier::Quic).ok();
+            s
+        }
+        Err(e) => {
+            building.carrier(Carrier::Quic).fail_with(&e);
+            return Err(DirectError::transient(e));
+        }
+    };
     // Reuse the session's transport (see the initiator-side note): a second
     // QuicPeerTransport would orphan the session's reader, which eats the
     // first inbound datagram on the fresh direct path.
@@ -2032,7 +2705,7 @@ async fn try_direct_as_responder(
 /// expands to EVERY resolved address — both families — so a dual-record
 /// `relay.example` behaves exactly as if its A and AAAA had been listed as
 /// separate relays.
-fn resolve_one_relay(relay: &RelayEndpoint) -> Result<Vec<SocketAddr>, String> {
+fn resolve_one_relay(relay: &RelayEndpoint) -> Result<Vec<SocketAddr>, Fault> {
     let host = &relay.host;
     let bare = host
         .strip_prefix('[')
@@ -2043,10 +2716,18 @@ fn resolve_one_relay(relay: &RelayEndpoint) -> Result<Vec<SocketAddr>, String> {
     }
     let addrs: Vec<SocketAddr> = format!("{}:{}", host, relay.port)
         .to_socket_addrs()
-        .map_err(|e| format!("resolve relay {}:{} failed: {}", host, relay.port, e))?
+        .map_err(|e| {
+            Fault::new(
+                Reason::DnsFailure,
+                format!("resolve relay {}:{} failed: {e}", host, relay.port),
+            )
+        })?
         .collect();
     if addrs.is_empty() {
-        return Err(format!("no address for relay {}:{}", host, relay.port));
+        return Err(Fault::new(
+            Reason::DnsNoRecords,
+            format!("no address for relay {}:{}", host, relay.port),
+        ));
     }
     Ok(addrs)
 }
@@ -2055,7 +2736,7 @@ fn resolve_one_relay(relay: &RelayEndpoint) -> Result<Vec<SocketAddr>, String> {
 /// (URL/config order preserved). A per-relay resolution failure is logged and
 /// skipped — censorship that blocks one relay's DNS must not take down the
 /// rest — so this errors only when NOTHING resolves.
-fn resolve_relays(relays: &[RelayEndpoint]) -> Result<Vec<(SocketAddr, RelayProtocol)>, String> {
+fn resolve_relays(relays: &[RelayEndpoint]) -> Result<Vec<(SocketAddr, RelayProtocol)>, Fault> {
     let mut out: Vec<(SocketAddr, RelayProtocol)> = Vec::new();
     let mut seen: HashSet<(SocketAddr, RelayProtocol)> = HashSet::new();
     for relay in relays {
@@ -2074,7 +2755,10 @@ fn resolve_relays(relays: &[RelayEndpoint]) -> Result<Vec<(SocketAddr, RelayProt
         }
     }
     if out.is_empty() {
-        return Err("no relay address resolved from the configured relays".into());
+        return Err(Fault::new(
+            Reason::DnsNoRecords,
+            "no relay address resolved from the configured relays",
+        ));
     }
     Ok(out)
 }
@@ -2084,7 +2768,7 @@ fn resolve_relays(relays: &[RelayEndpoint]) -> Result<Vec<(SocketAddr, RelayProt
 /// v4; within a family the configured order (and protocol) is preserved.
 fn resolve_relays_preferring_v6(
     relays: &[RelayEndpoint],
-) -> Result<Vec<(SocketAddr, RelayProtocol)>, String> {
+) -> Result<Vec<(SocketAddr, RelayProtocol)>, Fault> {
     let mut addrs = resolve_relays(relays)?;
     addrs.sort_by_key(|(a, _)| !a.is_ipv6()); // false(0)=v6 first, true(1)=v4
     Ok(addrs)
@@ -2148,16 +2832,16 @@ fn bind_share_udp(
 pub(crate) fn bind_local_udp(
     protector: &SocketProtector,
     peer: SocketAddr,
-) -> Result<std::net::UdpSocket, String> {
+) -> Result<std::net::UdpSocket, Fault> {
     let wildcard: SocketAddr = if peer.is_ipv6() {
         (std::net::Ipv6Addr::UNSPECIFIED, 0).into()
     } else {
         (std::net::Ipv4Addr::UNSPECIFIED, 0).into()
     };
-    let std =
-        std::net::UdpSocket::bind(wildcard).map_err(|e| format!("bind UDP {}: {}", wildcard, e))?;
+    let std = std::net::UdpSocket::bind(wildcard)
+        .map_err(|e| Fault::from_io(&e).context(&format!("bind UDP {wildcard}")))?;
     std.set_nonblocking(true)
-        .map_err(|e| format!("set_nonblocking: {}", e))?;
+        .map_err(|e| Fault::from_io(&e).context("set_nonblocking"))?;
     tune_udp_buffers(&std);
     apply_protector_to_std(protector, &std);
     Ok(std)
@@ -2244,9 +2928,14 @@ async fn punch_and_verify(
     verify_pkt: &[u8],
     phase_timeout: Duration,
     send_interval: Duration,
-) -> Result<(UdpSocket, SocketAddr), String> {
+) -> Result<(UdpSocket, SocketAddr), Fault> {
     debug!("Direct connection: punching {} (observed-source)", signaled);
 
+    // Whether anything from the peer ever arrived. It separates the two
+    // failures that look alike from the outside — "our packets never reached
+    // them, or theirs never reached us" from "we met, but never confirmed it
+    // both ways" — and only the first is evidence about the network.
+    let heard_peer = std::sync::atomic::AtomicBool::new(false);
     let result = tokio::time::timeout(phase_timeout.saturating_mul(2), async {
         let mut buf = [0u8; 1500];
         let mut interval = tokio::time::interval(send_interval);
@@ -2268,12 +2957,13 @@ async fn punch_and_verify(
                 result = socket.recv_from(&mut buf) => {
                     let (n, src) = match result {
                         Ok(x) => x,
-                        Err(e) => return Err(format!("recv error: {}", e)),
+                        Err(e) => return Err(Fault::from_io(&e).context("punch recv")),
                     };
                     let msg = &buf[..n];
                     if msg != punch_pkt && msg != verify_pkt {
                         continue;
                     }
+                    heard_peer.store(true, std::sync::atomic::Ordering::Relaxed);
                     if record_punch_source(&mut learned, &mut targets, src) {
                         debug!("Direct connection: learned peer source {}", src);
                     }
@@ -2285,7 +2975,7 @@ async fn punch_and_verify(
                         for _ in 0..3 {
                             let _ = socket.send_to(verify_pkt, src).await;
                         }
-                        return Ok::<_, String>(src);
+                        return Ok::<_, Fault>(src);
                     }
                 }
             }
@@ -2299,7 +2989,20 @@ async fn punch_and_verify(
             Ok((socket, peer))
         }
         Ok(Err(e)) => Err(e),
-        Err(_) => Err("timed out during punch exchange".into()),
+        Err(_) if heard_peer.load(std::sync::atomic::Ordering::Relaxed) => Err(Fault::new(
+            Reason::VerifyTimeout,
+            format!(
+                "heard the peer but never confirmed both directions within {:?}",
+                phase_timeout.saturating_mul(2)
+            ),
+        )),
+        Err(_) => Err(Fault::new(
+            Reason::PunchTimeout,
+            format!(
+                "nothing from the peer within {:?}",
+                phase_timeout.saturating_mul(2)
+            ),
+        )),
     }
 }
 
@@ -2315,18 +3018,27 @@ pub async fn pierce_keep_socket(
     stun_server: &str,
     protector: &SocketProtector,
     prefer_ipv6: bool,
-) -> Result<(UdpSocket, SocketAddr), String> {
+) -> Result<(UdpSocket, SocketAddr), Fault> {
     let resolved: Vec<SocketAddr> = stun_server
         .to_socket_addrs()
-        .map_err(|e| format!("failed to resolve stun address: {}", e))?
+        .map_err(|e| {
+            Fault::new(
+                Reason::DnsFailure,
+                format!("resolve stun {stun_server}: {e}"),
+            )
+        })?
         .collect();
     let mut candidates: Vec<SocketAddr> = Vec::with_capacity(resolved.len());
     candidates.extend(resolved.iter().filter(|a| a.is_ipv6() == prefer_ipv6));
     candidates.extend(resolved.iter().filter(|a| a.is_ipv6() != prefer_ipv6));
     if candidates.is_empty() {
-        return Err("stun address did not resolve".into());
+        return Err(Fault::new(
+            Reason::DnsNoRecords,
+            format!("stun {stun_server} resolved to no address"),
+        ));
     }
 
+    let mut last: Option<Fault> = None;
     for stun_addr in candidates {
         let wildcard: std::net::IpAddr = if stun_addr.is_ipv6() {
             std::net::Ipv6Addr::UNSPECIFIED.into()
@@ -2338,7 +3050,8 @@ pub async fn pierce_keep_socket(
             let local_addr = SocketAddr::new(wildcard, local_port);
             let udp = match tokio::net::UdpSocket::bind(&local_addr).await {
                 Ok(udp) => udp,
-                Err(_) => {
+                Err(e) => {
+                    last = Some(Fault::from_io(&e).context(&format!("bind {local_addr}")));
                     local_port += 1;
                     continue;
                 }
@@ -2354,14 +3067,21 @@ pub async fn pierce_keep_socket(
             let f = c.query_external_address_async(&udp);
             match f.await {
                 Ok(external_addr) => return Ok((udp, external_addr)),
-                Err(_) => {
+                Err(e) => {
+                    // The STUN client folds "no reply" and "unusable reply"
+                    // into one error, so this cannot honestly claim the
+                    // stronger of the two.
+                    last = Some(Fault::new(
+                        Reason::StunTimeout,
+                        format!("stun query to {stun_addr} from :{local_port}: {e}"),
+                    ));
                     local_port += 1;
                     continue;
                 }
             };
         }
     }
-    Err("failed to pierce".into())
+    Err(last.unwrap_or_else(|| Fault::new(Reason::StunFailed, "no STUN candidate could be tried")))
 }
 
 pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), String> {
@@ -2470,6 +3190,13 @@ mod tests {
                 Timings::default(),
                 None,
                 None,
+                SessionMeters::new(
+                    &Recorder::disabled(),
+                    Carrier::Quic,
+                    PathKind::Relay,
+                    None,
+                    1200,
+                ),
             )
             .await;
         });

@@ -13,7 +13,7 @@ This repository contains all the networking functionality, FFIs and a cross-plat
 It is a Rust [workspace](Cargo.toml) (edition 2024). The crates:
 
 - **`spora-core`** — the library everything else builds on. All of the networking lives here: NAT traversal (UDP hole punching), the relay-path and direct QUIC transports, the direct-path upgrade, the userland exit netstack, and the connection log. Its public surface is two calls — `share()` (act as an exit) and `connect(url)` (act as a client).
-- **`spora-cli`** — the cross-platform command-line client; builds to the `spora-cli` binary with `share`, `use <URL>`, and `log` subcommands. The reference front-end for `spora-core`.
+- **`spora-cli`** — the cross-platform command-line client; builds to the `spora-cli` binary with `share`, `use <URL>`, `log` and `record` subcommands. The reference front-end for `spora-core`.
 - **`spora-ffi`** — [UniFFI](https://mozilla.github.io/uniffi-rs/) bindings that wrap `spora-core` for the Android app (built as a `cdylib` with generated Kotlin; build outputs land in `jniLibs/` and `out/uniffi/`).
 - **`relay`** — the relay daemon: a "dumb" forwarder that pairs a sharer and client by routing key and splices their traffic without ever seeing inside it (it holds no keys and reads no plaintext). A public relay is built into the client, so running your own is optional. See [`relay/README.md`](relay/README.md) for its carriers, authorization, and session log.
 - **`relay-client`** — the sliver shared by core and relay: the relay wire-protocol constants and the sharer's registration loop.
@@ -68,6 +68,18 @@ spora-cli use "https://spora.to/s/…"
 ```
 
 Establishes the tunnel and pumps it to a local TUN device. It does **not** configure addressing or routing for you: the CLI `use` mode is a low-level/testing client, whereas the GUI apps are the turnkey clients that bring up the interface and route your traffic automatically. Not available on Windows (it needs a TUN device).
+
+### What went wrong, when something does
+
+Both `share` and `use` keep a **connection record**: a machine-readable account of one run — every step that was attempted, a reason code (from a fixed set, not free text) for every failure, quality samples while the tunnel is up, and how it ended. It lives at `$XDG_STATE_HOME/spora/records/`; `--no-record` turns it off and `--record-dir` moves it.
+
+```bash
+spora-cli record list                 # one line per run: when, how it ended, what failed first
+spora-cli record show                 # the newest run, step by step
+spora-cli record export -o run.json   # hand it to someone else
+```
+
+`list` and `show` take `--json`; `export` is always JSON. This is the thing to send when reporting a connection problem: it says *where* the attempt died rather than only that it did.
 
 ### Other overrides
 

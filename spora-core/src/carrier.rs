@@ -28,6 +28,7 @@ use tokio::net::TcpStream;
 use crate::e2e::{E2eSession, client_connect};
 use crate::e2e_tls;
 use crate::identity::{ROUTING_KEY_LEN, RelayProtocol, SECRET_LEN};
+use crate::record::{Carrier, Fault, PathKind, Recorder, StepKind};
 use crate::signal::SignalChannel;
 use crate::transport::IpTransport;
 use crate::{SocketProtector, Timings, bind_local_udp};
@@ -57,6 +58,19 @@ pub(crate) struct PeerSession {
 }
 
 impl PeerSession {
+    /// Which carrier this session arrived on. The carrier is implicit in
+    /// which fields are set — QUIC brings a connection, nz brings a Noise
+    /// signal channel, a stream carrier brings neither — so the mapping is
+    /// written down once, here.
+    pub fn carrier(&self) -> Carrier {
+        match (&self.quic_conn, &self.signal) {
+            (Some(_), _) => Carrier::Quic,
+            (None, Some(sig)) if sig.is_noise() => Carrier::NoiseUdp,
+            (None, Some(_)) => Carrier::Quic,
+            (None, None) => Carrier::TcpTls,
+        }
+    }
+
     /// Wrap an established QUIC end-to-end session.
     pub fn from_quic(session: E2eSession) -> Self {
         let E2eSession {
@@ -85,10 +99,14 @@ pub(crate) struct DialCtx<'a> {
     /// Wait for the sharer's accept-ack (relay path: surfaces a bad/expired
     /// secret as a connect error instead of a silent reconnect loop).
     pub expect_ack: bool,
+    /// Where this dial's steps are written. Classification has to happen
+    /// here, at the innermost site: by the time an error has been flattened
+    /// into the caller's `io::Error` its kind is already gone.
+    pub rec: &'a Recorder,
 }
 
 pub(crate) type SessionFut<'a> =
-    Pin<Box<dyn Future<Output = Result<PeerSession, String>> + Send + 'a>>;
+    Pin<Box<dyn Future<Output = Result<PeerSession, Fault>> + Send + 'a>>;
 
 /// A client-side relay protocol: given a target, establish an authenticated
 /// end-to-end session with the peer.
@@ -114,20 +132,68 @@ pub(crate) fn relay_client_for(protocol: RelayProtocol) -> Box<dyn RelayClient> 
 /// Initial), harmful on a Direct dial (a shared DCID collides with the
 /// previous client's live/draining connection on the sharer's endpoint and
 /// the Initials are silently swallowed) — Direct uses random DCIDs.
-async fn quic_dial(ctx: DialCtx<'_>, rk_dcid: bool) -> Result<PeerSession, String> {
-    let std_socket = bind_local_udp(ctx.protector, ctx.target)?;
+async fn quic_dial(ctx: DialCtx<'_>, rk_dcid: bool) -> Result<PeerSession, Fault> {
+    let path = if rk_dcid {
+        PathKind::Relay
+    } else {
+        PathKind::DirectAdvertised
+    };
+    let bind = ctx.rec.step(StepKind::SocketBind).via(ctx.target);
+    let std_socket = match bind_local_udp(ctx.protector, ctx.target) {
+        Ok(s) => {
+            match s.local_addr() {
+                Ok(a) => bind.local(a).ok(),
+                Err(_) => bind.ok(),
+            }
+            s
+        }
+        Err(e) => {
+            bind.fail_with(&e);
+            return Err(e);
+        }
+    };
     let endpoint =
         crate::e2e::client_endpoint_with_dcid(std_socket, ctx.routing_key, ctx.timings, rk_dcid)?;
-    let session = client_connect(&endpoint, ctx.target, &ctx.secret, ctx.expect_ack).await?;
+    // Handshake and authentication are one step here because `client_connect`
+    // does both and the codes it returns already tell them apart.
+    let hs = ctx
+        .rec
+        .step_now(StepKind::Handshake)
+        .via(ctx.target)
+        .carrier(Carrier::Quic)
+        .path(path);
+    let session = match client_connect(&endpoint, ctx.target, &ctx.secret, ctx.expect_ack).await {
+        Ok(s) => {
+            hs.peer(s.conn.remote_address()).ok();
+            s
+        }
+        Err(e) => {
+            hs.fail_with(&e);
+            return Err(e);
+        }
+    };
     Ok(PeerSession::from_quic(session))
 }
 
 /// TCP/TLS relay dial: connect to the relay, send the CONNECT preamble (routing
 /// key), then run the end-to-end TLS handshake + secret over the spliced stream.
-async fn tcp_tls_dial(ctx: DialCtx<'_>) -> Result<PeerSession, String> {
-    let mut tcp = TcpStream::connect(ctx.target)
-        .await
-        .map_err(|e| format!("tcp connect {}: {e}", ctx.target))?;
+async fn tcp_tls_dial(ctx: DialCtx<'_>) -> Result<PeerSession, Fault> {
+    let connect = ctx
+        .rec
+        .step_now(StepKind::SocketBind)
+        .via(ctx.target)
+        .carrier(Carrier::TcpTls);
+    let mut tcp = match TcpStream::connect(ctx.target).await {
+        Ok(t) => {
+            connect.ok();
+            t
+        }
+        Err(e) => {
+            let f = Fault::from_io(&e).context(&format!("tcp connect {}", ctx.target));
+            connect.fail_with(&f);
+            return Err(f);
+        }
+    };
     let _ = tcp.set_nodelay(true);
     protect_tcp(ctx.protector, &tcp);
     tcp.write_all(&relay_client::tcp::build_preamble(
@@ -136,10 +202,25 @@ async fn tcp_tls_dial(ctx: DialCtx<'_>) -> Result<PeerSession, String> {
         &[], // clients aren't relay-authorized — their auth is the E2E secret
     ))
     .await
-    .map_err(|e| format!("tcp preamble write: {e}"))?;
+    .map_err(|e| Fault::from_io(&e).context("tcp preamble write"))?;
     // End-to-end TLS (pinned to routing_key) + secret over the spliced stream.
     // The relay forwards ciphertext only; this is the E2E channel.
-    let transport = e2e_tls::connect(tcp, ctx.routing_key, &ctx.secret).await?;
+    let hs = ctx
+        .rec
+        .step_now(StepKind::Handshake)
+        .via(ctx.target)
+        .carrier(Carrier::TcpTls)
+        .path(PathKind::Relay);
+    let transport = match e2e_tls::connect(tcp, ctx.routing_key, &ctx.secret).await {
+        Ok(t) => {
+            hs.ok();
+            t
+        }
+        Err(e) => {
+            hs.fail_with(&e);
+            return Err(e);
+        }
+    };
     Ok(PeerSession {
         transport,
         remote_addr: ctx.target,
@@ -153,12 +234,36 @@ async fn tcp_tls_dial(ctx: DialCtx<'_>) -> Result<PeerSession, String> {
 /// NNpsk0 handshake to the sharer through the relay (routed by `routing_key` on
 /// the first packet), verify A's cert-auth, and hand back the data-plane
 /// transport. Non-QUIC-shaped on the wire; the relay stays dumb and keyless.
-async fn noise_dial(ctx: DialCtx<'_>) -> Result<PeerSession, String> {
-    let std_socket = bind_local_udp(ctx.protector, ctx.target)?;
+async fn noise_dial(ctx: DialCtx<'_>) -> Result<PeerSession, Fault> {
+    let bind = ctx
+        .rec
+        .step(StepKind::SocketBind)
+        .via(ctx.target)
+        .carrier(Carrier::NoiseUdp);
+    let std_socket = match bind_local_udp(ctx.protector, ctx.target) {
+        Ok(s) => {
+            match s.local_addr() {
+                Ok(a) => bind.local(a).ok(),
+                Err(_) => bind.ok(),
+            }
+            s
+        }
+        Err(e) => {
+            bind.fail_with(&e);
+            return Err(e);
+        }
+    };
     let socket = std::sync::Arc::new(
-        tokio::net::UdpSocket::from_std(std_socket).map_err(|e| format!("nz socket: {e}"))?,
+        tokio::net::UdpSocket::from_std(std_socket)
+            .map_err(|e| Fault::from_io(&e).context("nz socket"))?,
     );
-    let mut transport = crate::transport::noise::noise_connect(
+    let hs = ctx
+        .rec
+        .step_now(StepKind::Handshake)
+        .via(ctx.target)
+        .carrier(Carrier::NoiseUdp)
+        .path(PathKind::Relay);
+    let mut transport = match crate::transport::noise::noise_connect(
         socket,
         ctx.target,
         &ctx.routing_key,
@@ -166,7 +271,17 @@ async fn noise_dial(ctx: DialCtx<'_>) -> Result<PeerSession, String> {
         ctx.timings.relay_dial_timeout,
         ctx.timings.quic_idle_timeout,
     )
-    .await?;
+    .await
+    {
+        Ok(t) => {
+            hs.ok();
+            t
+        }
+        Err(e) => {
+            hs.fail_with(&e);
+            return Err(e);
+        }
+    };
     // The in-band signal channel drives the hole-punch direct upgrade.
     let signal = transport.take_signal().map(SignalChannel::noise);
     Ok(PeerSession {

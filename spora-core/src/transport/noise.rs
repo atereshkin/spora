@@ -58,6 +58,7 @@ use crate::e2e_noise::{
     NOISE_TAG_LEN, NoiseHandshake, NoiseSession, build_cert_auth, verify_cert_auth,
 };
 use crate::identity::{Identity, ROUTING_KEY_LEN, SECRET_LEN};
+use crate::record::{Fault, Reason};
 
 /// In-band channel tags (inside the AEAD, invisible on the wire).
 const CH_IP: u8 = 0x00;
@@ -279,18 +280,28 @@ async fn recv_matching<F: Fn(&[u8]) -> bool>(
     rx: &mut mpsc::UnboundedReceiver<(Vec<u8>, SocketAddr)>,
     within: Duration,
     pred: F,
-) -> Result<(Vec<u8>, SocketAddr), String> {
+) -> Result<(Vec<u8>, SocketAddr), Fault> {
     timeout(within, async {
         loop {
             match rx.recv().await {
                 Some((d, src)) if pred(&d) => return Ok((d, src)),
                 Some(_) => continue, // stray (punch leftover / other flow) — skip
-                None => return Err("nz: datagram source closed".to_string()),
+                None => {
+                    return Err(Fault::new(
+                        Reason::TransportClosed,
+                        "nz: datagram source closed",
+                    ));
+                }
             }
         }
     })
     .await
-    .map_err(|_| "nz: handshake timed out".to_string())?
+    .map_err(|_| {
+        Fault::new(
+            Reason::HandshakeTimeout,
+            format!("nz: handshake timed out after {within:?}"),
+        )
+    })?
 }
 
 // ---- handshake drivers ----------------------------------------------------
@@ -305,7 +316,7 @@ pub(crate) async fn noise_connect(
     secret: &[u8; SECRET_LEN],
     hs_timeout: Duration,
     idle: Duration,
-) -> Result<NoisePeerTransport, String> {
+) -> Result<NoisePeerTransport, Fault> {
     let shaper = nz_shaper(routing_key, secret);
     let (mut rx, pump) = spawn_socket_pump(socket.clone(), shaper.clone());
 
@@ -329,10 +340,16 @@ pub(crate) async fn noise_connect(
         socket
             .send_to(&shaper.obfuscate(&msg1, true), relay_addr)
             .await
-            .map_err(|e| format!("nz send msg1: {e}"))?;
+            .map_err(|e| Fault::from_io(&e).context("nz send msg1"))?;
         let now = tokio::time::Instant::now();
         if now >= deadline {
-            return Err("nz: handshake timed out (no msg2)".to_string());
+            // We own this socket and saw every datagram that arrived on it, so
+            // this really is "nothing came back" rather than "something went
+            // wrong later" — the one place in a dial that can say so.
+            return Err(Fault::new(
+                Reason::NoResponse,
+                format!("nz: no msg2 within {hs_timeout:?}"),
+            ));
         }
         let wait = MSG1_RESEND.min(deadline - now);
         let attempt = tokio::time::timeout(wait, async {
@@ -351,14 +368,22 @@ pub(crate) async fn noise_connect(
         .await;
         match attempt {
             Ok(Some(m)) => break m,
-            Ok(None) => return Err("nz: datagram source closed".to_string()),
+            Ok(None) => {
+                return Err(Fault::new(
+                    Reason::TransportClosed,
+                    "nz: datagram source closed",
+                ));
+            }
             Err(_) => {} // this attempt timed out — resend msg1 and keep waiting
         }
     };
     let idx_a = u32::from_be_bytes(msg2[INDEX_LEN..2 * INDEX_LEN].try_into().unwrap());
     hs.read_message(&msg2[2 * INDEX_LEN..])?;
     if !hs.is_finished() {
-        return Err("nz: handshake unfinished after msg2".into());
+        return Err(Fault::new(
+            Reason::ProtocolViolation,
+            "nz: handshake unfinished after msg2",
+        ));
     }
     let session = Arc::new(hs.into_session()?);
     let hp_key = derive_hp_key(&session.handshake_hash);
@@ -369,7 +394,12 @@ pub(crate) async fn noise_connect(
         loop {
             let (d, _) = match rx.recv().await {
                 Some(x) => x,
-                None => return Err("nz: datagram source closed".to_string()),
+                None => {
+                    return Err(Fault::new(
+                        Reason::TransportClosed,
+                        "nz: datagram source closed",
+                    ));
+                }
             };
             if let Ok((_c, CH_AUTH, pt)) = deframe_data(&session, &hp_key, idx_b, &d) {
                 return Ok(pt);
@@ -377,7 +407,12 @@ pub(crate) async fn noise_connect(
         }
     })
     .await
-    .map_err(|_| "nz: timed out waiting for cert-auth".to_string())??;
+    .map_err(|_| {
+        Fault::new(
+            Reason::AuthTimeout,
+            format!("nz: no cert-auth within {hs_timeout:?}"),
+        )
+    })??;
     verify_cert_auth(&auth_pt, routing_key, &session.handshake_hash)?;
 
     Ok(NoisePeerTransport::spawn(NoiseChannelInit {
@@ -408,7 +443,7 @@ pub(crate) async fn noise_accept(
     identity: &Identity,
     hs_timeout: Duration,
     idle: Duration,
-) -> Result<NoisePeerTransport, String> {
+) -> Result<NoisePeerTransport, Fault> {
     // The caller's pump/dispatcher already deobfuscated incoming datagrams, so
     // `rx` carries clean framed bytes; this shaper is for our OUTGOING packets.
     let shaper = nz_shaper(&identity.routing_key, &identity.secret);
@@ -437,9 +472,12 @@ pub(crate) async fn noise_accept(
     socket
         .send_to(&shaper.obfuscate(&msg2, false), peer_addr)
         .await
-        .map_err(|e| format!("nz send msg2: {e}"))?;
+        .map_err(|e| Fault::from_io(&e).context("nz send msg2"))?;
     if !hs.is_finished() {
-        return Err("nz: handshake unfinished after msg2".into());
+        return Err(Fault::new(
+            Reason::ProtocolViolation,
+            "nz: handshake unfinished after msg2",
+        ));
     }
     let session = Arc::new(hs.into_session()?);
     let hp_key = derive_hp_key(&session.handshake_hash);
@@ -450,7 +488,7 @@ pub(crate) async fn noise_accept(
     socket
         .send_to(&shaper.obfuscate(&auth_pkt, false), peer_addr)
         .await
-        .map_err(|e| format!("nz send cert-auth: {e}"))?;
+        .map_err(|e| Fault::from_io(&e).context("nz send cert-auth"))?;
 
     Ok(NoisePeerTransport::spawn(NoiseChannelInit {
         socket,
