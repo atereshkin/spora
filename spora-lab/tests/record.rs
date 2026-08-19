@@ -15,6 +15,9 @@
 //!   `never_connected` rather than silence.
 //! - `a_direct_upgrade_is_recorded`: when the punch works, the record shows
 //!   every stage of it and the moment traffic moved onto the direct path.
+//! - `a_redial_resolves_the_relays_again`: a reconnect re-derives the relay
+//!   list rather than reusing the addresses resolved at startup — the record
+//!   is what makes that observable.
 //!
 //! Records are written from the peers' own (namespaced) threads into a
 //! per-scenario temp directory; /tmp is shared with the suite process, so the
@@ -38,6 +41,7 @@ fn main() {
             a_working_session_is_recorded,
             a_relay_that_never_answers_is_recorded_as_such,
             a_direct_upgrade_is_recorded,
+            a_redial_resolves_the_relays_again,
         ],
     );
     std::process::exit(if ok { 0 } else { 1 });
@@ -397,5 +401,94 @@ fn a_direct_upgrade_is_recorded() -> Result<(), String> {
         "record: direct path after {:?}ms",
         closed.close.as_ref().and_then(|c| c.direct_ms)
     );
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// 4. a redial re-resolves
+
+/// Relay names are re-derived on every (re)dial, not resolved once at
+/// startup. It matters for exactly the case this project exists for: a relay
+/// that moves, a hostname whose records change, and a censor that starts
+/// poisoning one name are all invisible to a client holding addresses it
+/// looked up an hour ago. The record is what makes the behaviour observable —
+/// a `relay_resolve` step tagged with the redial cycle it belongs to.
+fn a_redial_resolves_the_relays_again() -> Result<(), String> {
+    let topo = Topology::build(&TopologySpec::new(
+        NatKind::PortRestricted,
+        NatKind::PortRestricted,
+    ))?;
+    // Short relay timeouts + short protocol timings so the death of the path
+    // is detected and redialled in seconds rather than half a minute.
+    let wan = services::start_wan(&topo.wan, || {
+        relay::State::with_timeouts(
+            Duration::from_secs(6),
+            Duration::from_secs(3),
+            Duration::from_millis(500),
+        )
+    })?;
+    let timings = spora_core::Timings {
+        register_interval: Duration::from_secs(1),
+        quic_idle_timeout: Duration::from_secs(3),
+        quic_keep_alive: Duration::from_secs(1),
+        reconnect_delay: Duration::from_millis(500),
+        ..Default::default()
+    };
+
+    let client_dir = fresh_dir("redial", "client")?;
+    let mut share_opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
+    share_opts.timings = timings.clone();
+    share_opts.enable_direct_upgrade = false;
+    let mut client_opts = LabPeerOpts::new(wan.relay_addr(), wan.stun_server());
+    client_opts.timings = timings;
+    client_opts.enable_direct_upgrade = false;
+    client_opts.record = Some(record_config(&client_dir));
+
+    let sharer = peers::start_sharer(&topo.sharer, &share_opts)?;
+    let mut client = peers::start_client(&topo.client, sharer.url().clone(), &client_opts)?;
+    // An active client redials a dead path; a dormant one parks instead.
+    client.set_keepalive(1);
+    client.wait_event(
+        |e| matches!(e, TunnelEvent::RelaySessionEstablished { .. }),
+        SESSION_TIMEOUT,
+    )?;
+
+    // Fresh relay socket and state: the path is dead and the client must
+    // start a new dial cycle.
+    wan.restart_relay()?;
+    client.discard_events();
+    client
+        .wait_event(
+            |e| matches!(e, TunnelEvent::Reconnected),
+            Duration::from_secs(30),
+        )
+        .map_err(|e| format!("client never reconnected after the relay restart: {e}"))?;
+
+    let rec = wait_for_record(&client_dir, "showing a completed redial", |r| {
+        r.steps
+            .iter()
+            .any(|s| s.kind == StepKind::Reconnect && s.cycle.is_some_and(|c| c >= 1))
+    })?;
+    let resolved_again = rec
+        .steps_of(StepKind::RelayResolve)
+        .any(|s| s.cycle.is_some_and(|c| c >= 1));
+    if !resolved_again {
+        return Err(format!(
+            "the redial reused the addresses resolved at startup: no relay_resolve step in a \
+             redial cycle; got [{}]",
+            summarize(&rec)
+        ));
+    }
+    // And the dial that followed belongs to the same cycle, so a reader can
+    // tell which resolution fed which attempt.
+    let dialled_again = rec
+        .steps_of(StepKind::RelayDial)
+        .any(|s| s.cycle.is_some_and(|c| c >= 1));
+    if !dialled_again {
+        return Err("no relay_dial step in a redial cycle".into());
+    }
+
+    client.stop();
+    sharer.stop();
     Ok(())
 }

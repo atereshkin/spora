@@ -1566,7 +1566,7 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
             resolving
                 .detail(format!("{} endpoint(s) to try", addrs.len()))
                 .ok();
-            Arc::new(addrs)
+            addrs
         }
         Err(e) => {
             resolving.fail_with(&e);
@@ -1612,7 +1612,11 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
     let dialer_cancel = cancel.clone();
     let dialer_knob = keepalive_knob.clone();
     let dialer_waker = keepalive_waker.clone();
-    let dialer_relays = relay_addrs.clone();
+    // The last answer DNS gave us. Every redial asks again — that is the
+    // point of re-resolving — but a resolver that has just been broken or
+    // poisoned must not cost us the addresses we already have, so this is
+    // what a failed lookup falls back to.
+    let known_relays = Arc::new(std::sync::Mutex::new(relay_addrs.clone()));
     let dialer_rec = rec.clone();
     // Which re-dial cycle a step belongs to. Without it, forty reconnects in
     // an hour are forty indistinguishable piles of steps.
@@ -1623,12 +1627,18 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         let cancel = dialer_cancel.clone();
         let knob = dialer_knob.clone();
         let waker = dialer_waker.clone();
-        let relays = dialer_relays.clone();
+        let known = known_relays.clone();
         let cycle = cycles.fetch_add(1, Ordering::Relaxed) + 1;
         let rec = dialer_rec.for_cycle(cycle as u32);
         Box::pin(async move {
             emit(&config.event_hook, TunnelEvent::Reconnecting);
             rec.mark(StepKind::Reconnect).ok();
+            // Ask DNS again for this cycle: a relay that moved, a hostname
+            // whose records changed, and a censor that started poisoning one
+            // name are all only visible if we look. Resolution stays on this
+            // task rather than a blocking pool thread — the network namespace
+            // (and any per-thread resolver state) belongs to this thread.
+            let relays = resolve_for_dial(&token.relays, &known, &rec);
             let result = dial_relays(&relays, &token, &config, cancel, knob, waker, &rec).await;
             if result.is_ok() {
                 emit(&config.event_hook, TunnelEvent::Reconnected);
@@ -1660,6 +1670,47 @@ pub async fn connect(url: Url, config: &Config) -> Result<ConnectResult, String>
         keepalive_waker,
         record: rec,
     })
+}
+
+/// Re-resolve the URL's relays for a redial, remembering the last usable
+/// answer.
+///
+/// DNS is one of the things a censor breaks, and it is broken at exactly the
+/// moment we most need to reconnect — so a failed lookup here falls back to
+/// the addresses that worked before rather than ending the cycle. Both the
+/// lookup and the fallback are recorded: "we are dialling yesterday's
+/// addresses because the resolver stopped answering" is a finding.
+fn resolve_for_dial(
+    endpoints: &[RelayEndpoint],
+    known: &std::sync::Mutex<Vec<(SocketAddr, RelayProtocol)>>,
+    rec: &Recorder,
+) -> Vec<(SocketAddr, RelayProtocol)> {
+    let step = rec.step(StepKind::RelayResolve);
+    match resolve_relays_preferring_v6(endpoints) {
+        Ok(addrs) => {
+            step.detail(format!("{} endpoint(s) to try", addrs.len()))
+                .ok();
+            *known.lock().unwrap_or_else(|e| e.into_inner()) = addrs.clone();
+            addrs
+        }
+        Err(e) => {
+            let fallback = known.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            warn!(
+                "relay resolution failed ({}); dialling {} previously resolved address(es)",
+                e,
+                fallback.len()
+            );
+            step.fail_with(&Fault::new(
+                e.reason,
+                format!(
+                    "{}; falling back to {} previously resolved address(es)",
+                    e.detail,
+                    fallback.len()
+                ),
+            ));
+            fallback
+        }
+    }
 }
 
 /// Try each relay (already ordered IPv6-first) until one bootstraps a
