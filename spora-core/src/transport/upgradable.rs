@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use log::{debug, error, info};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
 use super::IpTransport;
@@ -39,17 +39,48 @@ use super::IpTransport;
 /// upgrade arrived (channel closed or grace elapsed) — propagate the death
 /// as before.
 async fn upgrade_within_grace(
-    upgrade_rx: &mut mpsc::UnboundedReceiver<IpTransport>,
+    upgrade_rx: &mut mpsc::UnboundedReceiver<UpgradeRequest>,
     grace: Duration,
-) -> Option<IpTransport> {
+) -> Option<UpgradeRequest> {
     match tokio::time::timeout(grace, upgrade_rx.recv()).await {
         Ok(Some(new_transport)) => Some(new_transport),
         _ => None,
     }
 }
 
-/// Sender used to push an upgraded transport into the router task.
-pub type UpgradeSender = mpsc::UnboundedSender<IpTransport>;
+struct UpgradeRequest {
+    transport: IpTransport,
+    applied: oneshot::Sender<()>,
+}
+
+/// Sender used to push an upgraded transport into the router task. A
+/// successful send returns an acknowledgement which resolves only after the
+/// old path has been dropped and the router has selected the new transport.
+#[derive(Clone)]
+pub struct UpgradeSender {
+    inner: mpsc::UnboundedSender<UpgradeRequest>,
+}
+
+#[derive(Debug)]
+pub struct UpgradeSendError;
+
+impl UpgradeSender {
+    pub fn send(&self, transport: IpTransport) -> Result<oneshot::Receiver<()>, UpgradeSendError> {
+        let (applied, receiver) = oneshot::channel();
+        self.inner
+            .send(UpgradeRequest { transport, applied })
+            .map_err(|_| UpgradeSendError)?;
+        Ok(receiver)
+    }
+
+    pub async fn closed(&self) {
+        self.inner.closed().await;
+    }
+
+    pub fn is_closed(&self) -> bool {
+        self.inner.is_closed()
+    }
+}
 
 /// Create an upgradable transport backed by channel indirection.
 ///
@@ -67,7 +98,7 @@ pub fn upgradable_transport(
 ) -> (UpgradableTransport, UpgradeSender, JoinHandle<()>) {
     let (in_tx, in_rx) = mpsc::unbounded_channel::<io::Result<Vec<u8>>>();
     let (out_tx, out_rx) = mpsc::unbounded_channel::<Vec<u8>>();
-    let (upgrade_tx, upgrade_rx) = mpsc::unbounded_channel::<IpTransport>();
+    let (upgrade_tx, upgrade_rx) = mpsc::unbounded_channel::<UpgradeRequest>();
 
     let handle = tokio::spawn(transport_router(
         initial,
@@ -79,7 +110,7 @@ pub fn upgradable_transport(
 
     let transport = UpgradableTransport { in_rx, out_tx };
 
-    (transport, upgrade_tx, handle)
+    (transport, UpgradeSender { inner: upgrade_tx }, handle)
 }
 
 /// Background task that bridges between the real transport and the channels.
@@ -90,16 +121,17 @@ pub fn upgradable_transport(
 async fn transport_router(
     initial: IpTransport,
     rescue_grace: Duration,
-    mut upgrade_rx: mpsc::UnboundedReceiver<IpTransport>,
+    mut upgrade_rx: mpsc::UnboundedReceiver<UpgradeRequest>,
     in_tx: mpsc::UnboundedSender<io::Result<Vec<u8>>>,
     mut out_rx: mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
     let mut current = initial;
     loop {
         match route_one(current, rescue_grace, &mut upgrade_rx, &in_tx, &mut out_rx).await {
-            RouteResult::Upgraded(new_transport) => {
+            RouteResult::Upgraded { transport, applied } => {
                 info!("Transport upgraded to direct connection");
-                current = new_transport;
+                current = transport;
+                let _ = applied.send(());
                 // continue loop — will re-split the new transport
             }
             RouteResult::Done => return,
@@ -109,7 +141,10 @@ async fn transport_router(
 
 enum RouteResult {
     /// Got an upgrade — caller should loop with the new transport.
-    Upgraded(IpTransport),
+    Upgraded {
+        transport: IpTransport,
+        applied: oneshot::Sender<()>,
+    },
     /// Stream ended or channels closed — router should exit.
     Done,
 }
@@ -121,7 +156,7 @@ enum RouteResult {
 async fn route_one(
     transport: IpTransport,
     rescue_grace: Duration,
-    upgrade_rx: &mut mpsc::UnboundedReceiver<IpTransport>,
+    upgrade_rx: &mut mpsc::UnboundedReceiver<UpgradeRequest>,
     in_tx: &mpsc::UnboundedSender<io::Result<Vec<u8>>>,
     out_rx: &mut mpsc::UnboundedReceiver<Vec<u8>>,
 ) -> RouteResult {
@@ -131,8 +166,11 @@ async fn route_one(
         tokio::select! {
             upgrade = upgrade_rx.recv() => {
                 match upgrade {
-                    Some(new_transport) => {
-                        return RouteResult::Upgraded(new_transport);
+                    Some(upgrade) => {
+                        return RouteResult::Upgraded {
+                            transport: upgrade.transport,
+                            applied: upgrade.applied,
+                        };
                     }
                     None => {
                         // UpgradeSender dropped — no more upgrades.
@@ -160,14 +198,17 @@ async fn route_one(
                         // about to save (see UPGRADE_WAIT_AFTER_INNER_DEATH),
                         // so give the queued OR in-flight upgrade a grace
                         // window and switch instead.
-                        if let Some(new_transport) =
+                        if let Some(upgrade) =
                             upgrade_within_grace(upgrade_rx, rescue_grace).await
                         {
                             debug!(
                                 "Inner transport errored but an upgrade arrived; \
                                  switching: {e}"
                             );
-                            return RouteResult::Upgraded(new_transport);
+                            return RouteResult::Upgraded {
+                                transport: upgrade.transport,
+                                applied: upgrade.applied,
+                            };
                         }
                         if in_tx.send(Err(e)).is_err() {
                             debug!("Tunnel consumer dropped, router exiting");
@@ -178,11 +219,14 @@ async fn route_one(
                         // The inner stream ended — same situation as the
                         // error arm: a simultaneous (or one-flight-behind)
                         // upgrade must win over the old path's death.
-                        if let Some(new_transport) =
+                        if let Some(upgrade) =
                             upgrade_within_grace(upgrade_rx, rescue_grace).await
                         {
                             debug!("Inner stream ended but an upgrade arrived; switching");
-                            return RouteResult::Upgraded(new_transport);
+                            return RouteResult::Upgraded {
+                                transport: upgrade.transport,
+                                applied: upgrade.applied,
+                            };
                         }
                         debug!("Inner transport stream ended, router exiting");
                         return RouteResult::Done;
@@ -197,11 +241,14 @@ async fn route_one(
                             // sending side: an outbound packet hitting the
                             // just-closed old transport must not outrun an
                             // upgrade that is about to replace it.
-                            if let Some(new_transport) =
+                            if let Some(upgrade) =
                                 upgrade_within_grace(upgrade_rx, rescue_grace).await
                             {
                                 debug!("Router sink errored but an upgrade arrived; switching: {e}");
-                                return RouteResult::Upgraded(new_transport);
+                                return RouteResult::Upgraded {
+                                    transport: upgrade.transport,
+                                    applied: upgrade.applied,
+                                };
                             }
                             error!("Router sink send error: {}", e);
                             return RouteResult::Done;
@@ -410,6 +457,34 @@ mod tests {
             .expect("timeout")
             .unwrap();
         assert_eq!(pkt, vec![4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn upgrade_ack_means_subsequent_traffic_uses_the_new_path() {
+        let (local, mut old_handle) = mock_transport();
+        let (mut transport, upgrade_tx, _router_handle) =
+            upgradable_transport(Box::new(local), GRACE);
+        let (direct, mut direct_handle) = mock_transport();
+
+        let applied = upgrade_tx.send(Box::new(direct)).unwrap();
+        tokio::time::timeout(Duration::from_millis(100), applied)
+            .await
+            .expect("router did not acknowledge upgrade")
+            .expect("router dropped upgrade acknowledgement");
+
+        Pin::new(&mut transport).send(vec![9, 8, 7]).await.unwrap();
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), direct_handle.recv())
+                .await
+                .expect("new path received no traffic")
+                .unwrap(),
+            vec![9, 8, 7]
+        );
+        let old_path = tokio::time::timeout(Duration::from_millis(20), old_handle.recv()).await;
+        assert!(
+            !matches!(old_path, Ok(Some(_))),
+            "old path received traffic after the upgrade acknowledgement: {old_path:?}"
+        );
     }
 
     #[tokio::test]

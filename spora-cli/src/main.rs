@@ -425,6 +425,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.stun_server = stun;
             }
             config.enable_direct_upgrade = !no_direct_upgrade;
+            install_json_event_hook(&mut config, json);
             let connlog_dir = if no_conn_log {
                 None
             } else {
@@ -449,6 +450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 routing = Some(guard);
             }
             let routing_key_hex = spora_core::authz::hex_encode(&identity.routing_key);
+            let upgrade_enabled = config.enable_direct_upgrade;
             let session = share(identity, config).await?;
             if json {
                 emit_json_event(serde_json::json!({
@@ -459,6 +461,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "identity_file": path,
                     "tun_name": routing.as_ref().map(|g| g.tun_name()),
                     "record_dir": record_dir,
+                    "upgrade_enabled": upgrade_enabled,
                 }))?;
             } else {
                 println!("Share this URL with the peer that wants to connect:");
@@ -550,6 +553,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     config.stun_server = stun;
                 }
                 config.enable_direct_upgrade = !no_direct_upgrade;
+                install_json_event_hook(&mut config, json);
                 let configured_record_dir =
                     record_config(&mut config, no_record, record_dir, record_label, record_id);
                 if !json && let Some(dir) = configured_record_dir {
@@ -589,6 +593,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "event": "tunnel_ready",
                         "tun_name": actual_tun_name,
                         "record_dir": config.record.as_ref().and_then(|r| r.dir.as_ref()),
+                        "upgrade_enabled": config.enable_direct_upgrade,
                     }))?;
                 }
                 // Pump until the tunnel ends or the user stops us, then close
@@ -643,6 +648,44 @@ fn emit_json_event(value: serde_json::Value) -> Result<(), std::io::Error> {
     serde_json::to_writer(&mut stdout, &value)?;
     stdout.write_all(b"\n")?;
     stdout.flush()
+}
+
+fn install_json_event_hook(config: &mut spora_core::Config, enabled: bool) {
+    if !enabled {
+        return;
+    }
+    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
+    config.event_hook = Some(std::sync::Arc::new(move |event| {
+        let _ = sender.send(event);
+    }));
+    tokio::spawn(async move {
+        while let Some(event) = receiver.recv().await {
+            let _ = emit_json_event(tunnel_event_json(event));
+        }
+    });
+}
+
+fn tunnel_event_json(event: spora_core::TunnelEvent) -> serde_json::Value {
+    use spora_core::TunnelEvent;
+    match event {
+        TunnelEvent::RelaySessionEstablished { peer } => {
+            serde_json::json!({"v":1,"event":"relay_session_established","peer":peer})
+        }
+        TunnelEvent::DirectUpgradeSucceeded { local, peer } => serde_json::json!({
+            "v":1,"event":"direct_upgrade_succeeded","local":local,"peer":peer
+        }),
+        TunnelEvent::DirectUpgradeFailed { code, reason } => serde_json::json!({
+            "v":1,"event":"direct_upgrade_failed","code":code.as_str(),"reason":reason
+        }),
+        TunnelEvent::Reconnecting => serde_json::json!({"v":1,"event":"reconnecting"}),
+        TunnelEvent::Reconnected => serde_json::json!({"v":1,"event":"reconnected"}),
+        TunnelEvent::SessionEnded { reason } => {
+            serde_json::json!({"v":1,"event":"session_ended","reason":reason})
+        }
+        TunnelEvent::ConnLogDegraded { detail } => {
+            serde_json::json!({"v":1,"event":"conn_log_degraded","detail":detail})
+        }
+    }
 }
 
 // ---------- `spora log` ----------
@@ -1472,5 +1515,22 @@ mod automation_surface_tests {
     fn build_info_has_machine_readable_mode() {
         let args = Args::try_parse_from(["spora", "build-info", "--json"]).unwrap();
         assert!(matches!(args.mode, Mode::BuildInfo { json: true }));
+    }
+
+    #[test]
+    fn tunnel_events_have_machine_readable_path_notifications() {
+        let direct = tunnel_event_json(spora_core::TunnelEvent::DirectUpgradeSucceeded {
+            local: "192.0.2.1:1234".parse().unwrap(),
+            peer: "198.51.100.2:4321".parse().unwrap(),
+        });
+        assert_eq!(direct["event"], "direct_upgrade_succeeded");
+        assert_eq!(direct["peer"], "198.51.100.2:4321");
+
+        let failed = tunnel_event_json(spora_core::TunnelEvent::DirectUpgradeFailed {
+            code: spora_core::record::Reason::StunTimeout,
+            reason: "STUN did not answer".into(),
+        });
+        assert_eq!(failed["event"], "direct_upgrade_failed");
+        assert_eq!(failed["code"], "stun_timeout");
     }
 }

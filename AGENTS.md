@@ -220,7 +220,7 @@ Composition (client side): `QuicPeerTransport → UpgradableTransport → KeepAl
 
 ### Key Constants
 
-- STUN server: `stun.l.google.com:19302`
+- STUN server: `stun.cloudflare.com:3478`
 - Default relay: `167.71.66.250:443` (UDP, not TLS now — the relay speaks no protocol other than the magic-prefix control packets and QUIC pass-through)
 - Routing-key length: 20 bytes (fits in a QUIC v1 DCID)
 - Secret length: 16 bytes

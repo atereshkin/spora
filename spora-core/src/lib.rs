@@ -184,9 +184,9 @@ pub enum TunnelEvent {
     /// connected to the sharer). `peer` is the remote address of the QUIC
     /// connection — the relay's address when the path goes through it.
     RelaySessionEstablished { peer: SocketAddr },
-    /// A direct connection was established and handed to the transport
-    /// router. The actual swap applies on the router's next poll, so traffic
-    /// may ride the relay for a brief moment after this event fires.
+    /// A direct connection was established and the transport router
+    /// acknowledged replacing the relay path with it. Traffic submitted
+    /// after this event uses the direct path.
     DirectUpgradeSucceeded { local: SocketAddr, peer: SocketAddr },
     /// One direct-upgrade attempt failed (the upgrade task may retry).
     /// `code` is the vocabulary entry (see [`record::Reason`]) and is what
@@ -261,7 +261,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            stun_server: "stun.l.google.com:19302".into(),
+            stun_server: "stun.cloudflare.com:3478".into(),
             relays: vec![crate::identity::RelayEndpoint::new("167.71.66.250", 443)],
             protector: None,
             mtu_callback: None,
@@ -2291,9 +2291,17 @@ pub(crate) async fn try_direct_upgrade(
                     .peer(path.peer)
                     .path(PathKind::DirectPunched)
                     .carrier(meters.carrier);
-                if upgrade_sender.send(transport).is_err() {
-                    warn!("Failed to send upgrade — tunnel already closed");
-                    swap.fail(Reason::SwapFailed, "tunnel already closed");
+                let applied = match upgrade_sender.send(transport) {
+                    Ok(applied) => applied,
+                    Err(_) => {
+                        warn!("Failed to send upgrade — tunnel already closed");
+                        swap.fail(Reason::SwapFailed, "tunnel already closed");
+                        return;
+                    }
+                };
+                if applied.await.is_err() {
+                    warn!("Failed to apply upgrade — transport router stopped");
+                    swap.fail(Reason::SwapFailed, "transport router stopped");
                     return;
                 }
                 swap.ok();
