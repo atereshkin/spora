@@ -184,6 +184,16 @@ impl Default for Timings {
 /// Lifecycle notifications emitted by `share()`/`connect()` sessions.
 #[derive(Debug, Clone)]
 pub enum TunnelEvent {
+    /// A transport path is active and can carry tunnel traffic. Emitted for
+    /// the initial carrier and again after an acknowledged direct-path swap.
+    /// Unlike the older relay/direct lifecycle events, this names the exact
+    /// carrier and path and is therefore suitable for automated assertions.
+    PathActivated {
+        carrier: Carrier,
+        path: PathKind,
+        local: Option<SocketAddr>,
+        peer: SocketAddr,
+    },
     /// A relay-via QUIC session is up (sharer: peer accepted; client:
     /// connected to the sharer). `peer` is the remote address of the QUIC
     /// connection — the relay's address when the path goes through it.
@@ -1241,10 +1251,6 @@ async fn run_share_loop(
             Some((session, from_gen)) = session_rx.recv() => {
                 iteration += 1;
                 let remote_addr = session.remote_addr;
-                emit(
-                    &config.event_hook,
-                    TunnelEvent::RelaySessionEstablished { peer: remote_addr },
-                );
 
                 // Roll: the session was accepted on the CURRENT listener, so
                 // that socket is now its private endpoint — mint the next
@@ -1311,6 +1317,21 @@ async fn run_share_loop(
                 } else {
                     PathKind::Relay
                 };
+                // Kept for API compatibility; PathActivated is the precise
+                // automation surface for all carriers and path kinds.
+                emit(
+                    &config.event_hook,
+                    TunnelEvent::RelaySessionEstablished { peer: remote_addr },
+                );
+                emit(
+                    &config.event_hook,
+                    TunnelEvent::PathActivated {
+                        carrier: carrier_kind,
+                        path: path_kind,
+                        local: None,
+                        peer: remote_addr,
+                    },
+                );
                 spawn_responder_tunnel(
                     session,
                     identity.clone(),
@@ -1839,12 +1860,23 @@ async fn dial_initiator(
         fixed_mtu,
     } = session;
 
+    let carrier_kind = Carrier::of_protocol(protocol);
+    let path_kind = PathKind::of_protocol(protocol);
+    // Kept for API compatibility; PathActivated is the precise automation
+    // surface for all carriers and path kinds.
     emit(
         &config.event_hook,
         TunnelEvent::RelaySessionEstablished { peer: remote_addr },
     );
-    let carrier_kind = Carrier::of_protocol(protocol);
-    let path_kind = PathKind::of_protocol(protocol);
+    emit(
+        &config.event_hook,
+        TunnelEvent::PathActivated {
+            carrier: carrier_kind,
+            path: path_kind,
+            local: None,
+            peer: remote_addr,
+        },
+    );
     // `remote_addr` is the relay's address on a relayed carrier — the peer's
     // own address is not observable from here, and the record must not imply
     // otherwise. `path` says which it is.
@@ -2339,6 +2371,15 @@ pub(crate) async fn try_direct_upgrade(
                     &event_hook,
                     TunnelEvent::DirectUpgradeSucceeded {
                         local: path.local,
+                        peer: path.peer,
+                    },
+                );
+                emit(
+                    &event_hook,
+                    TunnelEvent::PathActivated {
+                        carrier: meters.carrier,
+                        path: PathKind::DirectPunched,
+                        local: Some(path.local),
                         peer: path.peer,
                     },
                 );

@@ -179,22 +179,29 @@ async fn main() {
     }
 
     // Optionally serve the TCP/TLS carrier alongside the UDP relay.
-    if let Some(tcp_port) = args.tcp_port {
+    let tcp_bound = if let Some(tcp_port) = args.tcp_port {
         let tcp_bind = SocketAddr::new(bind.ip(), tcp_port);
         match tokio::net::TcpListener::bind(tcp_bind).await {
             Ok(listener) => {
-                info!("tcp-relay listening on TCP {tcp_bind}");
+                let bound = listener.local_addr().unwrap_or_else(|e| {
+                    eprintln!("relay: read bound TCP address failed: {e}");
+                    process::exit(1);
+                });
+                info!("tcp-relay listening on TCP {bound}");
                 tokio::spawn(relay::tcp::serve_tcp(
                     listener,
                     relay::tcp::TcpRelayState::with_issuer_keys(issuer_keys),
                 ));
+                Some(bound)
             }
             Err(e) => {
                 eprintln!("relay: bind TCP {tcp_bind} failed: {e}");
                 process::exit(1);
             }
         }
-    }
+    } else {
+        None
+    };
 
     let socket = bind_relay_socket(bind).unwrap_or_else(|e| panic!("bind {} failed: {}", bind, e));
     let bound = socket
@@ -202,7 +209,10 @@ async fn main() {
         .unwrap_or_else(|e| panic!("read bound UDP address failed: {e}"));
     info!("dumb-relay listening on UDP {}", bound);
     if args.json {
-        println!("{}", serde_json::json!({"event":"relay_ready","udp":bound}));
+        println!(
+            "{}",
+            serde_json::json!({"event":"relay_ready","udp":bound,"tcp":tcp_bound})
+        );
         let _ = std::io::stdout().flush();
     }
     serve(socket, state).await;

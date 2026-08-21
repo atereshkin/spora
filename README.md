@@ -84,3 +84,9 @@ spora-cli record export -o run.json   # hand it to someone else
 ### Other overrides
 
 Repeatable `--stun <host:port>` options (on `share`/`use`) replace the built-in ordered STUN fallback list used for direct-path discovery; `--tcp-relay` / `--nz-relay` (on `share`) advertise alternative-carrier relay endpoints for networks that block or fingerprint QUIC (see [`relay/README.md`](relay/README.md)).
+
+With `--json`, `share` and `use` emit `path_activated` when a transport can
+carry tunnel traffic. Its `carrier` is `quic`, `tcp_tls`, or `nz`; its `path`
+is `relay`, `direct_advertised`, or `direct_punched`. The event appears for the
+initial path and again after an acknowledged punched-path swap, so automation
+and status UIs do not have to infer the active protocol from log prose.

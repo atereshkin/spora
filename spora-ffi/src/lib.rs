@@ -37,6 +37,15 @@ pub trait MtuCallback: Send + Sync {
 /// cleanly over UniFFI.
 #[derive(uniffi::Enum)]
 pub enum SporaEvent {
+    /// A transport path is active. `carrier` and `path` use the stable
+    /// diagnostic-record vocabulary (for example `nz` and
+    /// `direct_punched`).
+    PathActivated {
+        carrier: String,
+        path: String,
+        local: Option<String>,
+        peer: String,
+    },
     /// A relay-via session is up. `peer` is the remote address (the relay's
     /// address when the path goes through it).
     RelaySessionEstablished { peer: String },
@@ -61,6 +70,17 @@ impl From<spora_core::TunnelEvent> for SporaEvent {
     fn from(e: spora_core::TunnelEvent) -> Self {
         use spora_core::TunnelEvent as T;
         match e {
+            T::PathActivated {
+                carrier,
+                path,
+                local,
+                peer,
+            } => SporaEvent::PathActivated {
+                carrier: carrier.as_str().into(),
+                path: path.as_str().into(),
+                local: local.map(|address| address.to_string()),
+                peer: peer.to_string(),
+            },
             T::RelaySessionEstablished { peer } => SporaEvent::RelaySessionEstablished {
                 peer: peer.to_string(),
             },

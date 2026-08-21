@@ -672,6 +672,19 @@ fn install_json_event_hook(config: &mut spora_core::Config, enabled: bool) {
 fn tunnel_event_json(event: spora_core::TunnelEvent) -> serde_json::Value {
     use spora_core::TunnelEvent;
     match event {
+        TunnelEvent::PathActivated {
+            carrier,
+            path,
+            local,
+            peer,
+        } => serde_json::json!({
+            "v":1,
+            "event":"path_activated",
+            "carrier":carrier.as_str(),
+            "path":path.as_str(),
+            "local":local,
+            "peer":peer
+        }),
         TunnelEvent::RelaySessionEstablished { peer } => {
             serde_json::json!({"v":1,"event":"relay_session_established","peer":peer})
         }
@@ -1529,6 +1542,16 @@ mod automation_surface_tests {
 
     #[test]
     fn tunnel_events_have_machine_readable_path_notifications() {
+        let activated = tunnel_event_json(spora_core::TunnelEvent::PathActivated {
+            carrier: spora_core::record::Carrier::NoiseUdp,
+            path: spora_core::record::PathKind::DirectPunched,
+            local: Some("192.0.2.1:1234".parse().unwrap()),
+            peer: "198.51.100.2:4321".parse().unwrap(),
+        });
+        assert_eq!(activated["event"], "path_activated");
+        assert_eq!(activated["carrier"], "nz");
+        assert_eq!(activated["path"], "direct_punched");
+
         let direct = tunnel_event_json(spora_core::TunnelEvent::DirectUpgradeSucceeded {
             local: "192.0.2.1:1234".parse().unwrap(),
             peer: "198.51.100.2:4321".parse().unwrap(),

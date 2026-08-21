@@ -12,10 +12,12 @@
 //! - `TcpTls` — a TCP relay carrying end-to-end TLS (stream-native, for
 //!   transport diversity). Its E2E is `e2e_tls` over a `StreamPeerTransport`,
 //!   NOT QUIC-over-a-stream.
+//! - `NoiseUdp` — the dumb UDP relay carrying an end-to-end Noise datagram
+//!   session, for networks that fingerprint or throttle QUIC.
 //!
-//! QUIC carriers yield a [`QuicSessionExt`] (the connection + signal channel)
-//! so the caller can run the hole-punch upgrade and read the dynamic MTU; stream
-//! carriers yield `None` there (no upgrade, fixed MTU).
+//! QUIC carriers retain a quinn connection for dynamic MTU; QUIC and Noise
+//! relay carriers yield a signal channel for hole-punch upgrade. Stream
+//! carriers have neither (no upgrade, fixed MTU).
 
 use std::future::Future;
 use std::net::SocketAddr;

@@ -13,7 +13,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use futures_util::{SinkExt as _, StreamExt as _};
-use spora_core::identity::Identity;
+use spora_core::identity::{Identity, RelayEndpoint, RelayProtocol};
+use spora_core::record::{Carrier, PathKind};
 use spora_core::{CancellationToken, ExitMode, IpTransport, SessionHandler, TunnelEvent};
 use spora_lab::peers::{self, LabPeerOpts};
 use spora_lab::traffic::TrafficCmd;
@@ -420,7 +421,8 @@ async fn udp_echo_over_nz_relay() {
         spora_core::identity::RelayProtocol::NoiseUdp,
     );
 
-    // nz has no hole-punch upgrade in this stage; STUN is never hit.
+    // Keep this case on the relay path so it isolates the nz carrier; the
+    // separate matrix/transition cases cover its hole-punch upgrade.
     let mut opts = LabPeerOpts::new("127.0.0.1:0".parse().unwrap(), "stun.invalid:3478");
     opts.enable_direct_upgrade = false;
 
@@ -605,12 +607,258 @@ async fn relayless_share_with_unresolvable_advertised_host_starts() {
 
 /// Spawn a bare dumb relay on `bind` (loopback), returning its bound address.
 async fn spawn_relay(bind: &str) -> std::net::SocketAddr {
+    let (addr, _task) = spawn_relay_controlled(bind).await;
+    addr
+}
+
+async fn spawn_relay_controlled(bind: &str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
     let sock = tokio::net::UdpSocket::bind(bind)
         .await
         .unwrap_or_else(|e| panic!("bind relay {bind}: {e}"));
     let addr = sock.local_addr().unwrap();
-    tokio::spawn(relay::serve(sock, relay::State::default()));
-    addr
+    let task = tokio::spawn(relay::serve(sock, relay::State::default()));
+    (addr, task)
+}
+
+async fn assert_loopback_echo(
+    commands: &tokio::sync::mpsc::UnboundedSender<TrafficCmd>,
+    label: &str,
+) {
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    commands
+        .send(TrafficCmd::UdpEcho {
+            server: FAKE_SERVER.into(),
+            count: 5,
+            payload_len: 64,
+            respond: tx,
+        })
+        .expect("traffic pump is alive");
+    let stats = tokio::time::timeout(Duration::from_secs(10), rx)
+        .await
+        .unwrap_or_else(|_| panic!("{label}: echo timed out"))
+        .expect("traffic pump answers")
+        .unwrap_or_else(|error| panic!("{label}: echo failed: {error}"));
+    assert_eq!(stats.received, 5, "{label}: packet loss: {stats:?}");
+}
+
+fn relay_endpoint(addr: std::net::SocketAddr, protocol: RelayProtocol) -> RelayEndpoint {
+    RelayEndpoint::with_protocol(addr.ip().to_string(), addr.port(), protocol)
+}
+
+fn dead_udp_endpoint() -> std::net::SocketAddr {
+    let socket = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    socket.local_addr().unwrap()
+}
+
+/// A censored/dead QUIC endpoint must not prevent the ordered Noise carrier
+/// from bootstrapping the same share URL.
+#[tokio::test(flavor = "multi_thread")]
+async fn carrier_fallback_quic_to_noise() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let dead_quic = dead_udp_endpoint();
+    let noise_relay = spawn_relay("127.0.0.1:0").await;
+    let endpoints = vec![
+        relay_endpoint(dead_quic, RelayProtocol::UdpQuic),
+        relay_endpoint(noise_relay, RelayProtocol::NoiseUdp),
+    ];
+    let mut opts = LabPeerOpts::new(noise_relay, "127.0.0.1:3478");
+    opts.relays = endpoints;
+    opts.enable_direct_upgrade = false;
+    opts.timings.relay_dial_timeout = Duration::from_secs(1);
+
+    let (mut share_cfg, _share_events) = opts.config();
+    share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
+    let session = spora_core::share(Identity::generate(), share_cfg)
+        .await
+        .expect("mixed-carrier share starts");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (client_cfg, mut events) = opts.config();
+    let connected = tokio::time::timeout(
+        Duration::from_secs(8),
+        spora_core::connect(session.url.clone(), &client_cfg),
+    )
+    .await
+    .expect("ordered fallback stays bounded")
+    .expect("Noise succeeds after dead QUIC");
+    let event = tokio::task::spawn_blocking(move || {
+        events.wait_event(
+            |event| {
+                matches!(
+                    event,
+                    TunnelEvent::PathActivated {
+                        carrier: Carrier::NoiseUdp,
+                        path: PathKind::Relay,
+                        ..
+                    }
+                )
+            },
+            Duration::from_secs(2),
+        )
+    })
+    .await
+    .unwrap();
+    event.expect("Noise relay path activation is explicit");
+
+    let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let pump = tokio::spawn(peers::drive_client(connected, receiver));
+    assert_loopback_echo(&commands, "QUIC to Noise fallback").await;
+    drop(commands);
+    let _ = tokio::time::timeout(Duration::from_secs(5), pump).await;
+    session.abort();
+}
+
+/// When UDP is unavailable, the ordered TCP/TLS carrier must still establish
+/// an end-to-end tunnel and carry datagrams through its framed byte stream.
+#[tokio::test(flavor = "multi_thread")]
+async fn carrier_fallback_udp_to_tcp_tls() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let dead_quic = dead_udp_endpoint();
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let tcp_relay = listener.local_addr().unwrap();
+    tokio::spawn(relay::tcp::serve_tcp(
+        listener,
+        relay::tcp::TcpRelayState::new(),
+    ));
+    let endpoints = vec![
+        relay_endpoint(dead_quic, RelayProtocol::UdpQuic),
+        relay_endpoint(tcp_relay, RelayProtocol::TcpTls),
+    ];
+    let mut opts = LabPeerOpts::new(dead_quic, "127.0.0.1:3478");
+    opts.relays = endpoints;
+    opts.enable_direct_upgrade = false;
+    opts.timings.relay_dial_timeout = Duration::from_secs(1);
+
+    let (mut share_cfg, _share_events) = opts.config();
+    share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
+    let session = spora_core::share(Identity::generate(), share_cfg)
+        .await
+        .expect("mixed UDP/TCP share starts");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (client_cfg, mut events) = opts.config();
+    let connected = tokio::time::timeout(
+        Duration::from_secs(8),
+        spora_core::connect(session.url.clone(), &client_cfg),
+    )
+    .await
+    .expect("ordered UDP to TCP fallback stays bounded")
+    .expect("TCP/TLS succeeds after dead UDP");
+    let event = tokio::task::spawn_blocking(move || {
+        events.wait_event(
+            |event| {
+                matches!(
+                    event,
+                    TunnelEvent::PathActivated {
+                        carrier: Carrier::TcpTls,
+                        path: PathKind::Relay,
+                        ..
+                    }
+                )
+            },
+            Duration::from_secs(2),
+        )
+    })
+    .await
+    .unwrap();
+    event.expect("TCP/TLS relay path activation is explicit");
+
+    let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let pump = tokio::spawn(peers::drive_client(connected, receiver));
+    assert_loopback_echo(&commands, "UDP to TCP/TLS fallback").await;
+    drop(commands);
+    let _ = tokio::time::timeout(Duration::from_secs(5), pump).await;
+    session.abort();
+}
+
+/// Reconnect must re-run the whole ordered carrier list: after the active
+/// QUIC relay dies, its timed-out redial yields to Noise and traffic resumes.
+#[tokio::test(flavor = "multi_thread")]
+async fn reconnect_switches_to_next_carrier() {
+    let _ = env_logger::builder().is_test(true).try_init();
+    let (quic_relay, quic_task) = spawn_relay_controlled("127.0.0.1:0").await;
+    let noise_relay = spawn_relay("127.0.0.1:0").await;
+    let endpoints = vec![
+        relay_endpoint(quic_relay, RelayProtocol::UdpQuic),
+        relay_endpoint(noise_relay, RelayProtocol::NoiseUdp),
+    ];
+    let mut opts = LabPeerOpts::new(quic_relay, "127.0.0.1:3478");
+    opts.relays = endpoints;
+    opts.enable_direct_upgrade = false;
+    opts.timings.register_interval = Duration::from_millis(200);
+    opts.timings.relay_dial_timeout = Duration::from_millis(750);
+    opts.timings.quic_idle_timeout = Duration::from_secs(2);
+    opts.timings.keepalive_idle_threshold = Duration::from_millis(300);
+    opts.timings.keepalive_response_timeout = Duration::from_millis(300);
+    opts.timings.keepalive_inbound_grace = Duration::from_millis(200);
+    opts.timings.reconnect_delay = Duration::from_millis(100);
+
+    let (mut share_cfg, _share_events) = opts.config();
+    share_cfg.exit_mode = ExitMode::Custom(reflect_handler());
+    let session = spora_core::share(Identity::generate(), share_cfg)
+        .await
+        .expect("two-carrier share starts");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let (client_cfg, mut events) = opts.config();
+    let connected = spora_core::connect(session.url.clone(), &client_cfg)
+        .await
+        .expect("initial QUIC carrier connects");
+    connected
+        .keepalive_knob
+        .store(1, std::sync::atomic::Ordering::Relaxed);
+    if let Some(waker) = connected.keepalive_waker.lock().unwrap().take() {
+        waker.wake();
+    }
+    let initial = tokio::task::spawn_blocking(move || {
+        let event = events.wait_event(
+            |event| {
+                matches!(
+                    event,
+                    TunnelEvent::PathActivated {
+                        carrier: Carrier::Quic,
+                        path: PathKind::Relay,
+                        ..
+                    }
+                )
+            },
+            Duration::from_secs(2),
+        );
+        (events, event)
+    })
+    .await
+    .unwrap();
+    let (mut events, initial_event) = initial;
+    initial_event.expect("initial QUIC path activation");
+
+    let (commands, receiver) = tokio::sync::mpsc::unbounded_channel();
+    let pump = tokio::spawn(peers::drive_client(connected, receiver));
+    assert_loopback_echo(&commands, "before carrier loss").await;
+    quic_task.abort();
+
+    let switched = tokio::task::spawn_blocking(move || {
+        events.wait_event(
+            |event| {
+                matches!(
+                    event,
+                    TunnelEvent::PathActivated {
+                        carrier: Carrier::NoiseUdp,
+                        path: PathKind::Relay,
+                        ..
+                    }
+                )
+            },
+            Duration::from_secs(10),
+        )
+    })
+    .await
+    .unwrap();
+    switched.expect("reconnect activates the next Noise carrier");
+    assert_loopback_echo(&commands, "after carrier switch").await;
+
+    drop(commands);
+    let _ = tokio::time::timeout(Duration::from_secs(5), pump).await;
+    session.abort();
 }
 
 /// Multi-relay: with a v6 and a v4 relay both live, the sharer registers with

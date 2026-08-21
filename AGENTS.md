@@ -32,6 +32,10 @@ machine-readable account of a whole run via `Config.record` (see "Connection
 record"); the direct upgrade can be disabled via `Config.enable_direct_upgrade`
 — these exist for the lab but are usable by the apps (e.g. path-state
 display).
+`TunnelEvent::PathActivated` is the exact path-state assertion: it names the
+record-vocabulary `Carrier` and `PathKind` for the initial usable transport and
+again after an acknowledged direct swap. The CLI renders it as
+`path_activated`; UniFFI exposes the corresponding `SporaEvent`.
 
 **Reading suite results reliably.** ERROR log lines interleave between a
 scenario's name and its verdict, so `scenario X ... FAILED` is often NOT one

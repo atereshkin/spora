@@ -225,8 +225,8 @@ impl RelayProtocol {
     }
 
     /// Whether this protocol's E2E path is QUIC datagrams (vs a byte stream or a
-    /// Noise datagram session). Only QUIC carriers currently support the UDP
-    /// hole-punch direct upgrade.
+    /// Noise datagram session). QUIC and Noise relay carriers support the UDP
+    /// hole-punch direct upgrade; this predicate only describes wire shape.
     pub fn is_quic(self) -> bool {
         match self {
             RelayProtocol::UdpQuic | RelayProtocol::Direct => true,
