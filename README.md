@@ -83,4 +83,4 @@ spora-cli record export -o run.json   # hand it to someone else
 
 ### Other overrides
 
-`--stun <host:port>` (on `share`/`use`) overrides the STUN server used for direct-path discovery; `--tcp-relay` / `--nz-relay` (on `share`) advertise alternative-carrier relay endpoints for networks that block or fingerprint QUIC (see [`relay/README.md`](relay/README.md)).
+Repeatable `--stun <host:port>` options (on `share`/`use`) replace the built-in ordered STUN fallback list used for direct-path discovery; `--tcp-relay` / `--nz-relay` (on `share`) advertise alternative-carrier relay endpoints for networks that block or fingerprint QUIC (see [`relay/README.md`](relay/README.md)).

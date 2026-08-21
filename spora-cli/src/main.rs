@@ -93,10 +93,10 @@ enum Mode {
         /// combine with --relay to offer both (the client tries them in order).
         #[arg(long)]
         nz_relay: Vec<String>,
-        /// Override the STUN server (host:port) used for direct-upgrade
-        /// endpoint discovery.
+        /// Override the ordered STUN servers (host:port) used for
+        /// direct-upgrade endpoint discovery. Repeat for fallbacks.
         #[arg(long)]
-        stun: Option<String>,
+        stun: Vec<String>,
         /// Keep the session on its initial relay/carrier path instead of
         /// attempting a direct upgrade.
         #[arg(long)]
@@ -144,10 +144,10 @@ enum Mode {
     },
     Use {
         url: String,
-        /// Override the STUN server (host:port) used for direct-upgrade
-        /// endpoint discovery.
+        /// Override the ordered STUN servers (host:port) used for
+        /// direct-upgrade endpoint discovery. Repeat for fallbacks.
         #[arg(long)]
-        stun: Option<String>,
+        stun: Vec<String>,
         /// Keep the session on its initial relay/carrier path instead of
         /// attempting a direct upgrade.
         #[arg(long)]
@@ -420,9 +420,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             if !relays.is_empty() {
                 config.relays = relays;
             }
-            if let Some(stun) = stun {
-                parse_host_port(&stun).map_err(|e| format!("--stun: {}", e))?;
-                config.stun_server = stun;
+            if !stun.is_empty() {
+                for server in &stun {
+                    parse_host_port(server).map_err(|e| format!("--stun: {}", e))?;
+                }
+                config.stun_servers = stun;
             }
             config.enable_direct_upgrade = !no_direct_upgrade;
             install_json_event_hook(&mut config, json);
@@ -548,9 +550,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     );
                 }
                 let mut config = Config::default();
-                if let Some(stun) = stun {
-                    parse_host_port(&stun).map_err(|e| format!("--stun: {}", e))?;
-                    config.stun_server = stun;
+                if !stun.is_empty() {
+                    for server in &stun {
+                        parse_host_port(server).map_err(|e| format!("--stun: {}", e))?;
+                    }
+                    config.stun_servers = stun;
                 }
                 config.enable_direct_upgrade = !no_direct_upgrade;
                 install_json_event_hook(&mut config, json);
@@ -1492,6 +1496,10 @@ mod automation_surface_tests {
             "--json",
             "--record-id",
             "attempt-1",
+            "--stun",
+            "first.example:3478",
+            "--stun",
+            "second.example:53",
         ])
         .unwrap();
         match args.mode {
@@ -1500,12 +1508,14 @@ mod automation_surface_tests {
                 no_direct_upgrade,
                 json,
                 record_id,
+                stun,
                 ..
             } => {
                 assert_eq!(tun_name.as_deref(), Some("splab-deadbeef"));
                 assert!(no_direct_upgrade);
                 assert!(json);
                 assert_eq!(record_id.as_deref(), Some("attempt-1"));
+                assert_eq!(stun, ["first.example:3478", "second.example:53"]);
             }
             _ => panic!("parsed the wrong command"),
         }

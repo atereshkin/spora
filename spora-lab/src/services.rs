@@ -121,7 +121,7 @@ impl WanHandle {
     }
 
     /// The STUN responder's IPv6 endpoint (bracketed, ready for
-    /// `Config.stun_server`). Only bound under [`start_wan_dual`].
+    /// `Config.stun_servers`). Only bound under [`start_wan_dual`].
     pub fn stun_server6(&self) -> Result<String, String> {
         if !self.dual_stack {
             return Err("wan services were started v4-only (use start_wan_dual)".into());

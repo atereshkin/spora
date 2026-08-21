@@ -145,6 +145,9 @@ pub struct Timings {
     /// Initiator timeout waiting for the responder's endpoint over the
     /// signal channel.
     pub endpoint_exchange_timeout: Duration,
+    /// Per-service budget for one STUN binding query. A black-holed service
+    /// must yield quickly enough for the next configured service to be tried.
+    pub stun_query_timeout: Duration,
     /// Per-relay budget for the client's relay-via dial (handshake + accept
     /// ack). When it elapses the client fails over to the next relay, so a
     /// dead/censored relay doesn't stall the whole connect on one endpoint.
@@ -169,6 +172,7 @@ impl Default for Timings {
             punch_phase_timeout: Duration::from_secs(5),
             punch_send_interval: Duration::from_millis(300),
             endpoint_exchange_timeout: Duration::from_secs(10),
+            stun_query_timeout: Duration::from_secs(3),
             relay_dial_timeout: Duration::from_secs(8),
             keepalive_idle_threshold: Duration::from_secs(20),
             keepalive_response_timeout: Duration::from_secs(3),
@@ -220,7 +224,10 @@ fn emit(hook: &EventHook, event: TunnelEvent) {
 
 #[derive(Clone)]
 pub struct Config {
-    pub stun_server: String,
+    /// STUN services used for direct-path discovery, in fallback order. Each
+    /// service gets a bounded query attempt; the socket from the first
+    /// successful response is retained for punching.
+    pub stun_servers: Vec<String>,
     /// Relays to use, in preference order. The sharer registers with ALL of
     /// them; the client tries them IPv6-first until one bootstraps a session
     /// (so a censored/dead relay fails over to the next). A hostname that has
@@ -261,7 +268,7 @@ pub struct Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            stun_server: "stun.cloudflare.com:3478".into(),
+            stun_servers: default_stun_servers(),
             relays: vec![crate::identity::RelayEndpoint::new("167.71.66.250", 443)],
             protector: None,
             mtu_callback: None,
@@ -274,6 +281,24 @@ impl Default for Config {
             relay_token: None,
         }
     }
+}
+
+/// Built-in STUN fallback order. The first four answered from the Russian
+/// field-lab node when selected; Google remains last for networks where it is
+/// reachable. Provider diversity precedes Cloudflare's alternate port.
+pub const DEFAULT_STUN_SERVERS: &[&str] = &[
+    "stun.cloudflare.com:3478",
+    "global.stun.twilio.com:3478",
+    "stun.relay.metered.ca:80",
+    "stun.cloudflare.com:53",
+    "stun.l.google.com:19302",
+];
+
+pub fn default_stun_servers() -> Vec<String> {
+    DEFAULT_STUN_SERVERS
+        .iter()
+        .map(|server| (*server).to_owned())
+        .collect()
 }
 
 pub struct ShareSession {
@@ -1374,7 +1399,7 @@ fn spawn_responder_tunnel(
     // terminates via SignalClosed before it STUNs.
     let upgrade_task = match (config.enable_direct_upgrade, signal) {
         (true, Some(signal)) => {
-            let stun_server = config.stun_server.clone();
+            let stun_servers = config.stun_servers.clone();
             let protector = config.protector.clone();
             let mtu_cb = config.mtu_callback.clone();
             let timings = config.timings.clone();
@@ -1387,7 +1412,7 @@ fn spawn_responder_tunnel(
                 try_direct_upgrade(
                     signal,
                     upgrade_sender,
-                    &stun_server,
+                    &stun_servers,
                     role,
                     path_ipv6,
                     &protector,
@@ -1899,7 +1924,7 @@ async fn dial_initiator(
             routing_key: token.routing_key,
             secret: token.secret,
         };
-        let stun_server = config.stun_server.clone();
+        let stun_servers = config.stun_servers.clone();
         let protector = config.protector.clone();
         let mtu_cb = config.mtu_callback.clone();
         let timings = config.timings.clone();
@@ -1910,7 +1935,7 @@ async fn dial_initiator(
             try_direct_upgrade(
                 signal,
                 upgrade_sender,
-                &stun_server,
+                &stun_servers,
                 role,
                 path_ipv6,
                 &protector,
@@ -2191,7 +2216,7 @@ fn neg_err(e: TunnelError) -> DirectError {
 pub(crate) async fn try_direct_upgrade(
     mut signal: SignalChannel,
     upgrade_sender: UpgradeSender,
-    stun_server: &str,
+    stun_servers: &[String],
     role: DirectRole,
     path_ipv6: bool,
     protector: &SocketProtector,
@@ -2258,7 +2283,7 @@ pub(crate) async fn try_direct_upgrade(
             } => {
                 try_direct_as_initiator(
                     &mut signal,
-                    stun_server,
+                    stun_servers,
                     path_ipv6,
                     protector,
                     *routing_key,
@@ -2271,7 +2296,7 @@ pub(crate) async fn try_direct_upgrade(
             DirectRole::Responder { identity } => {
                 try_direct_as_responder(
                     &mut signal,
-                    stun_server,
+                    stun_servers,
                     protector,
                     identity,
                     &timings,
@@ -2407,7 +2432,7 @@ struct DirectPath {
 #[allow(clippy::too_many_arguments)]
 async fn try_direct_as_initiator(
     signal: &mut SignalChannel,
-    stun_server: &str,
+    stun_servers: &[String],
     path_ipv6: bool,
     protector: &SocketProtector,
     routing_key: [u8; ROUTING_KEY_LEN],
@@ -2415,18 +2440,15 @@ async fn try_direct_as_initiator(
     timings: &Timings,
     rec: &Recorder,
 ) -> Result<(IpTransport, DirectPath), DirectError> {
-    let stun = rec.step_now(StepKind::Stun).via(stun_server);
-    let (socket, external_addr) = match pierce_keep_socket(stun_server, protector, path_ipv6).await
-    {
-        Ok(x) => {
-            stun.local(x.1).ok();
-            x
-        }
-        Err(e) => {
-            stun.fail_with(&e);
-            return Err(DirectError::transient(e));
-        }
-    };
+    let (socket, external_addr) = pierce_keep_socket_recorded(
+        stun_servers,
+        protector,
+        path_ipv6,
+        timings.stun_query_timeout,
+        rec,
+    )
+    .await
+    .map_err(DirectError::transient)?;
     let exchange = rec
         .step_now(StepKind::EndpointExchange)
         .local(external_addr);
@@ -2571,7 +2593,7 @@ async fn try_direct_as_initiator(
 #[allow(clippy::too_many_arguments)]
 async fn try_direct_as_responder(
     signal: &mut SignalChannel,
-    stun_server: &str,
+    stun_servers: &[String],
     protector: &SocketProtector,
     identity: &Identity,
     timings: &Timings,
@@ -2590,18 +2612,15 @@ async fn try_direct_as_responder(
         }
         // Follow the initiator's family: it signaled first, so STUN (and
         // punch) in the family its endpoint lives in.
-        let stun = rec.step_now(StepKind::Stun).via(stun_server);
-        let (socket, external_addr) =
-            match pierce_keep_socket(stun_server, protector, peer_addr.is_ipv6()).await {
-                Ok(x) => {
-                    stun.local(x.1).ok();
-                    x
-                }
-                Err(e) => {
-                    stun.fail_with(&e);
-                    return Err(DirectError::transient(e));
-                }
-            };
+        let (socket, external_addr) = pierce_keep_socket_recorded(
+            stun_servers,
+            protector,
+            peer_addr.is_ipv6(),
+            timings.stun_query_timeout,
+            rec,
+        )
+        .await
+        .map_err(DirectError::transient)?;
         if let Some(sl) = conn_log {
             sl.addr(AddrKind::SharerPublic, external_addr);
         }
@@ -3065,82 +3084,163 @@ async fn punch_and_verify(
     }
 }
 
-/// Like `pierce()` but returns the UDP socket along with the addresses,
-/// so it can be reused for the direct connection (same port = same NAT mapping).
-///
-/// `prefer_ipv6` orders the resolved STUN addresses so the family matching
-/// the relay path is tried first (the punch socket is bound in the STUN
-/// address's family, and both peers must end up in the same family for the
-/// punch to work); the other family remains a fallback for STUN servers
-/// without an AAAA/A record.
-pub async fn pierce_keep_socket(
-    stun_server: &str,
+/// Try STUN services in order and retain the successful query socket for the
+/// direct connection (same socket/port = same NAT mapping). One resolved
+/// address per service gets a bounded attempt, so a black-holed provider
+/// cannot prevent later providers from being tried.
+pub async fn pierce_keep_socket_with_fallback(
+    stun_servers: &[String],
     protector: &SocketProtector,
     prefer_ipv6: bool,
+    query_timeout: Duration,
 ) -> Result<(UdpSocket, SocketAddr), Fault> {
-    let resolved: Vec<SocketAddr> = stun_server
-        .to_socket_addrs()
-        .map_err(|e| {
-            Fault::new(
-                Reason::DnsFailure,
-                format!("resolve stun {stun_server}: {e}"),
-            )
-        })?
-        .collect();
-    let mut candidates: Vec<SocketAddr> = Vec::with_capacity(resolved.len());
-    candidates.extend(resolved.iter().filter(|a| a.is_ipv6() == prefer_ipv6));
-    candidates.extend(resolved.iter().filter(|a| a.is_ipv6() != prefer_ipv6));
-    if candidates.is_empty() {
+    pierce_keep_socket_recorded(
+        stun_servers,
+        protector,
+        prefer_ipv6,
+        query_timeout,
+        &Recorder::disabled(),
+    )
+    .await
+}
+
+async fn pierce_keep_socket_recorded(
+    stun_servers: &[String],
+    protector: &SocketProtector,
+    prefer_ipv6: bool,
+    query_timeout: Duration,
+    rec: &Recorder,
+) -> Result<(UdpSocket, SocketAddr), Fault> {
+    if stun_servers.is_empty() {
         return Err(Fault::new(
             Reason::DnsNoRecords,
-            format!("stun {stun_server} resolved to no address"),
+            "no STUN services configured",
         ));
+    }
+    if query_timeout.is_zero() {
+        return Err(Fault::new(Reason::StunFailed, "STUN query timeout is zero"));
     }
 
     let mut last: Option<Fault> = None;
-    for stun_addr in candidates {
+    for stun_server in stun_servers {
+        let attempt = rec.step_now(StepKind::Stun).via(stun_server);
+        let resolved = match tokio::time::timeout(
+            query_timeout,
+            tokio::net::lookup_host(stun_server.as_str()),
+        )
+        .await
+        {
+            Ok(Ok(addresses)) => addresses.collect::<Vec<_>>(),
+            Ok(Err(error)) => {
+                let fault = Fault::new(
+                    Reason::DnsFailure,
+                    format!("resolve stun {stun_server}: {error}"),
+                );
+                attempt.fail_with(&fault);
+                last = Some(fault);
+                continue;
+            }
+            Err(_) => {
+                let fault = Fault::new(
+                    Reason::DnsFailure,
+                    format!("resolve stun {stun_server}: timed out after {query_timeout:?}"),
+                );
+                attempt.fail_with(&fault);
+                last = Some(fault);
+                continue;
+            }
+        };
+        let stun_addr = resolved
+            .iter()
+            .copied()
+            .find(|address| address.is_ipv6() == prefer_ipv6)
+            .or_else(|| resolved.first().copied());
+        let Some(stun_addr) = stun_addr else {
+            let fault = Fault::new(
+                Reason::DnsNoRecords,
+                format!("stun {stun_server} resolved to no address"),
+            );
+            attempt.fail_with(&fault);
+            last = Some(fault);
+            continue;
+        };
+
         let wildcard: std::net::IpAddr = if stun_addr.is_ipv6() {
             std::net::Ipv6Addr::UNSPECIFIED.into()
         } else {
             std::net::Ipv4Addr::UNSPECIFIED.into()
         };
-        let mut local_port = server::BASE_PORT;
-        while local_port < server::BASE_PORT + 10 {
+        let mut bound = None;
+        let mut bind_fault = None;
+        for local_port in server::BASE_PORT..server::BASE_PORT + 10 {
             let local_addr = SocketAddr::new(wildcard, local_port);
-            let udp = match tokio::net::UdpSocket::bind(&local_addr).await {
-                Ok(udp) => udp,
-                Err(e) => {
-                    last = Some(Fault::from_io(&e).context(&format!("bind {local_addr}")));
-                    local_port += 1;
-                    continue;
+            match UdpSocket::bind(local_addr).await {
+                Ok(udp) => {
+                    bound = Some((udp, local_port));
+                    break;
                 }
-            };
-            tune_udp_buffers(&udp);
-            protect_socket(protector, &udp);
-            debug!("Local addr: {}", &local_addr);
+                Err(error) => {
+                    bind_fault =
+                        Some(Fault::from_io(&error).context(&format!("bind {local_addr}")));
+                }
+            }
+        }
+        let Some((udp, local_port)) = bound else {
+            let fault = bind_fault.unwrap_or_else(|| {
+                Fault::new(Reason::BindFailed, "no STUN socket port could be tried")
+            });
+            attempt.fail_with(&fault);
+            last = Some(fault);
+            continue;
+        };
+        tune_udp_buffers(&udp);
+        protect_socket(protector, &udp);
+        debug!("STUN {stun_server} via {stun_addr}, local :{local_port}");
 
-            let mut c = StunClient::new(stun_addr);
-            // Drop the default SOFTWARE attribute ("SimpleRustStunClient"): it
-            // is a near-unique cleartext fingerprint in every binding request.
-            c.set_software(None);
-            let f = c.query_external_address_async(&udp);
-            match f.await {
-                Ok(external_addr) => return Ok((udp, external_addr)),
-                Err(e) => {
-                    // The STUN client folds "no reply" and "unusable reply"
-                    // into one error, so this cannot honestly claim the
-                    // stronger of the two.
-                    last = Some(Fault::new(
-                        Reason::StunTimeout,
-                        format!("stun query to {stun_addr} from :{local_port}: {e}"),
-                    ));
-                    local_port += 1;
-                    continue;
-                }
-            };
+        let mut client = StunClient::new(stun_addr);
+        client.set_timeout(query_timeout);
+        // Drop the default SOFTWARE attribute ("SimpleRustStunClient"): it
+        // is a near-unique cleartext fingerprint in every binding request.
+        client.set_software(None);
+        match client.query_external_address_async(&udp).await {
+            Ok(external_addr) => {
+                attempt
+                    .local(external_addr)
+                    .detail(format!("selected {stun_server} ({stun_addr})"))
+                    .ok();
+                return Ok((udp, external_addr));
+            }
+            Err(error) => {
+                // The STUN client folds "no reply" and "unusable reply"
+                // into one error, so this cannot honestly claim the stronger
+                // of the two.
+                let fault = Fault::new(
+                    Reason::StunTimeout,
+                    format!(
+                        "stun query to {stun_server} ({stun_addr}) from :{local_port}: {error}"
+                    ),
+                );
+                attempt.fail_with(&fault);
+                last = Some(fault);
+            }
         }
     }
     Err(last.unwrap_or_else(|| Fault::new(Reason::StunFailed, "no STUN candidate could be tried")))
+}
+
+/// Back-compatible single-service entry point.
+pub async fn pierce_keep_socket(
+    stun_server: &str,
+    protector: &SocketProtector,
+    prefer_ipv6: bool,
+) -> Result<(UdpSocket, SocketAddr), Fault> {
+    pierce_keep_socket_with_fallback(
+        &[stun_server.to_owned()],
+        protector,
+        prefer_ipv6,
+        Timings::default().stun_query_timeout,
+    )
+    .await
 }
 
 pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), String> {
@@ -3155,6 +3255,61 @@ pub async fn pierce(stun_server: &str) -> Result<(SocketAddr, SocketAddr), Strin
 mod tests {
     use super::*;
     use crate::e2e::{E2eSession, accept_one};
+
+    async fn answer_one_stun(socket: UdpSocket) {
+        let mut request = [0u8; 256];
+        let (length, peer) = socket.recv_from(&mut request).await.unwrap();
+        assert!(length >= 20);
+        let std::net::IpAddr::V4(peer_ip) = peer.ip() else {
+            panic!("test responder expected IPv4");
+        };
+        let mut response = Vec::with_capacity(32);
+        response.extend_from_slice(&[0x01, 0x01, 0x00, 0x0c]);
+        response.extend_from_slice(&[0x21, 0x12, 0xa4, 0x42]);
+        response.extend_from_slice(&request[8..20]);
+        response.extend_from_slice(&[0x00, 0x20, 0x00, 0x08, 0x00, 0x01]);
+        response.extend_from_slice(&(peer.port() ^ 0x2112).to_be_bytes());
+        response.extend_from_slice(
+            &(u32::from(peer_ip) ^ u32::from_be_bytes([0x21, 0x12, 0xa4, 0x42])).to_be_bytes(),
+        );
+        socket.send_to(&response, peer).await.unwrap();
+    }
+
+    #[test]
+    fn built_in_stun_order_is_provider_diverse_before_the_alternate_port() {
+        assert_eq!(
+            default_stun_servers(),
+            [
+                "stun.cloudflare.com:3478",
+                "global.stun.twilio.com:3478",
+                "stun.relay.metered.ca:80",
+                "stun.cloudflare.com:53",
+                "stun.l.google.com:19302",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn stun_query_falls_back_after_a_bounded_black_hole() {
+        let black_hole = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let responder = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let black_hole_addr = black_hole.local_addr().unwrap();
+        let responder_addr = responder.local_addr().unwrap();
+        let responder_task = tokio::spawn(answer_one_stun(responder));
+        let servers = vec![black_hole_addr.to_string(), responder_addr.to_string()];
+
+        let started = std::time::Instant::now();
+        let (socket, external) =
+            pierce_keep_socket_with_fallback(&servers, &None, false, Duration::from_millis(75))
+                .await
+                .unwrap();
+
+        assert!(started.elapsed() >= Duration::from_millis(70));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert_eq!(external.ip(), std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(external.port(), socket.local_addr().unwrap().port());
+        responder_task.await.unwrap();
+    }
 
     #[test]
     fn punch_source_recording_is_deduped_and_bounded() {
@@ -3236,10 +3391,11 @@ mod tests {
 
         let cancel = CancellationToken::new();
         let upgrade_task = tokio::spawn(async move {
+            let stun_servers = vec!["127.0.0.1:1".to_owned()];
             try_direct_upgrade(
                 a_session.signal,
                 upgrade_sender,
-                "127.0.0.1:1", // never reached: recv_endpoint fails first
+                &stun_servers, // never reached: recv_endpoint fails first
                 DirectRole::Responder { identity },
                 false,
                 &None,

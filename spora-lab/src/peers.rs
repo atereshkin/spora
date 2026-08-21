@@ -90,7 +90,9 @@ impl LabPeerOpts {
     pub fn config(&self) -> (Config, EventStream) {
         let (hook, events) = event_channel();
         let config = Config {
-            stun_server: self.stun_server.clone(),
+            // Lab scenarios name their isolated in-namespace STUN service
+            // explicitly and must never fall back to the public internet.
+            stun_servers: vec![self.stun_server.clone()],
             relays: self.relays.clone(),
             timings: self.timings.clone(),
             enable_direct_upgrade: self.enable_direct_upgrade,
