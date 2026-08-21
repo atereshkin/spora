@@ -3,9 +3,11 @@
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::time::Duration;
+use std::{io::Write as _, process};
 
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use log::info;
+use serde::Serialize;
 use tokio::net::UdpSocket;
 
 use relay::sessionlog::{SessionLog, SessionLogConfig};
@@ -14,6 +16,12 @@ use relay::{State, serve};
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Args {
+    /// Print embedded build provenance and exit instead of serving.
+    #[arg(value_enum)]
+    command: Option<Command>,
+    /// Emit machine-readable lifecycle output on stdout.
+    #[arg(long)]
+    json: bool,
     /// UDP port to bind (dual-stack wildcard unless --bind is given)
     #[arg(short, long, default_value_t = 443)]
     port: u16,
@@ -48,6 +56,34 @@ struct Args {
     tcp_port: Option<u16>,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum Command {
+    BuildInfo,
+}
+
+#[derive(Serialize)]
+struct BuildInfo {
+    version: &'static str,
+    commit: Option<&'static str>,
+    dirty: bool,
+    target: &'static str,
+    profile: &'static str,
+}
+
+fn build_info() -> BuildInfo {
+    BuildInfo {
+        version: env!("CARGO_PKG_VERSION"),
+        commit: option_env!("SPORA_BUILD_COMMIT").filter(|value| !value.is_empty()),
+        dirty: matches!(option_env!("SPORA_BUILD_DIRTY"), Some("1")),
+        target: env!("SPORA_BUILD_TARGET"),
+        profile: if cfg!(debug_assertions) {
+            "debug"
+        } else {
+            "release"
+        },
+    }
+}
+
 /// Where the session log lives when `--session-log` is not given. Prefers
 /// systemd's `$STATE_DIRECTORY` (an absolute, service-owned, writable path
 /// that systemd creates from `StateDirectory=`), so the on-by-default log
@@ -66,8 +102,23 @@ fn default_session_log_path() -> PathBuf {
 
 #[tokio::main]
 async fn main() {
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let args = Args::parse();
+    if matches!(args.command, Some(Command::BuildInfo)) {
+        let info = build_info();
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string(&info).expect("build info is serializable")
+            );
+        } else {
+            println!("relay {} ({})", info.version, info.target);
+            println!("commit: {}", info.commit.unwrap_or("unknown"));
+            println!("dirty: {}", info.dirty);
+            println!("profile: {}", info.profile);
+        }
+        return;
+    }
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info")).init();
     let bind = SocketAddr::new(
         args.bind
             .unwrap_or(std::net::IpAddr::V6(std::net::Ipv6Addr::UNSPECIFIED)),
@@ -98,7 +149,7 @@ async fn main() {
                      $STATE_DIRECTORY automatically), or pass --session-log <writable path>, \
                      or --no-session-log to run without it."
                 );
-                std::process::exit(1);
+                process::exit(1);
             }
         }
     } else {
@@ -115,7 +166,7 @@ async fn main() {
         .collect::<Result<Vec<_>, _>>()
         .unwrap_or_else(|e| {
             eprintln!("relay: invalid --issuer-key: {e}");
-            std::process::exit(1);
+            process::exit(1);
         });
     if issuer_keys.is_empty() {
         info!("authorization DISABLED (open mode): any valid registration is accepted");
@@ -140,13 +191,20 @@ async fn main() {
             }
             Err(e) => {
                 eprintln!("relay: bind TCP {tcp_bind} failed: {e}");
-                std::process::exit(1);
+                process::exit(1);
             }
         }
     }
 
     let socket = bind_relay_socket(bind).unwrap_or_else(|e| panic!("bind {} failed: {}", bind, e));
-    info!("dumb-relay listening on UDP {}", bind);
+    let bound = socket
+        .local_addr()
+        .unwrap_or_else(|e| panic!("read bound UDP address failed: {e}"));
+    info!("dumb-relay listening on UDP {}", bound);
+    if args.json {
+        println!("{}", serde_json::json!({"event":"relay_ready","udp":bound}));
+        let _ = std::io::stdout().flush();
+    }
     serve(socket, state).await;
 }
 
@@ -166,4 +224,23 @@ fn bind_relay_socket(bind: SocketAddr) -> std::io::Result<UdpSocket> {
     socket.set_nonblocking(true)?;
     socket.bind(&bind.into())?;
     UdpSocket::from_std(socket.into())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn machine_interfaces_are_additive_to_the_server_cli() {
+        let build = Args::try_parse_from(["relay", "build-info", "--json"]).unwrap();
+        assert!(matches!(build.command, Some(Command::BuildInfo)));
+        assert!(build.json);
+
+        let serve =
+            Args::try_parse_from(["relay", "--bind", "127.0.0.1", "--port", "8443", "--json"])
+                .unwrap();
+        assert!(serve.command.is_none());
+        assert_eq!(serve.port, 8443);
+        assert!(serve.json);
+    }
 }

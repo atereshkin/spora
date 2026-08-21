@@ -97,6 +97,10 @@ enum Mode {
         /// endpoint discovery.
         #[arg(long)]
         stun: Option<String>,
+        /// Keep the session on its initial relay/carrier path instead of
+        /// attempting a direct upgrade.
+        #[arg(long)]
+        no_direct_upgrade: bool,
         /// Capability token authorizing this sharer to use the relay(s), when
         /// the relay requires one. Accepts a base64url token (as printed by
         /// `spora-issuer issue`) or a path to a file containing it. Not needed
@@ -134,6 +138,9 @@ enum Mode {
         /// a test run.
         #[arg(long, conflicts_with = "no_record")]
         record_id: Option<String>,
+        /// Emit newline-delimited JSON lifecycle events on stdout.
+        #[arg(long)]
+        json: bool,
     },
     Use {
         url: String,
@@ -141,6 +148,14 @@ enum Mode {
         /// endpoint discovery.
         #[arg(long)]
         stun: Option<String>,
+        /// Keep the session on its initial relay/carrier path instead of
+        /// attempting a direct upgrade.
+        #[arg(long)]
+        no_direct_upgrade: bool,
+        /// Attach to this pre-created TUN instead of creating an anonymous
+        /// interface. The caller owns its address, MTU, routes and cleanup.
+        #[arg(long)]
+        tun_name: Option<String>,
         /// Don't keep a diagnostic record of how the connection went.
         #[arg(long)]
         no_record: bool,
@@ -155,6 +170,15 @@ enum Mode {
         /// run.
         #[arg(long, conflicts_with = "no_record")]
         record_id: Option<String>,
+        /// Emit newline-delimited JSON lifecycle events on stdout.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Print the source/build identity embedded in this executable.
+    BuildInfo {
+        /// Emit the complete build identity as JSON.
+        #[arg(long)]
+        json: bool,
     },
     /// Inspect the share's connection log (see docs/connection-logging.md).
     Log {
@@ -343,6 +367,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             tcp_relay,
             nz_relay,
             stun,
+            no_direct_upgrade,
             relay_token,
             no_conn_log,
             conn_log_dir,
@@ -352,6 +377,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             record_dir,
             record_label,
             record_id,
+            json,
         } => {
             let path = identity_file.unwrap_or_else(default_identity_path);
             let identity = load_or_create_identity(&path, fresh)?;
@@ -398,6 +424,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 parse_host_port(&stun).map_err(|e| format!("--stun: {}", e))?;
                 config.stun_server = stun;
             }
+            config.enable_direct_upgrade = !no_direct_upgrade;
             let connlog_dir = if no_conn_log {
                 None
             } else {
@@ -423,38 +450,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
             let routing_key_hex = spora_core::authz::hex_encode(&identity.routing_key);
             let session = share(identity, config).await?;
-            println!("Share this URL with the peer that wants to connect:");
-            println!("{}", session.url);
-            println!("(Identity persisted at {})", path.display());
-            println!(
-                "Routing key: {} (give this to your relay operator if the relay requires authorization)",
-                routing_key_hex
-            );
-            if let Some(g) = &routing {
+            if json {
+                emit_json_event(serde_json::json!({
+                    "v": 1,
+                    "event": "share_ready",
+                    "url": session.url.as_str(),
+                    "routing_key": routing_key_hex,
+                    "identity_file": path,
+                    "tun_name": routing.as_ref().map(|g| g.tun_name()),
+                    "record_dir": record_dir,
+                }))?;
+            } else {
+                println!("Share this URL with the peer that wants to connect:");
+                println!("{}", session.url);
+                println!("(Identity persisted at {})", path.display());
                 println!(
-                    "OS routing enabled: client traffic is forwarded by the kernel via {}.",
-                    g.tun_name()
+                    "Routing key: {} (give this to your relay operator if the relay requires authorization)",
+                    routing_key_hex
                 );
+                if let Some(g) = &routing {
+                    println!(
+                        "OS routing enabled: client traffic is forwarded by the kernel via {}.",
+                        g.tun_name()
+                    );
+                }
+                match &connlog_dir {
+                    Some(dir) => println!(
+                        "Connection log: {} (retention {} days; query with `spora log`, disable with --no-conn-log)",
+                        dir.display(),
+                        conn_log_retention_days
+                    ),
+                    None => println!(
+                        "Connection log DISABLED: you will have no record of what clients did with your IP."
+                    ),
+                }
+                if let Some(dir) = &record_dir {
+                    println!(
+                        "Diagnostic record: {} (read it with `spora record`, disable with --no-record)",
+                        dir.display()
+                    );
+                }
+                println!("Press Ctrl+C to stop sharing.");
             }
-            match &connlog_dir {
-                Some(dir) => println!(
-                    "Connection log: {} (retention {} days; query with `spora log`, disable with --no-conn-log)",
-                    dir.display(),
-                    conn_log_retention_days
-                ),
-                None => println!(
-                    "Connection log DISABLED: you will have no record of what clients did with your IP."
-                ),
-            }
-            if let Some(dir) = &record_dir {
-                println!(
-                    "Diagnostic record: {} (read it with `spora record`, disable with --no-record)",
-                    dir.display()
-                );
-            }
-            println!("Press Ctrl+C to stop sharing.");
             wait_for_shutdown().await?;
-            println!("Stopping share session...");
+            if json {
+                emit_json_event(serde_json::json!({"v": 1, "event": "stopping"}))?;
+            } else {
+                println!("Stopping share session...");
+            }
             session.stop().await;
             // `routing` (if any) drops here, after the session has stopped,
             // running OsRoute's cleanup. Dropping at scope end — rather than an
@@ -465,14 +508,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Mode::Use {
             url,
             stun,
+            no_direct_upgrade,
+            tun_name,
             no_record,
             record_dir,
             record_label,
             record_id,
+            json,
         } => {
             #[cfg(windows)]
             {
-                let _ = (url, stun, no_record, record_dir, record_label, record_id);
+                let _ = (
+                    url,
+                    stun,
+                    no_direct_upgrade,
+                    tun_name,
+                    no_record,
+                    record_dir,
+                    record_label,
+                    record_id,
+                    json,
+                );
                 return Err(
                     "The 'use' mode is not supported on Windows yet (requires a TUN device)."
                         .into(),
@@ -493,9 +549,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     parse_host_port(&stun).map_err(|e| format!("--stun: {}", e))?;
                     config.stun_server = stun;
                 }
-                if let Some(dir) =
-                    record_config(&mut config, no_record, record_dir, record_label, record_id)
-                {
+                config.enable_direct_upgrade = !no_direct_upgrade;
+                let configured_record_dir =
+                    record_config(&mut config, no_record, record_dir, record_label, record_id);
+                if !json && let Some(dir) = configured_record_dir {
                     println!("Diagnostic record: {}", dir.display());
                 }
                 let result = match connect(url, &config).await {
@@ -514,7 +571,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 if let Some(w) = result.keepalive_waker.lock().unwrap().take() {
                     w.wake();
                 }
-                let tun = Tun::builder().name("").up().try_build().unwrap();
+                let tun = match tun_name {
+                    Some(ref name) => Tun::builder()
+                        .name(name)
+                        .try_build()
+                        .map_err(|e| format!("could not attach TUN {name}: {e}"))?,
+                    None => Tun::builder()
+                        .name("")
+                        .up()
+                        .try_build()
+                        .map_err(|e| format!("could not create TUN: {e}"))?,
+                };
+                let actual_tun_name = tun.name().to_string();
+                if json {
+                    emit_json_event(serde_json::json!({
+                        "v": 1,
+                        "event": "tunnel_ready",
+                        "tun_name": actual_tun_name,
+                        "record_dir": config.record.as_ref().and_then(|r| r.dir.as_ref()),
+                    }))?;
+                }
                 // Pump until the tunnel ends or the user stops us, then close
                 // the record explicitly: a process killed mid-run leaves a
                 // truncated record, which is honest but much less useful than
@@ -524,7 +600,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 let mut pump = tokio::spawn(tun_util::start(result.transport, tun));
                 tokio::select! {
                     _ = wait_for_shutdown() => {
-                        println!("Stopping...");
+                        if json {
+                            emit_json_event(serde_json::json!({"v": 1, "event": "stopping"}))?;
+                        } else {
+                            println!("Stopping...");
+                        }
                         cancel.cancel();
                         record.close_shutdown(Some(spora_core::record::Reason::LocalShutdown));
                     }
@@ -538,8 +618,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Mode::Log { cmd } => run_log_cmd(cmd)?,
         Mode::Record { cmd } => run_record_cmd(cmd)?,
+        Mode::BuildInfo { json } => {
+            let build = spora_core::record::build_info();
+            if json {
+                println!("{}", serde_json::to_string(&build)?);
+            } else {
+                println!(
+                    "{} {}{} ({} {})",
+                    build.version,
+                    build.commit.as_deref().unwrap_or("unknown commit"),
+                    if build.dirty { " +uncommitted" } else { "" },
+                    build.target,
+                    build.profile
+                );
+            }
+        }
     }
     Ok(())
+}
+
+fn emit_json_event(value: serde_json::Value) -> Result<(), std::io::Error> {
+    use std::io::Write;
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer(&mut stdout, &value)?;
+    stdout.write_all(b"\n")?;
+    stdout.flush()
 }
 
 // ---------- `spora log` ----------
@@ -1327,5 +1430,47 @@ mod identity_persistence_tests {
         assert!(leftover.is_empty(), "temp file leaked: {:?}", leftover);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod automation_surface_tests {
+    use super::*;
+
+    #[test]
+    fn use_accepts_named_tun_json_and_direct_upgrade_control() {
+        let args = Args::try_parse_from([
+            "spora",
+            "use",
+            "https://spora.to/s/token?r=127.0.0.1:443",
+            "--tun-name",
+            "splab-deadbeef",
+            "--no-direct-upgrade",
+            "--json",
+            "--record-id",
+            "attempt-1",
+        ])
+        .unwrap();
+        match args.mode {
+            Mode::Use {
+                tun_name,
+                no_direct_upgrade,
+                json,
+                record_id,
+                ..
+            } => {
+                assert_eq!(tun_name.as_deref(), Some("splab-deadbeef"));
+                assert!(no_direct_upgrade);
+                assert!(json);
+                assert_eq!(record_id.as_deref(), Some("attempt-1"));
+            }
+            _ => panic!("parsed the wrong command"),
+        }
+    }
+
+    #[test]
+    fn build_info_has_machine_readable_mode() {
+        let args = Args::try_parse_from(["spora", "build-info", "--json"]).unwrap();
+        assert!(matches!(args.mode, Mode::BuildInfo { json: true }));
     }
 }
