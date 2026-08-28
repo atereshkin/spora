@@ -47,6 +47,25 @@ jobs:
       - name: Check spora-ffi for Android
         run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk -t arm64-v8a check -p spora-ffi
 
+  docs:
+    # The published CLI book (docs-site/, served at spora.to/docs/) must
+    # keep building: a page missing from SUMMARY.md or broken markdown
+    # should fail here, not during a website deploy. The reference page's
+    # freshness against the clap definitions is a unit test in spora-cli
+    # (docs.rs), covered by the test job.
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: docs
+          cache-on-failure: true
+      - name: Install mdBook
+        run: command -v mdbook >/dev/null || cargo install mdbook --locked --version 0.5.4
+      - run: mdbook build docs-site
+
   cli-windows:
     # `spora use` is a full VPN client on Windows (wintun + IP Helper);
     # nothing else builds the workspace for a Windows target, so this job

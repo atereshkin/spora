@@ -1,0 +1,77 @@
+/* Spora site look for the mdBook default (light) theme: palette and type
+   from spora-web/static/css/style.css. */
+:root {
+    --spora-bg-cream: #F2F1ED;
+    --spora-green-forest: #1B4332;
+    --spora-green-leaf: #2D6A4F;
+    --spora-green-apple: #95D5B2;
+    --spora-green-lime: #B7E4C7;
+    --spora-text-main: #2C362F;
+    --spora-text-muted: #5E6E60;
+    --spora-font-display: 'Inter', system-ui, -apple-system, sans-serif;
+    --spora-font-mono: 'Space Mono', 'Courier New', monospace;
+}
+
+.light,
+html:not(.js) {
+    --bg: var(--spora-bg-cream);
+    --fg: var(--spora-text-main);
+    --sidebar-bg: #ECEAE4;
+    --sidebar-fg: var(--spora-text-main);
+    --sidebar-active: var(--spora-green-leaf);
+    --scrollbar: var(--spora-text-muted);
+    --icons: var(--spora-text-muted);
+    --icons-hover: var(--spora-green-forest);
+    --links: var(--spora-green-leaf);
+    --inline-code-color: var(--spora-green-forest);
+    --searchbar-border-color: var(--spora-text-muted);
+    --searchresults-header-fg: var(--spora-text-muted);
+    --searchresults-border-color: var(--spora-green-apple);
+    --color-scheme: light;
+    --quote-bg: #ECEAE4;
+    --quote-border: var(--spora-green-apple);
+    --table-border-color: var(--spora-green-lime);
+    --table-header-bg: #ECEAE4;
+    --table-alternate-bg: #EDEBE6;
+    --theme-popup-bg: var(--spora-bg-cream);
+    --theme-popup-border: var(--spora-green-apple);
+    --theme-hover: var(--spora-green-lime);
+}
+
+html, body {
+    font-family: var(--spora-font-display);
+}
+
+h1, h2, h3, h4, h5 {
+    color: var(--spora-green-forest);
+    font-family: var(--spora-font-display);
+    font-weight: 700;
+}
+
+code, pre, .hljs {
+    font-family: var(--spora-font-mono);
+}
+
+.light .hljs {
+    background: #ECEAE4;
+    color: var(--spora-text-main);
+}
+
+.menu-title {
+    color: var(--spora-green-forest);
+    font-weight: 700;
+    letter-spacing: 0.06em;
+}
+
+/* The injected "spora.to" brand link (theme/spora.js). */
+.spora-home-link {
+    color: var(--spora-green-forest);
+    font-weight: 700;
+    text-decoration: none;
+    margin-left: 0.5rem;
+    align-self: center;
+}
+
+.spora-home-link:hover {
+    color: var(--spora-green-leaf);
+}

@@ -1,0 +1,19 @@
+[book]
+title = "Spora CLI"
+description = "Guide and reference for the Spora command-line client"
+authors = ["Spora"]
+language = "en"
+src = "src"
+
+[output.html]
+# The site is light-only by design; keep the book on the matching theme.
+default-theme = "light"
+preferred-dark-theme = "light"
+additional-css = ["theme/spora.css"]
+additional-js = ["theme/spora.js"]
+site-url = "/docs/"
+git-repository-url = "https://github.com/atereshkin/spora"
+edit-url-template = "https://github.com/atereshkin/spora/edit/main/docs-site/{path}"
+
+[output.html.search]
+limit-results = 20

@@ -6,6 +6,9 @@ use spora_core::{Config, connect, identity::Identity, share};
 use std::path::PathBuf;
 use url::Url;
 
+/// The generated command reference (docs-site) and its freshness test.
+#[cfg(test)]
+mod docs;
 /// Share-side netstack bypass (`spora share --os-routing`): Linux only (it
 /// drives iptables and kernel forwarding).
 #[cfg(target_os = "linux")]
@@ -79,7 +82,7 @@ enum Mode {
         #[arg(long)]
         relay: Vec<String>,
         /// Advertise a relay-less DIRECT endpoint (host:port) clients can dial
-        /// straight to this sharer — no relay, no relay bandwidth. The sharer
+        /// straight to this sharer: no relay, no relay bandwidth. The sharer
         /// binds this port, so it must be publicly reachable. Repeat for
         /// several advertised addresses (they must share one port). Combine
         /// with --relay for a mix, or use alone for pure relay-less sharing.
@@ -92,7 +95,7 @@ enum Mode {
         #[arg(long)]
         tcp_relay: Vec<String>,
         /// Advertise a Noise UDP (`nz`) relay endpoint (host:port): the dumb UDP
-        /// relay carrying an end-to-end Noise datagram session — a high-entropy,
+        /// relay carrying an end-to-end Noise datagram session, a high-entropy,
         /// non-QUIC-shaped transport for networks that fingerprint or throttle
         /// QUIC. Point it at a relay on a non-443 UDP port. Repeat for several;
         /// combine with --relay to offer both (the client tries them in order).
@@ -114,7 +117,7 @@ enum Mode {
         relay_token: Option<String>,
         /// Disable the connection log. By default the sharer keeps a local
         /// per-flow record (who connected to which destination, when) at
-        /// $XDG_STATE_HOME/spora/connlog/<routing-key>/ — the sharer's own
+        /// $XDG_STATE_HOME/spora/connlog/<routing-key>/, the sharer's own
         /// egress accountability record for answering abuse reports.
         #[arg(long)]
         no_conn_log: bool,
@@ -139,7 +142,7 @@ enum Mode {
         /// Label this machine in every record it writes.
         #[arg(long, conflicts_with = "no_record")]
         record_label: Option<String>,
-        /// Tie the records from this run to something outside it — a ticket,
+        /// Tie the records from this run to something outside it: a ticket,
         /// a test run.
         #[arg(long, conflicts_with = "no_record")]
         record_id: Option<String>,
@@ -147,7 +150,12 @@ enum Mode {
         #[arg(long)]
         json: bool,
     },
+    /// Connect through a share URL. By default this is a full VPN client:
+    /// it brings up the tunnel interface, routes traffic through it, sets
+    /// the resolver, follows the path's MTU, and restores everything on
+    /// exit. Needs root (Administrator on Windows), except with --tun-name.
     Use {
+        /// The share URL (https://spora.to/s/...) received from the sharer.
         url: String,
         /// Override the ordered STUN servers (host:port) used for
         /// direct-upgrade endpoint discovery. Repeat for fallbacks.
@@ -203,7 +211,7 @@ enum Mode {
         /// Label this machine in every record it writes.
         #[arg(long, conflicts_with = "no_record")]
         record_label: Option<String>,
-        /// Tie this run's record to something outside it — a ticket, a test
+        /// Tie this run's record to something outside it: a ticket, a test
         /// run.
         #[arg(long, conflicts_with = "no_record")]
         record_id: Option<String>,
@@ -251,7 +259,7 @@ enum RecordCmd {
         id: Option<String>,
         #[arg(long)]
         dir: Option<PathBuf>,
-        /// Machine-readable JSON output — the whole record, folded.
+        /// Machine-readable JSON output: the whole record, folded.
         #[arg(long)]
         json: bool,
         /// Include the quality samples taken while the tunnel was up.

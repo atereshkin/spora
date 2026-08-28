@@ -673,15 +673,22 @@ pub async fn run_pump(
 pub(crate) fn acquire_instance_lock(path: &str) -> Result<std::fs::File, String> {
     use std::os::unix::io::AsRawFd as _;
     let p = std::path::Path::new(path);
+    let needs_root = |e: &std::io::Error| {
+        if e.kind() == std::io::ErrorKind::PermissionDenied {
+            "; the VPN mode needs root: run `sudo spora use ...`, or attach to a pre-configured interface with --tun-name"
+        } else {
+            ""
+        }
+    };
     if let Some(dir) = p.parent() {
         std::fs::create_dir_all(dir)
-            .map_err(|e| format!("cannot create {}: {e}", dir.display()))?;
+            .map_err(|e| format!("cannot create {}: {e}{}", dir.display(), needs_root(&e)))?;
     }
     let f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .open(p)
-        .map_err(|e| format!("cannot open {path}: {e}"))?;
+        .map_err(|e| format!("cannot open {path}: {e}{}", needs_root(&e)))?;
     if unsafe { libc::flock(f.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
         return Err(format!(
             "another `spora use` instance appears to be running ({path} is locked); stop it first, or use --tun-name for a second, self-managed tunnel"
