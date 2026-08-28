@@ -55,7 +55,20 @@ pub use relay_client::authz;
 /// converged. The application can use this to configure its TUN device.
 pub type MtuCallback = Option<Arc<dyn Fn(u16) + Send + Sync>>;
 
-pub type SocketProtector = Option<Arc<dyn Fn(i32) + Send + Sync>>;
+/// The OS handle of a freshly bound outer socket, as handed to a
+/// [`SocketProtector`]: the raw fd on Unix, the raw `SOCKET` on Windows.
+#[cfg(unix)]
+pub type SocketHandle = i32;
+/// The OS handle of a freshly bound outer socket, as handed to a
+/// [`SocketProtector`]: the raw fd on Unix, the raw `SOCKET` on Windows.
+#[cfg(windows)]
+pub type SocketHandle = u64;
+
+/// Called with every outer (relay/STUN/punch/TCP) socket the core creates,
+/// before it is used, so the platform can keep it out of its own tunnel:
+/// `VpnService.protect()` on Android, `IP_BOUND_IF` on macOS, `SO_MARK` +
+/// policy routing on Linux, `IP_UNICAST_IF` on Windows.
+pub type SocketProtector = Option<Arc<dyn Fn(SocketHandle) + Send + Sync>>;
 
 /// Future driving one share-side session; it should resolve when the session
 /// ends (transport closed/errored) or its cancellation token fires.
@@ -82,21 +95,31 @@ pub enum ExitMode {
     Custom(SessionHandler),
 }
 
-/// Call the protector callback with the socket's raw fd (unix only).
-pub fn protect_socket(protector: &SocketProtector, _socket: &UdpSocket) {
-    #[cfg(unix)]
+/// Call the protector callback with the socket's OS handle.
+pub fn protect_socket(protector: &SocketProtector, socket: &UdpSocket) {
     if let Some(f) = protector {
-        use std::os::unix::io::AsRawFd;
-        f(_socket.as_raw_fd());
+        f(raw_socket_handle(socket));
     }
 }
 
-fn apply_protector_to_std(protector: &SocketProtector, _socket: &std::net::UdpSocket) {
-    #[cfg(unix)]
+fn apply_protector_to_std(protector: &SocketProtector, socket: &std::net::UdpSocket) {
     if let Some(f) = protector {
-        use std::os::unix::io::AsRawFd;
-        f(_socket.as_raw_fd());
+        f(raw_socket_handle(socket));
     }
+}
+
+/// The platform's raw handle for a socket, in the form a [`SocketProtector`]
+/// receives.
+#[cfg(unix)]
+pub(crate) fn raw_socket_handle(socket: &impl std::os::unix::io::AsRawFd) -> SocketHandle {
+    socket.as_raw_fd()
+}
+
+/// The platform's raw handle for a socket, in the form a [`SocketProtector`]
+/// receives.
+#[cfg(windows)]
+pub(crate) fn raw_socket_handle(socket: &impl std::os::windows::io::AsRawSocket) -> SocketHandle {
+    socket.as_raw_socket()
 }
 
 pub struct ConnectResult {

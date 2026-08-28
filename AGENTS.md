@@ -55,7 +55,7 @@ serially on a quiet machine rather than re-running the full suite a few times.
 Workspace members (resolver v3):
 
 - **spora-core** — Core library. Exposes `share()` (sharer mode) and `connect(url)` (client mode). Contains all networking logic.
-- **spora-cli** — CLI binary with `spora share` and `spora use <URL>` subcommands. Uses `tokio-tun` for TUN device on Unix. `spora share --os-routing` enables the privileged netstack bypass (see "Share-side exit modes"). `--relay <host:port>` (share) and `--stun <host:port>` (share/use) override the built-in endpoints.
+- **spora-cli** — CLI binary with `spora share` and `spora use <URL>` subcommands, building on Linux, macOS and Windows. `spora use` is a full VPN client (see "Client VPN mode"); `spora share --os-routing` enables the privileged netstack bypass (see "Share-side exit modes", Linux only). `--relay <host:port>` (share) and `--stun <host:port>` (share/use) override the built-in endpoints.
 - **spora-ffi** — Uniffi-based FFI for Android/JNI. Wraps core functions for Kotlin. Builds as `cdylib`.
 - **spora-wincore**, **spora-winui** — Windows service + UI.
 - **relay** — Dumb UDP relay (both `lib.rs` for use in tests and `main.rs` for the deployed binary). Forwards packets between peers by inspecting QUIC long-header DCIDs and tracking a small flow table. Speaks no QUIC, holds no TLS keys.
@@ -130,6 +130,61 @@ The CLI implements OS routing on top of `Custom` (`spora share --os-routing`, pl
 - **Client source addresses are learned, not assumed — but must be private.** Each platform picks its own client TUN address (e.g. wincore uses 10.0.85.1), so the pump learns inner source IPs from forwarded packets and installs a `/32` (v6: `/128`) route + scoped MASQUERADE rule per peer (cap 64, shared across families). The source is client-controlled, so it is **restricted to RFC1918/CGNAT** (`is_private_client_source`) for v4 and **ULA fc00::/7 only** (`is_ula_client_source`) for v6; a public source would otherwise install a route that hijacks the sharer's own egress to that address. A learned source that collides with a directly-connected host route (the sharer's own LAN) is also refused (route-table check, per family).
 - Destinations matching `is_local_address` are dropped (parity with the netstack's `block_local`); ICMPv6 echoes to blocked v6 destinations are answered locally like the v4 ones (mandatory pseudo-header checksum). IPv6 is carried in **both** directions; the host→client pump filters frames whose v6 src/dst is link-local or multicast (the kernel's RS/NS/MLD/DAD chatter must not leak to the peer). The TUN gets a ULA from `--tun-addr6` (default `fd00:5350::1/64`).
 - NAT setup at startup applies v4+v6 forwarding sysctls, FORWARD accepts, and TCP MSS clamp to the TUN MTU (v6 clamp = MTU−60) via iptables AND ip6tables; the per-peer scoped MASQUERADE is added lazily in `learn_peer` when each client source is first seen. All of it is undone on exit; `--no-nat` skips it. Cleanup runs from `OsRoute`'s `Drop`, so it fires on Ctrl+C (SIGINT), SIGTERM, error returns, and panics.
+
+### Client VPN mode (`spora use`, `spora-cli/src/vpn/`)
+
+Without `--tun-name`, `spora use` is a turnkey VPN client on Linux, macOS and
+Windows (privileged: root / Administrator). The bring-up is two-phase, exactly
+like the Android client: TUN with address+MTU but NO routes → `connect()` (the
+relay dial and STUN use the normal network) → routes + DNS. One managed
+instance at a time: a session-long `flock` (`/run/spora/use.lock`,
+`/var/db/spora/use.lock`; Windows: the exclusive adapter name) gates the
+startup sweep — flock dies with the process, so leftovers become sweepable
+exactly when sweeping is safe. Key invariants:
+
+- **The host's default route is never modified.** Linux: routes live in table
+  0x5350 behind two policy rules (`pref 21327` = main-table-minus-default,
+  `pref 21328` = `not fwmark 0x5350` → table; the wg-quick model). macOS and
+  Windows: half-default routes (`0/1`+`128/1`, `::/1`+`8000::/1`) that win by
+  prefix length. Stale rules/DNS from a crashed run are swept at next start.
+- **Every outer socket the core opens goes through `Config.protector`** and is
+  kept off the tunnel *by mechanism, not by destination* (the punched peer is
+  not known when routes are installed): `SO_MARK 0x5350` on Linux,
+  `IP_BOUND_IF` (macOS) / `IP_UNICAST_IF` (Windows) to the uplink interface,
+  which is re-detected on every `Reconnecting` event. `SocketProtector` takes
+  a `SocketHandle` (fd on Unix, `SOCKET` on Windows) for this.
+- **MTU follows `Config.mtu_callback`** (the carrier's datagram budget,
+  re-reported after a direct upgrade): TUN MTU = report, floored at 576 — or
+  at 1280 while the TUN carries IPv6 (below that the kernel disables v6; the
+  tunnel layer fragments what the carrier can't fit). `--mtu` pins it. JSON
+  events: `path_mtu` (reported) and `tun_mtu` (applied).
+- **DNS defaults to 8.8.8.8 + 1.1.1.1 through the tunnel** (must be public —
+  the exit drops private destinations); in split-tunnel mode the resolvers'
+  host routes are installed alongside the `--route` prefixes so DNS never
+  leaves in cleartext. Linux tiers: systemd-resolved (`resolvectl`, only
+  when resolved demonstrably owns resolv.conf) → `resolvconf` (verified to
+  actually change resolv.conf — loopback-forwarder setups count — else fall
+  through) → replace `/etc/resolv.conf` in place with a marker + backup (in
+  `/etc`, or `/run/spora` when `/etc` is unwritable; symlinked resolv.conf
+  survives the round trip). macOS: `networksetup -setdnsservers` per service
+  with a `/var/db/spora` state file for crash recovery (raw strings, so
+  zone-scoped resolvers survive). Windows: `SetInterfaceDnsSettings` on the
+  adapter. `src_valid_mark` is set but — like wg-quick — never restored
+  (global shared state other mark-routing VPNs rely on).
+- **Everything is undone in reverse on exit** (an undo stack; `Drop` +
+  SIGTERM/Ctrl+C, and the Windows console-close events), while what a SIGKILL
+  would leak is either process-lifetime (the interface) or recovered at the
+  next start (rules sweep, resolv.conf backup, macOS DNS state file).
+- **`--tun-name <name>` attaches to a pre-created TUN and touches NOTHING
+  else** — the field-lab contract: caller owns address, MTU, routes, cleanup.
+  Attach mode installs no protector, so the caller must not route the relay
+  endpoint into the TUN.
+- e2e coverage: `cargo test -p spora-lab --test cli_vpn` (spawns the real
+  binary in netns; needs `target/debug/spora-cli` built first). The macOS and
+  Windows backends are compile-checked (`--target aarch64-apple-darwin` needs
+  only a stub crate; `--target x86_64-pc-windows-gnu` checks the real crate)
+  and their pure logic (parsers, MTU policy, DNS files) is unit-tested on
+  every host.
 
 ### Wire protocol — relay control & QUIC routing (see `relay_client::protocol`)
 

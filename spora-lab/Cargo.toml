@@ -103,3 +103,11 @@ harness = false
 [[test]]
 name = "recovery"
 harness = false
+
+# The CLI as a VPN client: runs the real `spora-cli` binary (sharer and
+# client) in the lab namespaces and checks interface, routes, MTU, resolver,
+# socket bypass and cleanup — and that `--tun-name` still touches nothing.
+# Needs `target/debug/spora-cli` (build the workspace first).
+[[test]]
+name = "cli_vpn"
+harness = false

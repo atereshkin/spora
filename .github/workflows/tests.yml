@@ -47,6 +47,38 @@ jobs:
       - name: Check spora-ffi for Android
         run: ANDROID_NDK_HOME="$ANDROID_NDK_LATEST_HOME" cargo ndk -t arm64-v8a check -p spora-ffi
 
+  cli-windows:
+    # `spora use` is a full VPN client on Windows (wintun + IP Helper);
+    # nothing else builds the workspace for a Windows target, so this job
+    # catches windows-gated breakage (spora-core's protector plumbing, the
+    # vpn::windows backend) at the commit that causes it. Check only: the
+    # runtime needs wintun.dll and elevation, which CI has no business doing.
+    runs-on: windows-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-windows
+          cache-on-failure: true
+      - run: cargo check -p spora-cli
+
+  cli-macos:
+    # Same rationale for macOS (utun + BSD route/ifconfig backend). The unit
+    # tests for the cross-platform parsers run in the ubuntu job; this one
+    # keeps the darwin-gated code compiling.
+    runs-on: macos-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: cli-macos
+          cache-on-failure: true
+      - run: cargo check -p spora-cli
+
   test:
     runs-on: ubuntu-latest
     timeout-minutes: 45

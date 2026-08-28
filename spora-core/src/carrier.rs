@@ -295,12 +295,10 @@ async fn noise_dial(ctx: DialCtx<'_>) -> Result<PeerSession, Fault> {
     })
 }
 
-/// Protect a TCP socket's fd (Android VPN bypass); no-op without a protector.
-pub(crate) fn protect_tcp(protector: &SocketProtector, _tcp: &TcpStream) {
-    #[cfg(unix)]
+/// Protect a TCP socket (VPN bypass); no-op without a protector.
+pub(crate) fn protect_tcp(protector: &SocketProtector, tcp: &TcpStream) {
     if let Some(f) = protector {
-        use std::os::unix::io::AsRawFd;
-        f(_tcp.as_raw_fd());
+        f(crate::raw_socket_handle(tcp));
     }
 }
 

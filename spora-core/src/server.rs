@@ -416,13 +416,9 @@ async fn new_tcp_stream(
     socket.set_nodelay(true)?;
     socket.set_nonblocking(true)?;
 
-    #[cfg(unix)]
     if let Some(f) = protector {
-        use std::os::unix::io::AsRawFd;
-        f(socket.as_raw_fd());
+        f(crate::raw_socket_handle(&socket));
     }
-    #[cfg(not(unix))]
-    let _ = protector;
 
     let stream = TcpSocket::from_std_stream(socket.into())
         .connect(addr)
@@ -633,13 +629,9 @@ async fn new_udp_packet(
     )?;
     socket.set_nonblocking(true)?;
 
-    #[cfg(unix)]
     if let Some(f) = protector {
-        use std::os::unix::io::AsRawFd;
-        f(socket.as_raw_fd());
+        f(crate::raw_socket_handle(&socket));
     }
-    #[cfg(not(unix))]
-    let _ = protector;
 
     let socket = tokio::net::UdpSocket::from_std(socket.into());
     if let Ok(ref socket) = socket {

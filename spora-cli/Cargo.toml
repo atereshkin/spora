@@ -9,6 +9,7 @@ publish = false
 spora-core = { path = "../spora-core" }
 clap = { version = "4.5.52", features = ["derive"] }
 tokio = "1.48.0"
+tokio-util = "0.7.17"
 env_logger = "0.11.8"
 futures-util = "0.3.31"
 humantime = "2"
@@ -16,8 +17,26 @@ log = "0.4.29"
 serde_json = "1"
 url = "2.5.7"
 
-[target.'cfg(not(windows))'.dependencies]
+[target.'cfg(target_os = "linux")'.dependencies]
+# TUN device creation (ioctl); Linux-only crate, hence the narrow gate. macOS
+# opens its utun control socket directly via libc (src/vpn/macos.rs) and
+# Windows uses wintun (src/vpn/windows.rs).
 tokio-tun = "0.12.1"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+# `spora use` on Windows: wintun adapter (the DLL is loaded at runtime from
+# next to the executable) plus the IP Helper API for addresses, routes, MTU
+# and DNS (src/vpn/windows.rs).
+wintun = "0.5"
+windows-sys = { version = "0.52", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+] }
 
 # jemalloc-sys does not build on (at least) aarch64-musl; the static musl
 # release binaries use the system allocator instead (see main.rs GLOBAL).

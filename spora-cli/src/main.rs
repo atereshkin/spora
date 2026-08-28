@@ -1,13 +1,18 @@
 use clap::{Parser, Subcommand};
+#[cfg(target_os = "linux")]
+use spora_core::ExitMode;
 use spora_core::record::Record;
-#[cfg(not(windows))]
-use spora_core::{Config, ExitMode, connect, identity::Identity, share, tun_util};
+use spora_core::{Config, connect, identity::Identity, share};
 use std::path::PathBuf;
-use tokio_tun::Tun;
 use url::Url;
 
-#[cfg(not(windows))]
+/// Share-side netstack bypass (`spora share --os-routing`): Linux only (it
+/// drives iptables and kernel forwarding).
+#[cfg(target_os = "linux")]
 mod os_route;
+/// Client-side tunnel integration for `spora use` (interface, routes, MTU,
+/// resolver) on Linux, macOS and Windows.
+mod vpn;
 
 /// Active keepalive/liveness probe interval (seconds) for the always-on CLI
 /// client. Non-zero opts out of spora-core's dormant ("screen off") mode.
@@ -152,10 +157,42 @@ enum Mode {
         /// attempting a direct upgrade.
         #[arg(long)]
         no_direct_upgrade: bool,
-        /// Attach to this pre-created TUN instead of creating an anonymous
-        /// interface. The caller owns its address, MTU, routes and cleanup.
+        /// Attach to this pre-created TUN instead of bringing up the tunnel
+        /// interface yourself. The caller owns its address, MTU, routes and
+        /// cleanup; nothing else on the host is touched (Linux only).
         #[arg(long)]
         tun_name: Option<String>,
+        /// Address of the tunnel interface, in CIDR form. Must be private
+        /// (RFC1918/CGNAT): sharers refuse other client sources.
+        #[arg(long, default_value = vpn::DEFAULT_TUN_ADDR, conflicts_with = "tun_name")]
+        tun_addr: String,
+        /// IPv6 address of the tunnel interface, in CIDR form (must be a
+        /// ULA, fc00::/7).
+        #[arg(long, default_value = vpn::DEFAULT_TUN_ADDR6, conflicts_with = "tun_name")]
+        tun_addr6: String,
+        /// Carry no IPv6 in the tunnel: no v6 address, no v6 routes. On a
+        /// v6-capable host, v6 traffic then bypasses the tunnel.
+        #[arg(long, conflicts_with = "tun_name")]
+        no_ipv6: bool,
+        /// Route only this prefix into the tunnel (repeatable) instead of
+        /// everything. The host's more specific routes (its LANs) still win.
+        #[arg(long, conflicts_with = "tun_name")]
+        route: Vec<String>,
+        /// Bring the interface up with its address and MTU but install no
+        /// routes and leave the resolver alone: you route into it yourself.
+        #[arg(long, conflicts_with_all = ["tun_name", "route"])]
+        no_routes: bool,
+        /// Resolver to use while connected (repeatable; default 8.8.8.8 and
+        /// 1.1.1.1). It is reached through the tunnel, so it must be public.
+        #[arg(long, conflicts_with_all = ["tun_name", "no_routes"])]
+        dns: Vec<String>,
+        /// Leave the host's resolver configuration alone.
+        #[arg(long, conflicts_with_all = ["tun_name", "dns"])]
+        no_dns: bool,
+        /// Pin the interface MTU (576..=1500) instead of following the
+        /// path's discovered budget.
+        #[arg(long, conflicts_with = "tun_name")]
+        mtu: Option<u16>,
         /// Don't keep a diagnostic record of how the connection went.
         #[arg(long)]
         no_record: bool,
@@ -436,6 +473,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 cl.retention =
                     std::time::Duration::from_secs(u64::from(conn_log_retention_days) * 86_400);
                 cl.log_destinations = !conn_log_sessions_only;
+                #[cfg(target_os = "linux")]
                 if os_routing {
                     cl.egress_lookup = Some(os_route::conntrack_egress_lookup());
                 }
@@ -444,12 +482,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             };
             let record_dir =
                 record_config(&mut config, no_record, record_dir, record_label, record_id);
-            let mut routing = None;
+            #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+            let mut routing: Option<ShareRouting> = None;
             if os_routing {
-                let opts = os_route::Options::parse(&tun_addr, &tun_addr6, tun_mtu, !no_nat)?;
-                let guard = os_route::OsRoute::setup(&opts)?;
-                config.exit_mode = ExitMode::Custom(guard.session_handler());
-                routing = Some(guard);
+                #[cfg(target_os = "linux")]
+                {
+                    let opts = os_route::Options::parse(&tun_addr, &tun_addr6, tun_mtu, !no_nat)?;
+                    let guard = os_route::OsRoute::setup(&opts)?;
+                    config.exit_mode = ExitMode::Custom(guard.session_handler());
+                    routing = Some(guard);
+                }
+                #[cfg(not(target_os = "linux"))]
+                {
+                    let _ = (&tun_addr, &tun_addr6, tun_mtu, no_nat);
+                    return Err("--os-routing is only available on Linux (it drives iptables and kernel forwarding); the default netstack exit works everywhere".into());
+                }
             }
             let routing_key_hex = spora_core::authz::hex_encode(&identity.routing_key);
             let upgrade_enabled = config.enable_direct_upgrade;
@@ -515,115 +562,38 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             stun,
             no_direct_upgrade,
             tun_name,
+            tun_addr,
+            tun_addr6,
+            no_ipv6,
+            route,
+            no_routes,
+            dns,
+            no_dns,
+            mtu,
             no_record,
             record_dir,
             record_label,
             record_id,
             json,
         } => {
-            #[cfg(windows)]
-            {
-                let _ = (
-                    url,
-                    stun,
-                    no_direct_upgrade,
-                    tun_name,
-                    no_record,
-                    record_dir,
-                    record_label,
-                    record_id,
-                    json,
-                );
-                return Err(
-                    "The 'use' mode is not supported on Windows yet (requires a TUN device)."
-                        .into(),
-                );
-            }
-
-            #[cfg(not(windows))]
-            {
-                let url = Url::parse(&url)?;
-                if url.scheme() != "https" {
-                    panic!(
-                        "Unsupported scheme {}. Expected an https:// URL",
-                        url.scheme()
-                    );
-                }
-                let mut config = Config::default();
-                if !stun.is_empty() {
-                    for server in &stun {
-                        parse_host_port(server).map_err(|e| format!("--stun: {}", e))?;
-                    }
-                    config.stun_servers = stun;
-                }
-                config.enable_direct_upgrade = !no_direct_upgrade;
-                install_json_event_hook(&mut config, json);
-                let configured_record_dir =
-                    record_config(&mut config, no_record, record_dir, record_label, record_id);
-                if !json && let Some(dir) = configured_record_dir {
-                    println!("Diagnostic record: {}", dir.display());
-                }
-                let result = match connect(url, &config).await {
-                    Ok(result) => result,
-                    Err(e) => return Err(format!("could not connect: {e}").into()),
-                };
-                // The CLI is always-on and has no screen state, so opt out of the
-                // Android dormant/battery semantics. A keepalive knob of 0 means
-                // "screen off" to spora-core, which disables the liveness probe
-                // (a dead tunnel is never detected) and parks the direct upgrade
-                // after a few transient failures. Set an active probe interval so
-                // neither happens; only the Android FFI drives the knob to 0.
-                result
-                    .keepalive_knob
-                    .store(KEEPALIVE_PROBE_SECS, std::sync::atomic::Ordering::Relaxed);
-                if let Some(w) = result.keepalive_waker.lock().unwrap().take() {
-                    w.wake();
-                }
-                let tun = match tun_name {
-                    Some(ref name) => Tun::builder()
-                        .name(name)
-                        .try_build()
-                        .map_err(|e| format!("could not attach TUN {name}: {e}"))?,
-                    None => Tun::builder()
-                        .name("")
-                        .up()
-                        .try_build()
-                        .map_err(|e| format!("could not create TUN: {e}"))?,
-                };
-                let actual_tun_name = tun.name().to_string();
-                if json {
-                    emit_json_event(serde_json::json!({
-                        "v": 1,
-                        "event": "tunnel_ready",
-                        "tun_name": actual_tun_name,
-                        "record_dir": config.record.as_ref().and_then(|r| r.dir.as_ref()),
-                        "upgrade_enabled": config.enable_direct_upgrade,
-                    }))?;
-                }
-                // Pump until the tunnel ends or the user stops us, then close
-                // the record explicitly: a process killed mid-run leaves a
-                // truncated record, which is honest but much less useful than
-                // one with an ending.
-                let record = result.record.clone();
-                let cancel = result.cancel.clone();
-                let mut pump = tokio::spawn(tun_util::start(result.transport, tun));
-                tokio::select! {
-                    _ = wait_for_shutdown() => {
-                        if json {
-                            emit_json_event(serde_json::json!({"v": 1, "event": "stopping"}))?;
-                        } else {
-                            println!("Stopping...");
-                        }
-                        cancel.cancel();
-                        record.close_shutdown(Some(spora_core::record::Reason::LocalShutdown));
-                    }
-                    res = &mut pump => {
-                        record.close_shutdown(None);
-                        res.map_err(|e| format!("tunnel task: {e}"))??;
-                    }
-                }
-                pump.abort();
-            }
+            let mode = match tun_name {
+                Some(name) => UseMode::Attach(name),
+                None => UseMode::Vpn(vpn::Options::parse(
+                    &tun_addr, &tun_addr6, no_ipv6, &route, no_routes, &dns, no_dns, mtu,
+                )?),
+            };
+            run_use(UseArgs {
+                url,
+                stun,
+                no_direct_upgrade,
+                mode,
+                no_record,
+                record_dir,
+                record_label,
+                record_id,
+                json,
+            })
+            .await?;
         }
         Mode::Log { cmd } => run_log_cmd(cmd)?,
         Mode::Record { cmd } => run_record_cmd(cmd)?,
@@ -646,6 +616,306 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Share-side OS routing guard; only Linux has one.
+#[cfg(target_os = "linux")]
+type ShareRouting = os_route::OsRoute;
+#[cfg(not(target_os = "linux"))]
+struct ShareRouting;
+#[cfg(not(target_os = "linux"))]
+impl ShareRouting {
+    fn tun_name(&self) -> &str {
+        ""
+    }
+}
+
+/// How `spora use` gets its tunnel interface.
+enum UseMode {
+    /// Bring the interface up and manage routes/MTU/resolver (the VPN client).
+    Vpn(vpn::Options),
+    /// Attach to a pre-created TUN and only pump packets: the caller owns the
+    /// interface's address, MTU, routes and cleanup. This is the contract the
+    /// field lab drives; it must keep touching nothing else on the host.
+    Attach(String),
+}
+
+struct UseArgs {
+    url: String,
+    stun: Vec<String>,
+    no_direct_upgrade: bool,
+    mode: UseMode,
+    no_record: bool,
+    record_dir: Option<PathBuf>,
+    record_label: Option<String>,
+    record_id: Option<String>,
+    json: bool,
+}
+
+async fn run_use(args: UseArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let url = Url::parse(&args.url)?;
+    if url.scheme() != "https" {
+        return Err(format!(
+            "unsupported scheme {}: expected an https:// share URL",
+            url.scheme()
+        )
+        .into());
+    }
+    let mut config = Config::default();
+    if !args.stun.is_empty() {
+        for server in &args.stun {
+            parse_host_port(server).map_err(|e| format!("--stun: {}", e))?;
+        }
+        config.stun_servers = args.stun.clone();
+    }
+    config.enable_direct_upgrade = !args.no_direct_upgrade;
+    let json = args.json;
+
+    // Phase 1 (VPN mode): the interface exists with its address and MTU but
+    // no routes, so the relay dial and STUN below use the normal network —
+    // the same two-phase bring-up as the Android client.
+    let session = match &args.mode {
+        UseMode::Vpn(opts) => {
+            for ip in opts.unreachable_resolvers() {
+                log::warn!(
+                    "resolver {ip} is a private address: sharers drop traffic to private destinations, so it will not answer through the tunnel"
+                );
+            }
+            Some(std::sync::Arc::new(vpn::Session::setup(opts.clone())?))
+        }
+        UseMode::Attach(_) => None,
+    };
+    let weak = session.as_ref().map(std::sync::Arc::downgrade);
+    if let Some(s) = &session {
+        config.protector = s.protector();
+    }
+    install_event_hook(&mut config, json, weak.clone());
+    install_mtu_hook(&mut config, json, weak);
+
+    let configured_record_dir = record_config(
+        &mut config,
+        args.no_record,
+        args.record_dir,
+        args.record_label,
+        args.record_id,
+    );
+    if !json && let Some(dir) = &configured_record_dir {
+        println!("Diagnostic record: {}", dir.display());
+    }
+    let result = match connect(url, &config).await {
+        Ok(result) => result,
+        Err(e) => return Err(format!("could not connect: {e}").into()),
+    };
+    // The CLI is always-on and has no screen state, so opt out of the
+    // Android dormant/battery semantics. A keepalive knob of 0 means
+    // "screen off" to spora-core, which disables the liveness probe
+    // (a dead tunnel is never detected) and parks the direct upgrade
+    // after a few transient failures. Set an active probe interval so
+    // neither happens; only the Android FFI drives the knob to 0.
+    result
+        .keepalive_knob
+        .store(KEEPALIVE_PROBE_SECS, std::sync::atomic::Ordering::Relaxed);
+    if let Some(w) = result.keepalive_waker.lock().unwrap().take() {
+        w.wake();
+    }
+    let record = result.record.clone();
+    let cancel = result.cancel.clone();
+    let upgrade_enabled = config.enable_direct_upgrade;
+    let record_dir_json = config.record.as_ref().and_then(|r| r.dir.clone());
+
+    match args.mode {
+        UseMode::Attach(name) => {
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = name;
+                return Err(
+                    "--tun-name (attach to a pre-created TUN) is only available on Linux".into(),
+                );
+            }
+            #[cfg(target_os = "linux")]
+            {
+                let tun = tokio_tun::Tun::builder()
+                    .name(&name)
+                    .try_build()
+                    .map_err(|e| format!("could not attach TUN {name}: {e}"))?;
+                let actual_tun_name = tun.name().to_string();
+                if json {
+                    emit_json_event(serde_json::json!({
+                        "v": 1,
+                        "event": "tunnel_ready",
+                        "mode": "attached",
+                        "tun_name": actual_tun_name,
+                        "record_dir": record_dir_json,
+                        "upgrade_enabled": upgrade_enabled,
+                    }))?;
+                } else {
+                    println!(
+                        "Attached to {actual_tun_name}; its address, MTU and routes are yours to manage."
+                    );
+                    println!("Press Ctrl+C to disconnect.");
+                }
+                let pump = spora_core::tun_util::start(result.transport, tun);
+                tokio::pin!(pump);
+                wait_for_tunnel_end(&mut pump, json, &record, &cancel).await?;
+            }
+        }
+        UseMode::Vpn(_) => {
+            let session = session.expect("VPN mode has a session");
+            // Phase 2: the session is up and its sockets are protected — now
+            // point the host at the tunnel.
+            let activation = session.activate()?;
+            let pump_handle = session.pump_handle()?;
+            let opts = session.options();
+            let tun_addr = format!("{}/{}", opts.tun_addr, opts.tun_prefix);
+            let tun_addr6 = opts.tun_addr6.map(|(a, p)| format!("{a}/{p}"));
+            if json {
+                emit_json_event(serde_json::json!({
+                    "v": 1,
+                    "event": "tunnel_ready",
+                    "mode": "vpn",
+                    "tun_name": session.tun_name(),
+                    "tun_addr": tun_addr,
+                    "tun_addr6": tun_addr6,
+                    "mtu": session.current_mtu(),
+                    "mtu_policy": match opts.mtu {
+                        vpn::MtuPolicy::Auto => "auto",
+                        vpn::MtuPolicy::Fixed(_) => "fixed",
+                    },
+                    "routes": activation.routes.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "dns": activation.dns.iter().map(ToString::to_string).collect::<Vec<_>>(),
+                    "dns_method": activation.dns_method,
+                    "record_dir": record_dir_json,
+                    "upgrade_enabled": upgrade_enabled,
+                }))?;
+            } else {
+                let addrs = match &tun_addr6 {
+                    Some(a6) => format!("{tun_addr}, {a6}"),
+                    None => tun_addr.clone(),
+                };
+                println!(
+                    "Tunnel up on {} ({addrs}), MTU {}{}.",
+                    session.tun_name(),
+                    session.current_mtu(),
+                    match opts.mtu {
+                        vpn::MtuPolicy::Auto => " (follows the path)",
+                        vpn::MtuPolicy::Fixed(_) => " (pinned)",
+                    }
+                );
+                match &opts.routes {
+                    vpn::RouteSet::Default => println!("Routing all traffic through the tunnel."),
+                    vpn::RouteSet::Prefixes(_) => println!(
+                        "Routing {} through the tunnel.",
+                        activation
+                            .routes
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    vpn::RouteSet::None => {
+                        println!(
+                            "No routes installed (--no-routes): route into the interface yourself."
+                        )
+                    }
+                }
+                match activation.dns_method {
+                    Some(how) => println!(
+                        "Resolver: {} (set via {how}; restored on exit).",
+                        activation
+                            .dns
+                            .iter()
+                            .map(ToString::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                    None => println!("Resolver left unchanged."),
+                }
+                println!("Press Ctrl+C to disconnect.");
+            }
+            let pump = vpn::run_pump(result.transport, pump_handle);
+            tokio::pin!(pump);
+            let outcome = wait_for_tunnel_end(&mut pump, json, &record, &cancel).await;
+            // Undo the host changes while the interface still exists (the
+            // pump, and with it the device, is dropped at scope exit).
+            session.shutdown();
+            outcome?;
+        }
+    }
+    Ok(())
+}
+
+/// Run the pump until the tunnel ends or the user stops us, then close the
+/// record explicitly: a process killed mid-run leaves a truncated record,
+/// which is honest but much less useful than one with an ending.
+async fn wait_for_tunnel_end(
+    pump: &mut std::pin::Pin<&mut impl std::future::Future<Output = std::io::Result<()>>>,
+    json: bool,
+    record: &spora_core::record::Recorder,
+    cancel: &tokio_util::sync::CancellationToken,
+) -> Result<(), Box<dyn std::error::Error>> {
+    tokio::select! {
+        _ = wait_for_shutdown() => {
+            if json {
+                emit_json_event(serde_json::json!({"v": 1, "event": "stopping"}))?;
+            } else {
+                println!("Disconnecting...");
+            }
+            cancel.cancel();
+            record.close_shutdown(Some(spora_core::record::Reason::LocalShutdown));
+            Ok(())
+        }
+        res = pump => {
+            record.close_shutdown(None);
+            res.map_err(|e| format!("tunnel: {e}"))?;
+            Ok(())
+        }
+    }
+}
+
+/// Route spora-core's MTU reports (the carrier's datagram budget, reported
+/// after PMTUD converges and again after a direct upgrade) to the tunnel
+/// interface. The callback must not block, so it only queues; a task applies
+/// the value off the async runtime and announces both the report and what was
+/// set.
+fn install_mtu_hook(
+    config: &mut Config,
+    json: bool,
+    session: Option<std::sync::Weak<vpn::Session>>,
+) {
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u16>();
+    config.mtu_callback = Some(std::sync::Arc::new(move |mtu| {
+        let _ = tx.send(mtu);
+    }));
+    tokio::spawn(async move {
+        while let Some(reported) = rx.recv().await {
+            if json {
+                let _ = emit_json_event(
+                    serde_json::json!({"v": 1, "event": "path_mtu", "mtu": reported}),
+                );
+            } else {
+                log::info!("path MTU budget reported: {reported}");
+            }
+            let Some(session) = session.as_ref().and_then(std::sync::Weak::upgrade) else {
+                continue;
+            };
+            let applied =
+                tokio::task::spawn_blocking(move || session.on_mtu_report(reported)).await;
+            match applied {
+                Ok(Ok(Some(mtu))) => {
+                    if json {
+                        let _ = emit_json_event(
+                            serde_json::json!({"v": 1, "event": "tun_mtu", "mtu": mtu}),
+                        );
+                    } else {
+                        log::info!("tunnel interface MTU set to {mtu}");
+                    }
+                }
+                Ok(Ok(None)) => {}
+                Ok(Err(e)) => log::warn!("could not apply MTU {reported}: {e}"),
+                Err(e) => log::warn!("MTU task: {e}"),
+            }
+        }
+    });
+}
+
 fn emit_json_event(value: serde_json::Value) -> Result<(), std::io::Error> {
     use std::io::Write;
     let mut stdout = std::io::stdout().lock();
@@ -655,7 +925,19 @@ fn emit_json_event(value: serde_json::Value) -> Result<(), std::io::Error> {
 }
 
 fn install_json_event_hook(config: &mut spora_core::Config, enabled: bool) {
-    if !enabled {
+    install_event_hook(config, enabled, None);
+}
+
+/// Consume spora-core's lifecycle events: print them as JSON when asked, and
+/// let the VPN session re-detect its uplink when the tunnel reconnects (the
+/// network may have changed underneath; macOS/Windows bind the outer sockets
+/// to it).
+fn install_event_hook(
+    config: &mut spora_core::Config,
+    json: bool,
+    session: Option<std::sync::Weak<vpn::Session>>,
+) {
+    if !json && session.is_none() {
         return;
     }
     let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
@@ -664,7 +946,14 @@ fn install_json_event_hook(config: &mut spora_core::Config, enabled: bool) {
     }));
     tokio::spawn(async move {
         while let Some(event) = receiver.recv().await {
-            let _ = emit_json_event(tunnel_event_json(event));
+            if matches!(event, spora_core::TunnelEvent::Reconnecting)
+                && let Some(s) = session.as_ref().and_then(std::sync::Weak::upgrade)
+            {
+                let _ = tokio::task::spawn_blocking(move || s.refresh_uplink()).await;
+            }
+            if json {
+                let _ = emit_json_event(tunnel_event_json(event));
+            }
         }
     });
 }
@@ -1339,7 +1628,24 @@ async fn wait_for_shutdown() -> std::io::Result<()> {
             _ = term.recv() => Ok(()),
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        // Console close, logoff and system shutdown give a few seconds'
+        // grace; use them to put the routes and resolver back.
+        use tokio::signal::windows::{ctrl_break, ctrl_close, ctrl_logoff, ctrl_shutdown};
+        let mut brk = ctrl_break()?;
+        let mut close = ctrl_close()?;
+        let mut logoff = ctrl_logoff()?;
+        let mut shutdown = ctrl_shutdown()?;
+        tokio::select! {
+            r = tokio::signal::ctrl_c() => r,
+            _ = brk.recv() => Ok(()),
+            _ = close.recv() => Ok(()),
+            _ = logoff.recv() => Ok(()),
+            _ = shutdown.recv() => Ok(()),
+        }
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         tokio::signal::ctrl_c().await
     }
@@ -1356,8 +1662,6 @@ fn default_identity_path() -> PathBuf {
 
 #[cfg(windows)]
 fn default_identity_path() -> PathBuf {
-    // The Use mode is the only one usable on Windows; Share won't be hit, but
-    // be defensive about the binary still compiling.
     std::env::var_os("APPDATA")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("."))
@@ -1365,7 +1669,6 @@ fn default_identity_path() -> PathBuf {
         .join("identity.bin")
 }
 
-#[cfg(not(windows))]
 fn load_or_create_identity(
     path: &std::path::Path,
     fresh: bool,
@@ -1423,12 +1726,35 @@ fn write_identity_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::R
     res
 }
 
+/// Windows: the same temp-file-then-rename, without a POSIX mode (the file
+/// inherits the profile directory's ACL, which is per-user).
 #[cfg(windows)]
-fn load_or_create_identity(
-    _path: &std::path::Path,
-    _fresh: bool,
-) -> Result<Identity, Box<dyn std::error::Error>> {
-    unreachable!("Share mode is not supported on Windows in the CLI")
+fn write_identity_atomically(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("identity.bin");
+    let tmp = dir.join(format!(".{}.{}.tmp", stem, std::process::id()));
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .open(&tmp)?;
+    let res = f
+        .write_all(bytes)
+        .and_then(|()| f.sync_all())
+        .and_then(|()| {
+            drop(f);
+            // `rename` does not replace an existing file on Windows.
+            let _ = std::fs::remove_file(path);
+            std::fs::rename(&tmp, path)
+        });
+    if res.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    res
 }
 
 #[cfg(all(test, unix))]
