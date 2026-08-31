@@ -5,13 +5,23 @@ to use, `use` on the machine that should tunnel through it.
 
 ## Install
 
-Download the latest release for Linux from the
-[releases page](https://github.com/atereshkin/spora/releases): the
-`spora-<version>-linux-<arch>.tar.gz` archive contains a single static
-binary named `spora`. Put it somewhere on your `PATH`.
+Download the latest release for your system from the
+[releases page](https://github.com/atereshkin/spora/releases) and put the
+binary somewhere on your `PATH`:
 
-On macOS and Windows, build from source for now (a Rust toolchain is the
-only requirement):
+- **Linux** — `spora-<version>-linux-<arch>.tar.gz`: a single static
+  binary named `spora`.
+- **macOS** — `spora-<version>-macos-<arch>.tar.gz` (`aarch64` for Apple
+  silicon, `x86_64` for Intel): a single binary named `spora`. It is not
+  notarized yet, so if a browser downloaded the archive, macOS will refuse
+  to run the binary until you clear the quarantine flag
+  (`xattr -d com.apple.quarantine spora`); fetching with `curl` avoids the
+  flag entirely.
+- **Windows** — `spora-<version>-windows-<arch>.zip`: `spora.exe` plus
+  `wintun.dll`, which `spora use` loads from next to the executable — keep
+  the two files together.
+
+Or build from source (a Rust toolchain is the only requirement):
 
 ```bash
 git clone https://github.com/atereshkin/spora.git
@@ -20,7 +30,7 @@ cargo build --release -p spora-cli
 # the binary is target/release/spora-cli; rename or alias it to `spora`
 ```
 
-On Windows, `spora use` also needs `wintun.dll` from
+For a source build on Windows, `spora use` also needs `wintun.dll` from
 [wintun.net](https://www.wintun.net/) next to the executable.
 
 ## Share

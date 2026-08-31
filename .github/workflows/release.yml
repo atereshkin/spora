@@ -7,6 +7,8 @@ name: release
 #
 # Artifacts:
 #   spora-<tag>-linux-{x86_64,aarch64}.tar.gz        CLI (static musl)
+#   spora-<tag>-macos-{aarch64,x86_64}.tar.gz        CLI (stripped, ad-hoc signed)
+#   spora-<tag>-windows-{x86_64,aarch64}.zip         CLI + wintun.dll (static CRT)
 #   spora-relay-<tag>-linux-{x86_64,aarch64}.tar.gz  relay (static musl)
 #   spora-ffi-<tag>-android.zip                      jniLibs (4 ABIs) + Kotlin bindings
 #   SHA256SUMS
@@ -97,6 +99,161 @@ jobs:
           name: linux-${{ matrix.arch }}
           path: dist/
 
+  macos-bins:
+    # Native runners for both arches (Apple silicon is `macos-latest`; Intel
+    # stays on `macos-15-intel`, supported by GitHub until Aug 2027), so the
+    # smoke test exercises the shipped binary. CLI only — the relay deploys on
+    # Linux. No signing identity / notarization yet: the linker's ad-hoc
+    # signature is invalidated by strip, so re-sign ad-hoc after stripping
+    # (arm64 refuses to run unsigned binaries at all). Quarantined downloads
+    # (browser, not curl) will still hit Gatekeeper — a docs matter until
+    # real signing.
+    name: macos ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            arch: aarch64
+            lipoarch: arm64
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            arch: x86_64
+            lipoarch: x86_64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p spora-cli
+
+      - name: Stage, strip, sign
+        run: |
+          mkdir -p stage dist
+          install -m 755 target/${{ matrix.target }}/release/spora-cli stage/spora
+          strip stage/spora
+          codesign -f -s - stage/spora
+
+      - name: Verify binary
+        run: |
+          archs=$(lipo -archs stage/spora)
+          echo "spora: $archs"
+          [ "$archs" = "${{ matrix.lipoarch }}" ] \
+            || { echo "::error::spora is not ${{ matrix.lipoarch }}"; exit 1; }
+          codesign -v stage/spora \
+            || { echo "::error::signature did not survive staging"; exit 1; }
+          # native smoke test, on the stripped+re-signed copy that ships
+          ./stage/spora --help | grep -qi share \
+            || { echo "::error::spora --help smoke test failed"; exit 1; }
+
+      - name: Stage tarball
+        run: tar -C stage -czf "dist/spora-${{ github.ref_name }}-macos-${{ matrix.arch }}.tar.gz" spora
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: macos-${{ matrix.arch }}
+          path: dist/
+
+  windows-bins:
+    # Native runners for both arches (`windows-11-arm` is free for public
+    # repos). Static CRT so the exe does not depend on a VC++ redistributable.
+    # The zip bundles wintun.dll — `spora use` loads it from next to the
+    # executable (src/vpn/windows.rs) — from the pinned official build;
+    # wintun's prebuilt-binaries license permits redistribution alongside
+    # software that uses it only via its API (its LICENSE.txt ships in the
+    # zip). No code signing yet. Steps are pwsh (runner default): cmdlets
+    # throw on error and the wrapper propagates native exit codes.
+    name: windows ${{ matrix.arch }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    env:
+      RUSTFLAGS: -C target-feature=+crt-static
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            arch: x86_64
+            wintun_dir: amd64
+            pe_machine: 0x8664
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            arch: aarch64
+            wintun_dir: arm64
+            pe_machine: 0xAA64
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+          cache-on-failure: true
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p spora-cli
+
+      - name: Verify binary
+        run: |
+          $exe = "target/${{ matrix.target }}/release/spora-cli.exe"
+          # PE machine field: an x86_64 exe would still RUN on the arm64
+          # runner (emulation), so running it is not an arch check.
+          $bytes = [IO.File]::ReadAllBytes($exe)
+          $pe = [BitConverter]::ToInt32($bytes, 0x3c)
+          $machine = [BitConverter]::ToUInt16($bytes, $pe + 4)
+          "spora-cli.exe: machine 0x{0:X4}" -f $machine
+          if ($machine -ne ${{ matrix.pe_machine }}) {
+            Write-Host "::error::spora-cli.exe is not ${{ matrix.arch }}"
+            exit 1
+          }
+          $out = & $exe --help
+          if ($LASTEXITCODE -ne 0) {
+            Write-Host "::error::spora-cli --help smoke test failed"
+            exit 1
+          }
+          if (-not ($out | Select-String -Quiet -SimpleMatch "share")) {
+            Write-Host "::error::spora-cli --help does not mention share"
+            exit 1
+          }
+
+      - name: Fetch wintun
+        run: |
+          Invoke-WebRequest -Uri "https://www.wintun.net/builds/wintun-0.14.1.zip" -OutFile wintun.zip
+          $hash = (Get-FileHash wintun.zip -Algorithm SHA256).Hash
+          if ($hash -ne "07C256185D6EE3652E09FA55C0B673E2624B565E02C4B9091C79CA7D2F24EF51") {
+            Write-Host "::error::wintun.zip checksum mismatch: $hash"
+            exit 1
+          }
+          Expand-Archive wintun.zip -DestinationPath .
+
+      - name: Stage zip
+        run: |
+          New-Item -ItemType Directory -Force -Path stage, dist | Out-Null
+          Copy-Item "target/${{ matrix.target }}/release/spora-cli.exe" stage/spora.exe
+          Copy-Item "wintun/bin/${{ matrix.wintun_dir }}/wintun.dll" stage/
+          Copy-Item wintun/LICENSE.txt stage/wintun-LICENSE.txt
+          Compress-Archive -Path stage/* -DestinationPath "dist/spora-${{ github.ref_name }}-windows-${{ matrix.arch }}.zip"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: windows-${{ matrix.arch }}
+          path: dist/
+
   ffi-bundle:
     name: android ffi bundle
     runs-on: ubuntu-latest
@@ -160,7 +317,7 @@ jobs:
   release:
     name: draft github release
     if: startsWith(github.ref_name, 'v')
-    needs: [linux-bins, ffi-bundle]
+    needs: [linux-bins, macos-bins, windows-bins, ffi-bundle]
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
