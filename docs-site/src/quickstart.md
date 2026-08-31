@@ -9,17 +9,17 @@ Download the latest release for your system from the
 [releases page](https://github.com/atereshkin/spora/releases) and put the
 binary somewhere on your `PATH`:
 
-- **Linux** — `spora-<version>-linux-<arch>.tar.gz`: a single static
+- **Linux**: `spora-<version>-linux-<arch>.tar.gz`, a single static
   binary named `spora`.
-- **macOS** — `spora-<version>-macos-<arch>.tar.gz` (`aarch64` for Apple
-  silicon, `x86_64` for Intel): a single binary named `spora`. It is not
+- **macOS**: `spora-<version>-macos-<arch>.tar.gz` (`aarch64` for Apple
+  silicon, `x86_64` for Intel), a single binary named `spora`. It is not
   notarized yet, so if a browser downloaded the archive, macOS will refuse
   to run the binary until you clear the quarantine flag
   (`xattr -d com.apple.quarantine spora`); fetching with `curl` avoids the
   flag entirely.
-- **Windows** — `spora-<version>-windows-<arch>.zip`: `spora.exe` plus
-  `wintun.dll`, which `spora use` loads from next to the executable — keep
-  the two files together.
+- **Windows**: `spora-<version>-windows-<arch>.zip`, containing `spora.exe`
+  plus `wintun.dll`. `spora use` loads the DLL from next to the executable,
+  so keep the two files together.
 
 Or build from source (a Rust toolchain is the only requirement):
 
