@@ -154,14 +154,16 @@ fn tcp_pool_starved_by_aborted_dials() -> Result<(), String> {
     // THE CONTRACT: every one of those 320 connections was FIN-closed by
     // the client before this point, so none of them may still hold a
     // session slot against a fresh, legitimate connection.
-    download(&client, "post-storm download (abandoned flows must not starve it)").map_err(
-        |e| {
-            format!(
-                "netstack TCP pool starved by abandoned dials \
+    download(
+        &client,
+        "post-storm download (abandoned flows must not starve it)",
+    )
+    .map_err(|e| {
+        format!(
+            "netstack TCP pool starved by abandoned dials \
                  ({established} established+aborted, {refused} refused): {e}"
-            )
-        },
-    )?;
+        )
+    })?;
 
     client.stop();
     sharer.stop();

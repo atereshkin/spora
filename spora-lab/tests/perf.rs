@@ -381,7 +381,13 @@ fn relay_loss_compare() -> Result<(), String> {
             .tcp_upload(svc(TCP_SINK_PORT), 512 * 1024, perf_opts(), T)
             .map(|s| s.throughput_mbps())
             .unwrap_or(0.0);
-        metrics::record(&format!("upload_mbps.{path}.lossy"), ul, "mbps", true, 500.0);
+        metrics::record(
+            &format!("upload_mbps.{path}.lossy"),
+            ul,
+            "mbps",
+            true,
+            500.0,
+        );
         client.stop();
         sharer.stop();
         Ok((dl, ul))
