@@ -754,6 +754,7 @@ impl TrafficPump {
         let (mut device, mut iface, mut sockets, handle) = tcp_session(server, local_port, &opts)?;
         let mut reasm = Reassembler::default();
         let start = std::time::Instant::now();
+        let mut established = false;
 
         loop {
             iface.poll(SmolInstant::now(), &mut device, &mut sockets);
@@ -766,26 +767,36 @@ impl TrafficPump {
 
             {
                 let sock = sockets.get_mut::<tcp::Socket>(handle);
-                if sock.may_send() {
-                    // Established. Orderly close (queues FIN), push it out,
-                    // and abandon the session — no waiting for the peer's
-                    // half to close.
+                if !established && sock.may_send() {
+                    // Established. Orderly close (queues FIN) — then keep
+                    // the session polling until the close handshake
+                    // resolves, like a real client's KERNEL does after the
+                    // app calls close(): the peer's FIN must be ACKed, or
+                    // the share-side socket parks in LAST_ACK and the
+                    // scenario measures a vanished host instead of an
+                    // abandoning app.
+                    established = true;
                     sock.close();
-                    iface.poll(SmolInstant::now(), &mut device, &mut sockets);
-                    while let Some(frame) = device.tx.pop_front() {
-                        let _ = self.transport.send(frame).await;
-                    }
-                    return Ok(true);
                 }
-                // `connect()` left the socket in SynSent; back to Closed
-                // means the SYN was answered with RST — refused.
-                if sock.state() == tcp::State::Closed {
-                    return Ok(false);
+                match sock.state() {
+                    // Never established: the SYN was answered with RST —
+                    // refused. Established: the teardown fully resolved.
+                    tcp::State::Closed => return Ok(established),
+                    // Both FINs exchanged and ACKed from the peer's point
+                    // of view; flush our final ACK and finish.
+                    tcp::State::TimeWait => {
+                        iface.poll(SmolInstant::now(), &mut device, &mut sockets);
+                        while let Some(frame) = device.tx.pop_front() {
+                            let _ = self.transport.send(frame).await;
+                        }
+                        return Ok(true);
+                    }
+                    _ => {}
                 }
             }
 
             if start.elapsed() > DEADLINE {
-                return Ok(false);
+                return Ok(established);
             }
 
             let delay = iface

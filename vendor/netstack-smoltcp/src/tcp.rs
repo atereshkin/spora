@@ -129,6 +129,41 @@ fn grow_ring(ring: &mut RingBuffer<'static, u8>, max: usize) -> bool {
     true
 }
 
+/// Warn (rate-limited to one line per 5 s, with a dropped-since count) that
+/// the socket cap refused a SYN. Per-drop detail stays at trace.
+fn report_syn_drop(src_addr: SocketAddr, dst_addr: SocketAddr) {
+    use std::sync::atomic::AtomicU64;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    static DROPPED: AtomicU64 = AtomicU64::new(0);
+    static LAST_WARN_SECS: AtomicU64 = AtomicU64::new(0);
+
+    trace!(
+        "TCP socket cap ({}) reached; dropping SYN {} -> {}",
+        MAX_TCP_SOCKETS, src_addr, dst_addr
+    );
+    DROPPED.fetch_add(1, Ordering::Relaxed);
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let last = LAST_WARN_SECS.load(Ordering::Relaxed);
+    if now.saturating_sub(last) >= 5
+        && LAST_WARN_SECS
+            .compare_exchange(last, now, Ordering::Relaxed, Ordering::Relaxed)
+            .is_ok()
+    {
+        let count = DROPPED.swap(0, Ordering::Relaxed);
+        tracing::warn!(
+            "TCP socket cap ({}) reached: {} SYN(s) refused (RST) since last report — \
+             new TCP connections through the tunnel are failing (latest {} -> {})",
+            MAX_TCP_SOCKETS,
+            count,
+            src_addr,
+            dst_addr
+        );
+    }
+}
+
 /// Total smoltcp buffer bytes (both buffers together) for a socket admitted
 /// while the ledger sits at `used`: a LARGE pair while the budget has room,
 /// a SMALL pair beyond it.
@@ -259,7 +294,13 @@ impl TcpListenerRunner {
                         trace!("duplicate SYN {} -> {}, forwarding to existing socket", src_addr, dst_addr);
                         false
                     } else if flows.len() >= MAX_TCP_SOCKETS {
-                        trace!("TCP socket cap ({}) reached; dropping SYN {} -> {}", MAX_TCP_SOCKETS, src_addr, dst_addr);
+                        // At the cap every new connection is refused (RST):
+                        // an exit-wide outage for new TCP while it lasts.
+                        // That must be loud — the September 2026 stall went
+                        // undiagnosed for weeks because this was a trace! —
+                        // but rate-limited, because the same condition fires
+                        // per refused SYN during a storm.
+                        report_syn_drop(src_addr, dst_addr);
                         false
                     } else {
                         flows.insert(flow);

@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
-use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpSocket, TcpStream, UdpSocket};
 use tokio::task::{AbortHandle, JoinHandle};
 use tokio_util::sync::CancellationToken;
@@ -327,6 +327,70 @@ impl<T: AsyncWrite + Unpin> AsyncWrite for CountedIo<T> {
     }
 }
 
+/// How long the exit waits for its outbound connect before giving up on the
+/// destination. A backstop, not the primary release: the primary is the
+/// inner-side watch in [`dial_watching_inner`] (a client that gives up
+/// releases the dial immediately). Without either, kernel SYN retries pin
+/// this task, its OS socket, and the netstack's session slot for ~2 minutes
+/// per blackholed destination — the pool-starvation stall a retry-storming
+/// client desktop turns into a total new-connection outage
+/// (spora-lab `tests/exit.rs`).
+const EXIT_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Early request bytes buffered while the dial is in flight (a client that
+/// pipelines its request before the destination answered). Bounded: past it
+/// the inner stream is simply not read until the dial resolves — the
+/// netstack's ring holds the rest.
+const DIAL_STASH_LIMIT: usize = 64 * 1024;
+
+enum Dialed {
+    /// Outbound leg up; `stash` holds inner bytes that arrived mid-dial.
+    Connected {
+        stream: TcpStream,
+        egress: SocketAddr,
+        stash: Vec<u8>,
+    },
+    /// The inner side closed while the dial was still pending: the client
+    /// gave up, so the dial (and with it the netstack session slot) is
+    /// released instead of riding out the kernel's SYN retries. A client
+    /// that half-closes mid-dial and still expects a response is
+    /// indistinguishable from one that left and is dropped too — a
+    /// deliberate trade against the storm; half-close after the dial
+    /// completes works normally.
+    Abandoned,
+    Failed(io::Error),
+}
+
+/// Dial `remote` while watching the inner stream — see [`Dialed`].
+async fn dial_watching_inner(
+    inner: &mut netstack_smoltcp::TcpStream,
+    remote: SocketAddr,
+    protector: &SocketProtector,
+) -> Dialed {
+    let mut stash: Vec<u8> = Vec::new();
+    let mut buf = vec![0u8; 16 * 1024];
+    let dial = tokio::time::timeout(EXIT_CONNECT_TIMEOUT, new_tcp_stream(remote, protector));
+    tokio::pin!(dial);
+    loop {
+        tokio::select! {
+            d = &mut dial => {
+                return match d {
+                    Ok(Ok((stream, egress))) => Dialed::Connected { stream, egress, stash },
+                    Ok(Err(e)) => Dialed::Failed(e),
+                    Err(_) => Dialed::Failed(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("connect to {remote}: no answer within {EXIT_CONNECT_TIMEOUT:?}"),
+                    )),
+                };
+            }
+            n = inner.read(&mut buf), if stash.len() < DIAL_STASH_LIMIT => match n {
+                Ok(0) | Err(_) => return Dialed::Abandoned,
+                Ok(n) => stash.extend_from_slice(&buf[..n]),
+            },
+        }
+    }
+}
+
 async fn handle_tcp_streams(
     mut tcp_listener: TcpListener,
     protector: SocketProtector,
@@ -362,8 +426,8 @@ async fn handle_tcp_streams(
             tokio::select! {
                 _ = cancel.cancelled() => {}
                 r = async {
-                    match new_tcp_stream(remote, &protector).await {
-                        Ok((remote_stream, egress)) => {
+                    match dial_watching_inner(&mut stream, remote, &protector).await {
+                        Dialed::Connected { stream: remote_stream, egress, stash } => {
                             if let Some(f) = &flow {
                                 f.established(Some(egress));
                             }
@@ -372,6 +436,15 @@ async fn handle_tcp_streams(
                                 .map(|f| (f.up.clone(), f.down.clone()))
                                 .unwrap_or_default();
                             let mut counted = CountedIo { inner: remote_stream, up, down };
+                            if !stash.is_empty()
+                                && let Err(e) = counted.write_all(&stash).await
+                            {
+                                warn!("failed to forward early bytes {:?}=>{:?}, err: {:?}", local, remote, e);
+                                if let Some(f) = &flow {
+                                    f.close("error", Duration::ZERO);
+                                }
+                                return;
+                            }
                             match tokio::io::copy_bidirectional(&mut stream, &mut counted).await {
                                 Ok(_) => {
                                     if let Some(f) = &flow {
@@ -386,7 +459,15 @@ async fn handle_tcp_streams(
                                 }
                             }
                         }
-                        Err(e) => {
+                        Dialed::Abandoned => {
+                            // Routine under client retry storms — the whole
+                            // point is that these DON'T pile up; not a warning.
+                            info!("client left before {:?}=>{:?} connected; dial abandoned", local, remote);
+                            if let Some(f) = &flow {
+                                f.close("abandoned", Duration::ZERO);
+                            }
+                        }
+                        Dialed::Failed(e) => {
                             warn!("failed to new tcp stream {:?}=>{:?}, err: {:?}", local, remote, e);
                             if let Some(f) = &flow {
                                 f.close("connect_failed", Duration::ZERO);

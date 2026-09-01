@@ -13,12 +13,13 @@
 //! keeps the tunnel looking perfectly healthy (no reconnect, no recovery).
 //!
 //! The contract this suite pins: inner connections the client has already
-//! abandoned must not starve new connections. The final assertion is a
-//! `known_gap(exit-dial-lifecycle)` — RED by design until the exit-dial
-//! lifecycle fix (connect timeout + cancel-on-inner-close) lands.
-//! `SPORA_LAB_EXIT=xfail` (CI) logs the gap as an expected failure instead
-//! of failing the suite, and flags an unexpected PASS so the marker is
-//! removed together with the fix (the recovery suite's model).
+//! abandoned must not starve new connections. Enforced strictly since the
+//! exit-dial lifecycle fix (`dial_watching_inner` in spora-core server.rs:
+//! a connect timeout, plus the dial — and with it the netstack slot — is
+//! released the moment the inner side closes). Before that fix this suite
+//! failed with "254 established+aborted, 66 refused … connection closed
+//! early". The known_gap/xfail machinery below is retained (unused) for
+//! the next red-by-design finding, the recovery suite's model.
 
 use std::net::{Ipv4Addr, SocketAddrV4};
 use std::time::Duration;
@@ -69,7 +70,9 @@ fn xfail_mode() -> bool {
 /// Known-gap accounting, the recovery suite's model: strict mode returns the
 /// result tagged; xfail mode (CI) converts the expected miss into a logged
 /// expected failure, and an unexpected PASS into an error so this marker is
-/// removed together with the fix.
+/// removed together with the fix. Currently unused — the exit-dial gap is
+/// fixed; retained for the next red-by-design finding.
+#[allow(dead_code)]
 fn known_gap(tag: &str, result: Result<(), String>) -> Result<(), String> {
     match result {
         Ok(()) if xfail_mode() => Err(format!(
@@ -151,16 +154,13 @@ fn tcp_pool_starved_by_aborted_dials() -> Result<(), String> {
     // THE CONTRACT: every one of those 320 connections was FIN-closed by
     // the client before this point, so none of them may still hold a
     // session slot against a fresh, legitimate connection.
-    known_gap(
-        "exit-dial-lifecycle",
-        download(&client, "post-storm download (abandoned flows must not starve it)").map_err(
-            |e| {
-                format!(
-                    "netstack TCP pool starved by abandoned dials \
-                     ({established} established+aborted, {refused} refused): {e}"
-                )
-            },
-        ),
+    download(&client, "post-storm download (abandoned flows must not starve it)").map_err(
+        |e| {
+            format!(
+                "netstack TCP pool starved by abandoned dials \
+                 ({established} established+aborted, {refused} refused): {e}"
+            )
+        },
     )?;
 
     client.stop();
