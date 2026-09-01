@@ -3,7 +3,7 @@ use std::{
     net::SocketAddr,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc, Mutex,
     },
     task::{Context, Poll, Waker},
@@ -36,16 +36,43 @@ use crate::{
     Runner,
 };
 
-// NOTE: Default buffer could contain 20 AEAD packets
-const DEFAULT_TCP_SEND_BUFFER_SIZE: u32 = 0x3FFF * 20;
-const DEFAULT_TCP_RECV_BUFFER_SIZE: u32 = 0x3FFF * 20;
+// smoltcp fixes a socket's buffer sizes at creation (no resize API), and the
+// receive buffer IS the advertised TCP window — so the size chosen at SYN
+// time is that flow's throughput ceiling for its whole life. 320 KiB over a
+// 100 ms RTT path supports ~26 Mbit/s per flow, which matches the tunnel's
+// measured single-flow rates. (The `0x3FFF * 20` figure is inherited from
+// upstream's shadowsocks lineage — "20 AEAD chunks" — but survives on this
+// window arithmetic, not on its origin.)
+const LARGE_TCP_BUFFER_SIZE: u32 = 0x3FFF * 20;
 
-// Each accepted SYN allocates four buffers of the sizes above (~1.3 MiB total)
-// before any handshake completes, and the inbound packets come from an untrusted
-// peer. Cap the number of concurrently-tracked sockets so a flood of
-// distinct-4-tuple SYNs can't exhaust host memory; at the cap, further SYNs are
-// dropped (smoltcp answers with RST). 256 bounds worst-case TCP buffer memory to
-// ~340 MiB while leaving generous headroom for real concurrent flows.
+// Fallback socket-buffer size once LARGE allocations have exhausted
+// TCP_BUFFER_BUDGET: enough for handshakes, request/response traffic, and
+// slow transfers (~2.6 Mbit/s at 100 ms RTT), so a burst of new flows
+// degrades to modest windows instead of unbounded memory or refusal.
+const SMALL_TCP_BUFFER_SIZE: u32 = 32 * 1024;
+
+// Ledger budget for smoltcp socket buffers, incremented at admission and
+// released when the socket is reaped. New sockets get LARGE buffer pairs
+// while the ledger has room — the calm-exit common case, where per-flow
+// throughput must not regress — and SMALL pairs beyond it (a storm of new
+// flows is exactly when generous windows matter least). ~52 concurrent
+// LARGE flows fit; a busy-but-sane exit rarely has more than a handful
+// moving data at once.
+const TCP_BUFFER_BUDGET: usize = 32 * 1024 * 1024;
+
+// The userland relay rings (`TcpSocketControl`) start here and grow on
+// demand (x4 when full, one preserved-content copy per step) toward the
+// socket's own buffer size — a ring larger than the window buys nothing.
+// Flows that never move bulk data (dial-and-abandon attempts, DNS-ish
+// request/response) stay at this size for their whole life.
+const INITIAL_RING_BUFFER_SIZE: usize = 16 * 1024;
+
+// A flood of distinct-4-tuple SYNs from the untrusted peer still needs a
+// socket-count bound (each socket also costs a slot, a task and an outbound
+// dial); at the cap, further SYNs are dropped (smoltcp answers with RST).
+// With the buffer ledger above, worst-case TCP buffer memory is
+// TCP_BUFFER_BUDGET + MAX_TCP_SOCKETS x (2 x SMALL + rings) ≈ 56 MiB —
+// versus ~340 MiB when every socket eagerly took four LARGE buffers.
 const MAX_TCP_SOCKETS: usize = 256;
 
 // A freshly-accepted (half-open) socket gets a short idle timeout so a SYN that
@@ -65,17 +92,62 @@ enum TcpSocketState {
 
 struct TcpSocketControl {
     send_buffer: RingBuffer<'static, u8>,
+    /// On-demand growth ceiling for `send_buffer` (the socket's send-buffer
+    /// size; see `grow_ring`).
+    max_send_ring: usize,
     send_waker: Option<Waker>,
     recv_buffer: RingBuffer<'static, u8>,
+    /// On-demand growth ceiling for `recv_buffer`.
+    max_recv_ring: usize,
     recv_waker: Option<Waker>,
     recv_state: TcpSocketState,
     send_state: TcpSocketState,
+}
+
+/// Grow `ring` in place (x4, capped at `max`), preserving its queued bytes.
+/// Returns false when the ring is already at `max` — the caller then applies
+/// backpressure exactly as it would have against a fixed-size ring. The
+/// copy is at most `max` bytes, paid once per growth step by the sustained
+/// flow that forced it.
+fn grow_ring(ring: &mut RingBuffer<'static, u8>, max: usize) -> bool {
+    let cap = ring.capacity();
+    if cap >= max {
+        return false;
+    }
+    let mut grown = RingBuffer::new(vec![0u8; (cap * 4).min(max)]);
+    loop {
+        let n = {
+            let chunk = ring.dequeue_many(usize::MAX);
+            if chunk.is_empty() {
+                break;
+            }
+            grown.enqueue_slice(chunk)
+        };
+        debug_assert!(n > 0, "grown ring must absorb the old content");
+    }
+    *ring = grown;
+    true
+}
+
+/// Total smoltcp buffer bytes (both buffers together) for a socket admitted
+/// while the ledger sits at `used`: a LARGE pair while the budget has room,
+/// a SMALL pair beyond it.
+fn admission_buf_bytes(used: usize) -> usize {
+    let large = 2 * LARGE_TCP_BUFFER_SIZE as usize;
+    if used + large <= TCP_BUFFER_BUDGET {
+        large
+    } else {
+        2 * SMALL_TCP_BUFFER_SIZE as usize
+    }
 }
 
 struct TcpSocketCreation {
     control: SharedControl,
     socket: TcpSocket<'static>,
     flow: Flow,
+    /// smoltcp buffer bytes charged to the ledger for this socket; released
+    /// when the socket is reaped.
+    buf_bytes: usize,
 }
 
 /// A TCP connection 4-tuple: (source addr, dest addr). Used to both cap the
@@ -107,9 +179,13 @@ impl TcpListenerRunner {
             // the number of sockets and skip a duplicate (retransmitted) SYN,
             // and the socket task can release them on close.
             let live_flows: LiveFlows = Arc::new(Mutex::new(HashSet::new()));
+            // smoltcp buffer-byte ledger: the packet task charges it at
+            // admission (and tiers new sockets by it), the socket task
+            // releases it on reap.
+            let buffer_bytes = Arc::new(AtomicUsize::new(0));
             let res = tokio::select! {
-                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, live_flows.clone()) => v,
-                v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx, live_flows) => v,
+                v = Self::handle_packet(notify.clone(), iface_ingress_tx, iface_ingress_tx_avail.clone(), tcp_rx, stream_tx, socket_tx, live_flows.clone(), buffer_bytes.clone()) => v,
+                v = Self::handle_socket(notify, device, iface, iface_ingress_tx_avail, sockets, socket_rx, live_flows, buffer_bytes) => v,
             };
             res?;
             trace!("VirtDevice::poll thread exited");
@@ -117,6 +193,7 @@ impl TcpListenerRunner {
         })
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_packet(
         notify: SharedNotify,
         iface_ingress_tx: UnboundedSender<Vec<u8>>,
@@ -125,6 +202,7 @@ impl TcpListenerRunner {
         stream_tx: UnboundedSender<TcpStream>,
         socket_tx: UnboundedSender<TcpSocketCreation>,
         live_flows: LiveFlows,
+        buffer_bytes: Arc<AtomicUsize>,
     ) -> std::io::Result<()> {
         while let Some(frame) = tcp_rx.recv().await {
             let packet = match IpPacket::new_checked(frame.as_slice()) {
@@ -196,9 +274,23 @@ impl TcpListenerRunner {
                     notify.notify_one();
                     continue;
                 }
+                // Tier this socket's buffers by ledger pressure: LARGE while
+                // the budget has room (the calm-exit common case — per-flow
+                // throughput must not regress), SMALL beyond it (a burst of
+                // new flows costs bounded memory instead of ~1.3 MiB each).
+                let buf_bytes = admission_buf_bytes(buffer_bytes.load(Ordering::Relaxed));
+                let per_buf = buf_bytes / 2;
+                if per_buf == SMALL_TCP_BUFFER_SIZE as usize {
+                    trace!(
+                        "TCP buffer budget exhausted; small buffers for {} -> {}",
+                        src_addr,
+                        dst_addr
+                    );
+                }
+                buffer_bytes.fetch_add(buf_bytes, Ordering::Relaxed);
                 let mut socket = TcpSocket::new(
-                    TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE as usize]),
-                    TcpSocketBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE as usize]),
+                    TcpSocketBuffer::new(vec![0u8; per_buf]),
+                    TcpSocketBuffer::new(vec![0u8; per_buf]),
                 );
                 socket.set_keep_alive(Some(Duration::from_secs(28)));
                 // Short timeout until the handshake completes (reaps a SYN that
@@ -216,15 +308,24 @@ impl TcpListenerRunner {
 
                 if let Err(err) = socket.listen(dst_addr) {
                     error!("listen error: {:?}", err);
+                    // The socket never reaches the socket task, so its
+                    // admission must be unwound here: the flow entry (which
+                    // was leaked on this path before the ledger existed) and
+                    // the buffer bytes just charged.
+                    live_flows.lock().unwrap().remove(&flow);
+                    buffer_bytes.fetch_sub(buf_bytes, Ordering::Relaxed);
                     continue;
                 }
 
                 trace!("created TCP connection for {} <-> {}", src_addr, dst_addr);
 
+                let initial_ring = INITIAL_RING_BUFFER_SIZE.min(per_buf);
                 let control = Arc::new(SpinMutex::new(TcpSocketControl {
-                    send_buffer: RingBuffer::new(vec![0u8; DEFAULT_TCP_SEND_BUFFER_SIZE as usize]),
+                    send_buffer: RingBuffer::new(vec![0u8; initial_ring]),
+                    max_send_ring: per_buf,
                     send_waker: None,
-                    recv_buffer: RingBuffer::new(vec![0u8; DEFAULT_TCP_RECV_BUFFER_SIZE as usize]),
+                    recv_buffer: RingBuffer::new(vec![0u8; initial_ring]),
+                    max_recv_ring: per_buf,
                     recv_waker: None,
                     recv_state: TcpSocketState::Normal,
                     send_state: TcpSocketState::Normal,
@@ -239,7 +340,12 @@ impl TcpListenerRunner {
                     })
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
                 socket_tx
-                    .send(TcpSocketCreation { control, socket, flow })
+                    .send(TcpSocketCreation {
+                        control,
+                        socket,
+                        flow,
+                        buf_bytes,
+                    })
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::BrokenPipe, e))?;
             }
 
@@ -253,6 +359,7 @@ impl TcpListenerRunner {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn handle_socket(
         notify: SharedNotify,
         mut device: VirtualDevice,
@@ -261,16 +368,24 @@ impl TcpListenerRunner {
         mut sockets: HashMap<SocketHandle, SharedControl>,
         mut socket_rx: UnboundedReceiver<TcpSocketCreation>,
         live_flows: LiveFlows,
+        buffer_bytes: Arc<AtomicUsize>,
     ) -> std::io::Result<()> {
         let mut socket_set = SocketSet::new(vec![]);
-        // Maps each live socket back to its flow so we can release it from
-        // `live_flows` (which caps and dedups admissions) when it closes.
-        let mut socket_flows: HashMap<SocketHandle, Flow> = HashMap::new();
+        // Maps each live socket back to its flow (released from `live_flows`,
+        // which caps and dedups admissions, when it closes) and its ledger
+        // charge (released from `buffer_bytes` at the same moment).
+        let mut socket_flows: HashMap<SocketHandle, (Flow, usize)> = HashMap::new();
         loop {
-            while let Ok(TcpSocketCreation { control, socket, flow }) = socket_rx.try_recv() {
+            while let Ok(TcpSocketCreation {
+                control,
+                socket,
+                flow,
+                buf_bytes,
+            }) = socket_rx.try_recv()
+            {
                 let handle = socket_set.add(socket);
                 sockets.insert(handle, control);
-                socket_flows.insert(handle, flow);
+                socket_flows.insert(handle, (flow, buf_bytes));
             }
 
             let before_poll = Instant::now();
@@ -307,7 +422,13 @@ impl TcpListenerRunner {
                 // tail and reporting a clean EOF (the read-side analogue of the
                 // write-side half-close truncation fixed in 84685b8).
                 let mut wake_receiver = false;
-                while socket.can_recv() && !control.recv_buffer.is_full() {
+                while socket.can_recv() {
+                    if control.recv_buffer.is_full() {
+                        let max = control.max_recv_ring;
+                        if !grow_ring(&mut control.recv_buffer, max) {
+                            break;
+                        }
+                    }
                     let result = socket.recv(|buffer| {
                         let n = control.recv_buffer.enqueue_slice(buffer);
                         (n, ())
@@ -442,8 +563,9 @@ impl TcpListenerRunner {
             if !sockets_to_remove.is_empty() {
                 let mut flows = live_flows.lock().unwrap();
                 for socket_handle in &sockets_to_remove {
-                    if let Some(flow) = socket_flows.remove(socket_handle) {
+                    if let Some((flow, buf_bytes)) = socket_flows.remove(socket_handle) {
                         flows.remove(&flow);
+                        buffer_bytes.fetch_sub(buf_bytes, Ordering::Relaxed);
                     }
                 }
             }
@@ -651,16 +773,20 @@ impl AsyncWrite for TcpStream {
             return Err(std::io::ErrorKind::BrokenPipe.into()).into();
         }
 
-        // Write to buffer
+        // Write to buffer, growing the ring toward its ceiling before
+        // resorting to backpressure.
 
         if control.send_buffer.is_full() {
-            if let Some(old_waker) = control.send_waker.replace(cx.waker().clone()) {
-                if !old_waker.will_wake(cx.waker()) {
-                    old_waker.wake();
+            let max = control.max_send_ring;
+            if !grow_ring(&mut control.send_buffer, max) {
+                if let Some(old_waker) = control.send_waker.replace(cx.waker().clone()) {
+                    if !old_waker.will_wake(cx.waker()) {
+                        old_waker.wake();
+                    }
                 }
-            }
 
-            return Poll::Pending;
+                return Poll::Pending;
+            }
         }
 
         let n = control.send_buffer.enqueue_slice(buf);
@@ -706,6 +832,44 @@ mod tests {
     use crate::StackBuilder;
     use futures::{SinkExt, StreamExt};
     use std::time::Duration;
+
+    // Ring growth must preserve queued bytes across the old ring's wrap
+    // point, and stop at the ceiling.
+    #[test]
+    fn ring_growth_preserves_wrapped_content() {
+        use smoltcp::storage::RingBuffer;
+        let mut ring = RingBuffer::new(vec![0u8; 8]);
+        assert_eq!(ring.enqueue_slice(&[1, 2, 3, 4, 5, 6]), 6);
+        let mut head = [0u8; 4];
+        assert_eq!(ring.dequeue_slice(&mut head), 4);
+        // Wraps: [5, 6] at the tail, [7..11] around the front.
+        assert_eq!(ring.enqueue_slice(&[7, 8, 9, 10, 11]), 5);
+
+        assert!(super::grow_ring(&mut ring, 32));
+        assert_eq!(ring.capacity(), 32);
+        let mut rest = [0u8; 16];
+        let n = ring.dequeue_slice(&mut rest);
+        assert_eq!(&rest[..n], &[5, 6, 7, 8, 9, 10, 11]);
+
+        assert!(!super::grow_ring(&mut ring, 32), "at the ceiling");
+    }
+
+    // The admission tier flips from LARGE to SMALL exactly when one more
+    // LARGE pair would overrun the budget.
+    #[test]
+    fn buffer_tier_flips_at_the_budget() {
+        let large = 2 * super::LARGE_TCP_BUFFER_SIZE as usize;
+        let small = 2 * super::SMALL_TCP_BUFFER_SIZE as usize;
+        assert_eq!(super::admission_buf_bytes(0), large);
+        assert_eq!(
+            super::admission_buf_bytes(super::TCP_BUFFER_BUDGET - large),
+            large
+        );
+        assert_eq!(
+            super::admission_buf_bytes(super::TCP_BUFFER_BUDGET - large + 1),
+            small
+        );
+    }
 
     /// A bare IPv4 TCP SYN for a distinct 4-tuple.
     fn syn_packet(src_port: u16, dst_port: u16) -> Vec<u8> {
