@@ -111,3 +111,13 @@ harness = false
 [[test]]
 name = "cli_vpn"
 harness = false
+
+# Exit-side netstack under abandoned inner TCP flows: the September 2026
+# "traffic stops until you quit the retrying app" field finding. The final
+# assertion is a known_gap(exit-dial-lifecycle) — red by design until the
+# exit-dial lifecycle fix lands; SPORA_LAB_EXIT=xfail (CI) reports it as an
+# expected failure and flags an unexpected pass so the marker is removed
+# with the fix.
+[[test]]
+name = "exit"
+harness = false

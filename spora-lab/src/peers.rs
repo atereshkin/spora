@@ -407,6 +407,27 @@ impl ClientHandle {
         recv_result(rx, timeout, "tcp upload")
     }
 
+    /// One aborted inner TCP connection through the tunnel: complete the
+    /// inner handshake toward `server`, then immediately RST and walk away
+    /// (an app giving up on a slow destination). `Ok(true)` = handshake
+    /// completed before the abort; `Ok(false)` = the share's netstack
+    /// refused the SYN — what session-pool exhaustion looks like from here.
+    pub fn tcp_aborted_connect(
+        &self,
+        server: impl Into<SocketAddr>,
+        timeout: Duration,
+    ) -> Result<bool, String> {
+        let server = server.into();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmds
+            .send(TrafficCmd::TcpAbortedConnect {
+                server,
+                respond: tx,
+            })
+            .map_err(|_| "client traffic pump is gone".to_string())?;
+        recv_result(rx, timeout, "tcp aborted connect")
+    }
+
     /// Send one tagged echo probe through the tunnel and wait up to `grace`
     /// for the reply: `Ok(Some(rtt))` = tunnel is passing traffic,
     /// `Ok(None)` = probe lost. Cheap enough to call in a loop for

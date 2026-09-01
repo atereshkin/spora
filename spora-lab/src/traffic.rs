@@ -164,6 +164,17 @@ pub enum TrafficCmd {
         grace: Duration,
         respond: tokio::sync::oneshot::Sender<Result<Option<Duration>, String>>,
     },
+    /// One deliberately-abandoned inner TCP connection: complete the inner
+    /// handshake toward `server` (the share's netstack admits the flow and
+    /// starts its outbound dial), then immediately abort (RST) and walk away
+    /// — the shape of an app giving up on a slow destination. `Ok(true)` =
+    /// the handshake completed before the abort; `Ok(false)` = the netstack
+    /// refused the SYN (RST or silence), which is what exhaustion of its
+    /// session pool looks like from the client.
+    TcpAbortedConnect {
+        server: std::net::SocketAddr,
+        respond: tokio::sync::oneshot::Sender<Result<bool, String>>,
+    },
     /// Drop the composed transport chain while the host runtime is still
     /// alive and end the pump. Unlike host teardown (which drops the whole
     /// runtime mid-poll — abrupt, no clean close on the wire), this lets the
@@ -305,6 +316,14 @@ impl TrafficPump {
                     Err("transport is closed".to_string())
                 } else {
                     self.udp_probe(server, grace).await
+                };
+                let _ = respond.send(result);
+            }
+            TrafficCmd::TcpAbortedConnect { server, respond } => {
+                let result = if self.dead {
+                    Err("transport is closed".to_string())
+                } else {
+                    self.tcp_aborted_connect(server).await
                 };
                 let _ = respond.send(result);
             }
@@ -706,6 +725,91 @@ impl TrafficPump {
                         return Err(format!(
                             "transport closed mid-download ({received}/{bytes})"
                         ));
+                    }
+                },
+                _ = tokio::time::sleep(delay) => {}
+            }
+        }
+    }
+
+    /// One abandoned inner TCP connection (see
+    /// [`TrafficCmd::TcpAbortedConnect`]): SYN toward `server`, and the
+    /// moment the handshake completes, close — FIN, the shape of an app
+    /// calling `close()` and moving on — then drop the session without ever
+    /// reading. The share-side netstack has by then admitted the flow and
+    /// started its outbound dial; its socket sits in CLOSE_WAIT until the
+    /// exit side closes its half, so whether the session-pool slot outlives
+    /// the abandonment is exactly what the exit suite probes. (An RST abort
+    /// would drive the netstack socket straight to Closed and free the slot
+    /// immediately — a different, already-working path.) `Ok(false)` = the
+    /// handshake never completed (RST back, or nothing within the deadline).
+    async fn tcp_aborted_connect(&mut self, server: SocketAddr) -> Result<bool, String> {
+        use smoltcp::socket::tcp;
+
+        const DEADLINE: Duration = Duration::from_secs(3);
+        const MAX_IDLE: Duration = Duration::from_millis(20);
+
+        let local_port = self.alloc_port();
+        let opts = TcpOpts::default();
+        let (mut device, mut iface, mut sockets, handle) = tcp_session(server, local_port, &opts)?;
+        let mut reasm = Reassembler::default();
+        let start = std::time::Instant::now();
+
+        loop {
+            iface.poll(SmolInstant::now(), &mut device, &mut sockets);
+            while let Some(frame) = device.tx.pop_front() {
+                self.transport
+                    .send(frame)
+                    .await
+                    .map_err(|e| format!("aborted connect: transport send: {e}"))?;
+            }
+
+            {
+                let sock = sockets.get_mut::<tcp::Socket>(handle);
+                if sock.may_send() {
+                    // Established. Orderly close (queues FIN), push it out,
+                    // and abandon the session — no waiting for the peer's
+                    // half to close.
+                    sock.close();
+                    iface.poll(SmolInstant::now(), &mut device, &mut sockets);
+                    while let Some(frame) = device.tx.pop_front() {
+                        let _ = self.transport.send(frame).await;
+                    }
+                    return Ok(true);
+                }
+                // `connect()` left the socket in SynSent; back to Closed
+                // means the SYN was answered with RST — refused.
+                if sock.state() == tcp::State::Closed {
+                    return Ok(false);
+                }
+            }
+
+            if start.elapsed() > DEADLINE {
+                return Ok(false);
+            }
+
+            let delay = iface
+                .poll_delay(SmolInstant::now(), &sockets)
+                .map(|d| Duration::from_micros(d.total_micros()))
+                .unwrap_or(MAX_IDLE)
+                .min(MAX_IDLE);
+            if delay.is_zero() {
+                continue;
+            }
+
+            tokio::select! {
+                pkt = self.transport.next() => match pkt {
+                    Some(Ok(p)) => {
+                        if let Some(full) = reasm.push(p)
+                            && is_session_tcp(&full, server, local_port)
+                        {
+                            device.rx.push_back(full);
+                        }
+                    }
+                    Some(Err(e)) => log::warn!("aborted connect: transport error: {e}"),
+                    None => {
+                        self.dead = true;
+                        return Err("transport closed mid-connect".into());
                     }
                 },
                 _ = tokio::time::sleep(delay) => {}
