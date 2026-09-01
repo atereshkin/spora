@@ -226,8 +226,8 @@ fn measure_saturation(client: &ClientHandle, path: &str, cond: &str) -> Result<(
         &format!("download_mbps.{path}.{cond}"),
         dl_mbps,
         "mbps",
-        false,
-        0.0,
+        true,
+        15.0,
     );
     let ul = client.tcp_upload(svc(TCP_SINK_PORT), 4 * MIB, perf_opts(), BULK_TIMEOUT)?;
     let ul_mbps = ul.throughput_mbps();
@@ -235,8 +235,8 @@ fn measure_saturation(client: &ClientHandle, path: &str, cond: &str) -> Result<(
         &format!("upload_mbps.{path}.{cond}"),
         ul_mbps,
         "mbps",
-        false,
-        0.0,
+        true,
+        15.0,
     );
     Ok((dl_mbps, ul_mbps))
 }
@@ -364,18 +364,24 @@ fn relay_loss_compare() -> Result<(), String> {
             .tcp_download(svc(TCP_SOURCE_PORT), MIB, perf_opts(), T)
             .map(|s| s.throughput_mbps())
             .unwrap_or(0.0);
+        // Effectively ungated: measured SAME-CODE spreads on these lossy
+        // scenarios are 4-13x run to run (tcp_dl 0.4-5.5, quic_dl 2.5-15,
+        // nz_dl 3-21 Mbit/s over ten runs on one quiet machine) — a stalled
+        // transfer legitimately records 0.0, and the numbers are EXPECTED to
+        // improve as the carriers get better on loss. No percentage gate can
+        // hold that; the band exists so an A/A comparison stays quiet.
         metrics::record(
             &format!("download_mbps.{path}.lossy"),
             dl,
             "mbps",
-            false,
-            0.0,
+            true,
+            60.0,
         );
         let ul = client
             .tcp_upload(svc(TCP_SINK_PORT), 512 * 1024, perf_opts(), T)
             .map(|s| s.throughput_mbps())
             .unwrap_or(0.0);
-        metrics::record(&format!("upload_mbps.{path}.lossy"), ul, "mbps", false, 0.0);
+        metrics::record(&format!("upload_mbps.{path}.lossy"), ul, "mbps", true, 500.0);
         client.stop();
         sharer.stop();
         Ok((dl, ul))
@@ -394,14 +400,17 @@ fn relay_loss_compare() -> Result<(), String> {
     } else {
         f64::INFINITY
     };
+    // Trade-off quantifiers, not gates: the ratio SHRINKS whenever the TCP
+    // carrier improves under loss, which is progress, not regression. The
+    // very wide band keeps perf-diff quiet in both directions.
     metrics::record(
         "loss_download_ratio.udp_over_tcp",
         dl_ratio,
         "x",
-        false,
-        0.0,
+        true,
+        500.0,
     );
-    metrics::record("loss_upload_ratio.udp_over_tcp", ul_ratio, "x", false, 0.0);
+    metrics::record("loss_upload_ratio.udp_over_tcp", ul_ratio, "x", true, 500.0);
     log::info!(
         "LOSS A/B ({SPEC}): download UDP {dl_udp:.1} vs TCP {dl_tcp:.1} Mbit/s ({dl_ratio:.1}x); \
          upload UDP {ul_udp:.1} vs TCP {ul_tcp:.1} Mbit/s ({ul_ratio:.1}x)"
@@ -474,12 +483,12 @@ fn relay_nz_loss() -> Result<(), String> {
         .tcp_download(svc(TCP_SOURCE_PORT), 512 * 1024, perf_opts(), T)
         .map(|s| s.throughput_mbps())
         .unwrap_or(0.0);
-    metrics::record("download_mbps.relay_nz.lossy", dl, "mbps", false, 0.0);
+    metrics::record("download_mbps.relay_nz.lossy", dl, "mbps", true, 500.0);
     let ul = client
         .tcp_upload(svc(TCP_SINK_PORT), 256 * 1024, perf_opts(), T)
         .map(|s| s.throughput_mbps())
         .unwrap_or(0.0);
-    metrics::record("upload_mbps.relay_nz.lossy", ul, "mbps", false, 0.0);
+    metrics::record("upload_mbps.relay_nz.lossy", ul, "mbps", true, 500.0);
     log::info!(
         "relay_nz lossy: download {dl:.2} Mbit/s, upload {ul:.2} Mbit/s (no pacer — collapse expected)"
     );
