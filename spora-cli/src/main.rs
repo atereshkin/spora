@@ -641,8 +641,10 @@ enum UseMode {
     /// Bring the interface up and manage routes/MTU/resolver (the VPN client).
     Vpn(vpn::Options),
     /// Attach to a pre-created TUN and only pump packets: the caller owns the
-    /// interface's address, MTU, routes and cleanup. This is the contract the
-    /// field lab drives; it must keep touching nothing else on the host.
+    /// interface's address, MTU, routes and cleanup. A Linux-only product
+    /// feature exercised by the in-tree `cli_vpn` lab test; the field lab
+    /// drives the ordinary VPN mode (`--route`/`--no-dns`) instead. It must
+    /// keep touching nothing else on the host.
     Attach(String),
 }
 

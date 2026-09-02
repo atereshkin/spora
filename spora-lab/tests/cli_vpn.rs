@@ -2,8 +2,9 @@
 //! the interface up, route the host through it, swap the resolver, follow the
 //! path's MTU, keep its own outer sockets out of the tunnel (the relay socket
 //! AND the hole-punched one), and put everything back when it exits — and
-//! `--tun-name` must keep touching nothing, because the field lab relies on
-//! that contract.
+//! `--tun-name` must keep touching nothing: attach mode is a Linux-only
+//! product feature whose sole consumer is this suite (the field lab drives
+//! the ordinary VPN mode with `--route`/`--no-dns` instead).
 //!
 //! Unlike the other suites this one runs the real `spora-cli` binary (as the
 //! sharer and as the client) inside the lab namespaces and reads its `--json`
@@ -946,8 +947,8 @@ fn split_tunnel() -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-// 4. --tun-name: the field lab's contract — the caller's interface is used
-//    as is and nothing else on the host moves, not even the MTU
+// 4. --tun-name: the attach contract — the caller's interface is used as is
+//    and nothing else on the host moves, not even the MTU
 
 fn attach_mode_touches_nothing() -> Result<(), String> {
     let topo = Topology::build(&TopologySpec::new(
@@ -967,8 +968,8 @@ fn attach_mode_touches_nothing() -> Result<(), String> {
         .run(&format!("ip link set dev {tun} mtu 1280 up"))?;
     // Route a service into the TUN — but never the relay's own address:
     // attach mode has no socket protector (the caller owns routing policy),
-    // so the relay dial must stay off the TUN, exactly as the field lab
-    // routes only its probe hosts.
+    // so the relay dial must stay off the TUN, exactly as a caller routing
+    // only its probe hosts would.
     topo.client.run(&format!(
         "ip route replace {WAN_SERVICES_IP_ALT}/32 dev {tun}"
     ))?;

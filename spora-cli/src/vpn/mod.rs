@@ -34,8 +34,10 @@
 //! or a state file so the *next* start restores it first.
 //!
 //! `spora use --tun-name <name>` does not come through here at all: that is the
-//! attach-only contract the field lab relies on (the caller owns the
-//! interface's address, MTU, routes and cleanup), and it is left untouched.
+//! Linux-only attach mode (the caller owns the interface's address, MTU,
+//! routes and cleanup), used by the in-tree `cli_vpn` lab test and left
+//! untouched. The field lab drives the ordinary VPN mode through this module
+//! (`--route <ip>/32` host routes plus `--no-dns`).
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};

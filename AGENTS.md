@@ -176,9 +176,11 @@ exactly when sweeping is safe. Key invariants:
   would leak is either process-lifetime (the interface) or recovered at the
   next start (rules sweep, resolv.conf backup, macOS DNS state file).
 - **`--tun-name <name>` attaches to a pre-created TUN and touches NOTHING
-  else** — the field-lab contract: caller owns address, MTU, routes, cleanup.
-  Attach mode installs no protector, so the caller must not route the relay
-  endpoint into the TUN.
+  else** — a Linux-only product feature used by the in-tree `cli_vpn` lab
+  test: caller owns address, MTU, routes, cleanup. Attach mode installs no
+  protector, so the caller must not route the relay endpoint into the TUN.
+  The field lab no longer drives it; it runs the ordinary VPN mode as root
+  with split-tunnel host routes (`--route <ip>/32`) and `--no-dns`.
 - e2e coverage: `cargo test -p spora-lab --test cli_vpn` (spawns the real
   binary in netns; needs `target/debug/spora-cli` built first). The macOS and
   Windows backends are compile-checked (`--target aarch64-apple-darwin` needs
