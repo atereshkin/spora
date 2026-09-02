@@ -85,8 +85,8 @@ jobs:
 
   cli-macos:
     # Same rationale for macOS (utun + BSD route/ifconfig backend). The unit
-    # tests for the cross-platform parsers run in the ubuntu job; this one
-    # keeps the darwin-gated code compiling.
+    # the cross-platform parsers are tested in the ubuntu job too; this one
+    # compiles AND tests the darwin-gated code (vpn::macos).
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
@@ -97,6 +97,7 @@ jobs:
           key: cli-macos
           cache-on-failure: true
       - run: cargo check -p spora-cli
+      - run: cargo test -p spora-cli
 
   test:
     runs-on: ubuntu-latest

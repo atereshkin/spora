@@ -152,7 +152,16 @@ exactly when sweeping is safe. Key invariants:
   not known when routes are installed): `SO_MARK 0x5350` on Linux,
   `IP_BOUND_IF` (macOS) / `IP_UNICAST_IF` (Windows) to the uplink interface,
   which is re-detected on every `Reconnecting` event. `SocketProtector` takes
-  a `SocketHandle` (fd on Unix, `SOCKET` on Windows) for this.
+  a `SocketHandle` (fd on Unix, `SOCKET` on Windows) for this. On macOS the
+  bind alone is NOT enough under the half-default routes: a bound socket gets
+  a *scoped* route lookup, `0.0.0.0/1` on the utun becomes the best match for
+  every public address (XNU's default-route fallback even resolves `0.0.0.0`
+  to it), and every send fails with `ENETUNREACH` — cached routes included,
+  since any table change invalidates them. So the macOS backend also keeps a
+  default route *scoped to the uplink* (`route add default <gw> -ifscope
+  en0`, v6 alike): installed before the tunnel routes, re-pointed on every
+  reconnect, removed on exit unless it pre-existed. `route(8)` exits 0 on
+  refusals, so its output text is the verdict.
 - **MTU follows `Config.mtu_callback`** (the carrier's datagram budget,
   re-reported after a direct upgrade): TUN MTU = report, floored at 576 — or
   at 1280 while the TUN carries IPv6 (below that the kernel disables v6; the

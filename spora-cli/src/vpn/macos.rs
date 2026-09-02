@@ -13,8 +13,21 @@
 //! assumed auto-bypass, and excluded routes proved unreliable), so every
 //! socket spora-core opens is bound to the uplink interface index with
 //! `IP_BOUND_IF`/`IPV6_BOUND_IF`, the same mechanism the NetworkExtension
-//! client uses. The index is re-read whenever the tunnel reconnects, so a
-//! Wi-Fi → Ethernet change is picked up on the next redial.
+//! client uses. Binding alone is not enough, though. A bound socket gets a
+//! *scoped* route lookup, which insists that the best match lie on the bound
+//! interface, and once `0.0.0.0/1` exists it IS the best match for every
+//! public address — XNU's "fall back to the default route" step even resolves
+//! `0.0.0.0` to it. Every send then fails with ENETUNREACH, and because the
+//! kernel invalidates all cached routes on any table change, that includes
+//! the sockets that were already talking. The cure is a default route
+//! *scoped to the uplink* (`route add default <gw> -ifscope en0`), which the
+//! scoped lookup finds before anything else: it is put in place (or, if one
+//! is already there, re-pointed at the current gateway — a killed run may
+//! have left a stale one) before the relay dial, again before the tunnel
+//! routes, and whenever the tunnel reconnects (a new uplink gets its own);
+//! ours is deleted on exit. The index is
+//! re-read at the same moments, so a Wi-Fi → Ethernet change is picked up on
+//! the next redial.
 //!
 //! Resolver: `networksetup -setdnsservers` on every enabled network service,
 //! with the previous values saved to a state file first — after a crash, the
@@ -25,15 +38,20 @@
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::{Arc, Mutex};
 
+use super::parsers::RouteOutcome;
 use super::{Options, Prefix, Undo, UndoStack, parsers, run_cmd_output, svec};
 
 /// Where the pre-change resolver settings are kept while we run, so a later
 /// start can restore them if this one never got to. A fixed system path:
 /// `sudo` changes `$HOME`, and the file must be found regardless.
 const DNS_STATE: &str = "/var/db/spora/dns-restore.json";
+/// The default routes scoped to the uplink that this run added, so a start
+/// after a SIGKILL can remove them: they live on the uplink, not the utun,
+/// and would otherwise outlive every run (same pattern as `DNS_STATE`).
+const UPLINK_ROUTE_STATE: &str = "/var/db/spora/uplink-routes.json";
 /// Held (locked) for the whole session; see `super::acquire_instance_lock`.
 const INSTANCE_LOCK: &str = "/var/db/spora/use.lock";
 const UTUN_CONTROL: &str = "com.apple.net.utun_control";
@@ -44,8 +62,25 @@ pub struct Backend {
     fd: OwnedFd,
     uplink4: Arc<AtomicU32>,
     uplink6: Arc<AtomicU32>,
+    /// The default routes scoped to the uplink that keep bound sockets
+    /// routable (see the module docs).
+    uplink_routes: Mutex<Vec<UplinkRoute>>,
     /// The instance lock, held until the session ends.
     _lock: std::fs::File,
+}
+
+/// A default route scoped to the uplink interface.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UplinkRoute {
+    /// `-inet` or `-inet6`.
+    family: &'static str,
+    /// The gateway arguments: `[address]`, or `["-interface", ifname]` for a
+    /// directly attached default (`link#N` in netstat).
+    via: Vec<String>,
+    /// The uplink interface the route is scoped to.
+    ifscope: String,
+    /// Whether this run created it (deleted on exit) or found it (left as is).
+    ours: bool,
 }
 
 pub type PumpHandle = OwnedFd;
@@ -54,6 +89,7 @@ impl Backend {
     pub fn setup(opts: &Options, _undo: &mut UndoStack) -> Result<Backend, String> {
         let lock = super::acquire_instance_lock(INSTANCE_LOCK)?;
         restore_stale_dns();
+        sweep_stale_uplink_routes();
         let (fd, name) = open_utun().map_err(friendly_utun_error)?;
         let mask = super::v4_netmask(opts.tun_prefix).to_string();
         run_cmd_output(
@@ -89,8 +125,12 @@ impl Backend {
             fd,
             uplink4: Arc::new(AtomicU32::new(0)),
             uplink6: Arc::new(AtomicU32::new(0)),
+            uplink_routes: Mutex::new(Vec::new()),
             _lock: lock,
         };
+        // Before the relay dial: bound sockets consult a scoped default from
+        // the start, and one left behind by a killed run may name a gateway
+        // this network no longer has.
         backend.refresh_uplink();
         if backend.uplink4.load(Ordering::Relaxed) == 0 {
             log::warn!(
@@ -151,14 +191,37 @@ impl Backend {
         routes: &[Prefix],
         undo: &mut UndoStack,
     ) -> Result<(), String> {
+        // Make sure the uplink routes are in place before the first tunnel
+        // route: that add invalidates every cached route in the kernel, and
+        // the relay socket must find its scoped default on the very next send.
+        self.ensure_uplink_routes();
         for p in routes {
             for target in half_defaults(*p) {
                 let family = if p.is_ipv4() { "-inet" } else { "-inet6" };
-                run_cmd_output(
-                    "route",
-                    &svec(&["-q", "-n", "add", family, &target, "-interface", &self.name]),
-                )
-                .map_err(|e| format!("cannot route {target} into {}: {e}", self.name))?;
+                match route_cmd(&svec(&[
+                    "-n",
+                    "add",
+                    family,
+                    &target,
+                    "-interface",
+                    &self.name,
+                ]))
+                .map_err(|e| format!("cannot route {target} into {}: {e}", self.name))?
+                {
+                    RouteOutcome::Done => {}
+                    RouteOutcome::Exists => {
+                        return Err(format!(
+                            "cannot route {target} into {}: a route for {target} already exists (another VPN?)",
+                            self.name
+                        ));
+                    }
+                    RouteOutcome::Missing => {
+                        return Err(format!(
+                            "cannot route {target} into {}: the routing socket reported it missing",
+                            self.name
+                        ));
+                    }
+                }
                 undo.push(Undo::Cmd(svec(&[
                     "route",
                     "-q",
@@ -218,9 +281,101 @@ impl Backend {
     }
 
     /// Re-read which interface carries the system's default route(s), for
-    /// the protector to bind new sockets to.
+    /// the protector to bind new sockets to, and give a changed uplink its
+    /// scoped default route.
     pub fn refresh_uplink(&self) {
         refresh_uplinks(&self.name, &self.uplink4, &self.uplink6);
+        self.ensure_uplink_routes();
+    }
+
+    /// Keep one default route scoped to the uplink, per address family that
+    /// has an uplink, so sockets bound with `IP_BOUND_IF` still resolve a
+    /// route once the tunnel's half-defaults shadow the primary default (see
+    /// the module docs). Idempotent, and driven by the routing TABLE rather
+    /// than by memory: the kernel drops the scoped route together with the
+    /// interface's address (Wi-Fi bounce, sleep/wake), so every call checks
+    /// what is actually there. Runs at setup, before the tunnel routes, and
+    /// after every reconnect; a new uplink gets its own route and the old
+    /// one keeps its (still-bound sockets may need it) until exit.
+    fn ensure_uplink_routes(&self) {
+        let mut routes = self.uplink_routes.lock().unwrap();
+        let mut added = false;
+        for (family, netstat_family) in [("-inet", "inet"), ("-inet6", "inet6")] {
+            let Ok(table) = run_cmd_output("netstat", &svec(&["-rn", "-f", netstat_family])) else {
+                continue;
+            };
+            let Some((gateway, netif)) = parsers::darwin_netstat_default_route(&table, &self.name)
+            else {
+                continue;
+            };
+            let via = parsers::darwin_uplink_route_via(&gateway, &netif);
+            let present = parsers::darwin_netstat_scoped_default(&table, &netif)
+                .map(|gw| parsers::darwin_uplink_route_via(&gw, &netif));
+            let tracked = routes
+                .iter()
+                .position(|r| r.family == family && r.ifscope == netif);
+            let (verb, ours) = match (present, tracked) {
+                // In place and pointing at the current gateway.
+                (Some(p), Some(i)) if p == via => {
+                    routes[i].via = via;
+                    continue;
+                }
+                // The system (or an earlier run) keeps one: adopt it, leave it on exit.
+                (Some(p), None) if p == via => ("", false),
+                // There, but at another gateway (a stale one from a killed run,
+                // or a DHCP change): re-point it, ownership unchanged.
+                (Some(_), tracked) => ("change", tracked.is_some_and(|i| routes[i].ours)),
+                // Missing (never there, or flushed with the address): ours now.
+                (None, _) => ("add", true),
+            };
+            if !verb.is_empty() {
+                let args = parsers::darwin_uplink_route_args(verb, family, &via, &netif);
+                match route_cmd(&args) {
+                    Ok(RouteOutcome::Done) => {}
+                    Ok(RouteOutcome::Exists) => {
+                        // Raced into the table between the read and the add.
+                        let args =
+                            parsers::darwin_uplink_route_args("change", family, &via, &netif);
+                        if let Err(e) = route_cmd(&args) {
+                            log::warn!("uplink route: {e}");
+                        }
+                    }
+                    Ok(RouteOutcome::Missing) => {
+                        log::warn!(
+                            "uplink route for {netstat_family}: the routing socket rejected it"
+                        );
+                        continue;
+                    }
+                    Err(e) => {
+                        log::warn!("uplink route for {netstat_family}: {e}");
+                        continue;
+                    }
+                }
+            }
+            log::info!(
+                "{netstat_family} uplink route: default via {} scoped to {netif} ({})",
+                via.join(" "),
+                match verb {
+                    "add" => "added",
+                    "change" => "re-pointed",
+                    _ => "already present",
+                }
+            );
+            let entry = UplinkRoute {
+                family,
+                via,
+                ifscope: netif,
+                ours,
+            };
+            match tracked {
+                Some(i) => routes[i] = entry,
+                None => routes.push(entry),
+            }
+            added |= ours;
+        }
+        if added {
+            write_uplink_state(&routes);
+        }
     }
 
     pub fn pump_handle(&self) -> Result<PumpHandle, String> {
@@ -229,7 +384,91 @@ impl Backend {
             .map_err(|e| format!("cannot dup the utun descriptor: {e}"))
     }
 
-    pub fn closed(&self) {}
+    /// Runs after the undo stack (tunnel routes, resolver) has unwound:
+    /// remove the uplink routes this run added.
+    pub fn closed(&self) {
+        let mut routes = self.uplink_routes.lock().unwrap();
+        for r in routes.drain(..) {
+            if r.ours
+                && let Err(e) = route_cmd(&parsers::darwin_uplink_route_args(
+                    "delete", r.family, &r.via, &r.ifscope,
+                ))
+            {
+                log::warn!("cleanup: {e}");
+            }
+        }
+        let _ = std::fs::remove_file(UPLINK_ROUTE_STATE);
+    }
+}
+
+/// Run `route -n <args>` and judge it by its output (see
+/// `parsers::darwin_route_outcome`).
+fn route_cmd(args: &[String]) -> Result<RouteOutcome, String> {
+    log::debug!("# route {}", args.join(" "));
+    let out = std::process::Command::new("route")
+        .args(args)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .map_err(|e| format!("route: cannot run: {e}"))?;
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    parsers::darwin_route_outcome(out.status.success(), &text)
+        .map_err(|detail| format!("route {} failed ({}): {detail}", args.join(" "), out.status))
+}
+
+/// Persist which scoped defaults are ours: `[{"family": "-inet", "ifscope":
+/// "en0"}, …]`.
+fn write_uplink_state(routes: &[UplinkRoute]) {
+    let list: Vec<serde_json::Value> = routes
+        .iter()
+        .filter(|r| r.ours)
+        .map(|r| serde_json::json!({"family": r.family, "ifscope": r.ifscope}))
+        .collect();
+    if let Some(dir) = Path::new(UPLINK_ROUTE_STATE).parent()
+        && let Err(e) = std::fs::create_dir_all(dir)
+    {
+        log::warn!("cannot create {}: {e}", dir.display());
+        return;
+    }
+    if let Err(e) = std::fs::write(
+        UPLINK_ROUTE_STATE,
+        serde_json::Value::Array(list).to_string(),
+    ) {
+        log::warn!("cannot write {UPLINK_ROUTE_STATE}: {e}");
+    }
+}
+
+/// A killed run cannot delete its scoped defaults; the next start (under
+/// the instance lock, so no other run is live) removes what the state file
+/// names. `ensure_uplink_routes` then puts a fresh one in place.
+fn sweep_stale_uplink_routes() {
+    let Ok(text) = std::fs::read_to_string(UPLINK_ROUTE_STATE) else {
+        return;
+    };
+    log::warn!("removing the uplink routes an earlier run left behind ({UPLINK_ROUTE_STATE})");
+    if let Ok(serde_json::Value::Array(list)) = serde_json::from_str::<serde_json::Value>(&text) {
+        for item in list {
+            let (Some(family), Some(ifscope)) = (item["family"].as_str(), item["ifscope"].as_str())
+            else {
+                continue;
+            };
+            if family != "-inet" && family != "-inet6" {
+                continue;
+            }
+            if let Err(e) = route_cmd(&parsers::darwin_uplink_route_args(
+                "delete",
+                family,
+                &[],
+                ifscope,
+            )) {
+                log::warn!("stale uplink route: {e}");
+            }
+        }
+    }
+    let _ = std::fs::remove_file(UPLINK_ROUTE_STATE);
 }
 
 pub async fn run_pump(transport: spora_core::IpTransport, fd: PumpHandle) -> io::Result<()> {

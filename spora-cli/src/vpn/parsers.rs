@@ -20,18 +20,116 @@ pub fn ip_rules(output: &str) -> Vec<(u32, String)> {
 /// The interface of the system's `default` route in macOS `netstat -rn -f
 /// inet|inet6` output, skipping routes on `exclude` (our own tunnel: once
 /// `0.0.0.0/1` is installed, `route get default` would resolve to it, but
-/// the uplink's `default` row stays in the table). Columns are
-/// `Destination Gateway Flags Netif [Expire]`.
+/// the uplink's `default` row stays in the table).
 pub fn darwin_netstat_default_interface(output: &str, exclude: &str) -> Option<String> {
-    output.lines().find_map(|l| {
+    darwin_netstat_default_route(output, exclude).map(|(_, netif)| netif)
+}
+
+/// The `(gateway, interface)` of the system's `default` route in macOS
+/// `netstat -rn -f inet|inet6` output, skipping routes on `exclude`. Columns
+/// are `Destination Gateway Flags Netif [Expire]`; the gateway is an
+/// address (`192.168.1.1`, `fe80::1%en0`) or a link (`link#11`) for a
+/// directly attached default.
+pub fn darwin_netstat_default_route(output: &str, exclude: &str) -> Option<(String, String)> {
+    let rows: Vec<(String, String, bool)> = darwin_default_rows(output)
+        .filter(|(_, netif, _)| netif != exclude)
+        .collect();
+    // The primary (unscoped) row is the uplink of record; a scoped one (`I`
+    // flag) only if that is all there is.
+    rows.iter()
+        .find(|(_, _, scoped)| !scoped)
+        .or_else(|| rows.first())
+        .map(|(gateway, netif, _)| (gateway.clone(), netif.clone()))
+}
+
+/// The gateway of the `default` route *scoped to* `netif` (Flags carry
+/// `I`, RTF_IFSCOPE) in macOS `netstat -rn -f inet|inet6` output, if one is
+/// in the table. This is the row bound sockets rely on; the kernel drops it
+/// together with the interface's address, so it must be looked up, never
+/// remembered.
+pub fn darwin_netstat_scoped_default(output: &str, netif: &str) -> Option<String> {
+    darwin_default_rows(output)
+        .find(|(_, n, scoped)| *scoped && n == netif)
+        .map(|(gateway, _, _)| gateway)
+}
+
+/// Every `default` row as `(gateway, netif, scoped)`. Columns are
+/// `Destination Gateway Flags Netif [Expire]`; a missing Expire column does
+/// not shift Netif.
+fn darwin_default_rows(output: &str) -> impl Iterator<Item = (String, String, bool)> + '_ {
+    output.lines().filter_map(|l| {
         let cols: Vec<&str> = l.split_whitespace().collect();
         if cols.first() != Some(&"default") {
             return None;
         }
-        // Netif is the 4th column; a missing Expire column does not shift it.
+        let gateway = cols.get(1)?;
+        let flags = cols.get(2)?;
         let netif = cols.get(3)?;
-        (*netif != exclude).then(|| netif.to_string())
+        Some((gateway.to_string(), netif.to_string(), flags.contains('I')))
     })
+}
+
+/// How macOS `route(8)` answered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RouteOutcome {
+    Done,
+    /// `File exists`: the route is already in the table.
+    Exists,
+    /// `not in table`: nothing to change or delete.
+    Missing,
+}
+
+/// The verdict of a macOS `route(8)` run from its exit status and combined
+/// stdout+stderr. `route` exits 0 even when the routing socket refuses the
+/// change, so the text is what counts.
+pub fn darwin_route_outcome(success: bool, text: &str) -> Result<RouteOutcome, String> {
+    if text.contains("File exists") {
+        return Ok(RouteOutcome::Exists);
+    }
+    if text.contains("not in table") {
+        return Ok(RouteOutcome::Missing);
+    }
+    let complained = text
+        .lines()
+        .any(|l| l.starts_with("route:") || l.contains("writing to routing socket"));
+    if !success || complained {
+        return Err(text.trim().to_string());
+    }
+    Ok(RouteOutcome::Done)
+}
+
+/// The gateway arguments of a default route scoped to an uplink: the
+/// address, or `-interface <netif>` when netstat shows a directly attached
+/// default (`link#N`).
+pub fn darwin_uplink_route_via(gateway: &str, netif: &str) -> Vec<String> {
+    if gateway.starts_with("link#") {
+        vec!["-interface".to_string(), netif.to_string()]
+    } else {
+        vec![gateway.to_string()]
+    }
+}
+
+/// `route -n <verb> <family> default [<via>] -ifscope <ifscope>`: the
+/// scoped default route for an uplink. A delete needs no gateway; the scope
+/// alone identifies the route.
+pub fn darwin_uplink_route_args(
+    verb: &str,
+    family: &str,
+    via: &[String],
+    ifscope: &str,
+) -> Vec<String> {
+    let mut args = vec![
+        "-n".to_string(),
+        verb.to_string(),
+        family.to_string(),
+        "default".to_string(),
+    ];
+    if verb != "delete" {
+        args.extend(via.iter().cloned());
+    }
+    args.push("-ifscope".to_string());
+    args.push(ifscope.to_string());
+    args
 }
 
 /// The enabled services in macOS `networksetup -listallnetworkservices`
@@ -111,6 +209,148 @@ mod tests {
             darwin_netstat_default_interface("Routing tables\n", "utun4"),
             None
         );
+    }
+
+    #[test]
+    fn darwin_netstat_default_route_carries_the_gateway() {
+        let out = "Routing tables\n\nInternet:\nDestination        Gateway            Flags               Netif Expire\n0/1                utun0              UScg                utun0       \ndefault            192.168.23.254     UGScg                 en0       \ndefault            192.168.23.254     UGScIg                en0       \n127                127.0.0.1          UCS                   lo0       \n";
+        assert_eq!(
+            darwin_netstat_default_route(out, "utun0"),
+            Some(("192.168.23.254".to_string(), "en0".to_string()))
+        );
+        let ppp = "Internet:\nDestination        Gateway            Flags           Netif Expire\ndefault            link#22            UCSg            utun4       \ndefault            link#14            UCScg           ppp0       \n";
+        assert_eq!(
+            darwin_netstat_default_route(ppp, "utun4"),
+            Some(("link#14".to_string(), "ppp0".to_string()))
+        );
+        let v6 = "Internet6:\nDestination                             Gateway                                 Flags           Netif Expire\ndefault                                 fe80::1%en0                             UGcg              en0       \n";
+        assert_eq!(
+            darwin_netstat_default_route(v6, "utun4"),
+            Some(("fe80::1%en0".to_string(), "en0".to_string()))
+        );
+        assert_eq!(
+            darwin_netstat_default_route("Routing tables\n", "utun0"),
+            None
+        );
+    }
+
+    #[test]
+    fn darwin_netstat_scoped_default_is_the_i_flagged_row_for_the_interface() {
+        let out = "Internet:\nDestination        Gateway            Flags               Netif Expire\n0/1                utun0              UScg                utun0       \ndefault            192.168.23.254     UGScg                 en0       \ndefault            192.168.23.1       UGScIg                en0       \ndefault            link#11            UCScIg                en7      !\n";
+        assert_eq!(
+            darwin_netstat_scoped_default(out, "en0").as_deref(),
+            Some("192.168.23.1")
+        );
+        assert_eq!(
+            darwin_netstat_scoped_default(out, "en7").as_deref(),
+            Some("link#11")
+        );
+        assert_eq!(darwin_netstat_scoped_default(out, "utun0"), None);
+        // The primary row wins for the uplink of record even when a scoped
+        // one is listed first.
+        let scoped_first = "Internet:\ndefault            10.0.0.1           UGScIg                en0       \ndefault            10.0.0.254         UGScg                 en0       \n";
+        assert_eq!(
+            darwin_netstat_default_route(scoped_first, "utun0"),
+            Some(("10.0.0.254".to_string(), "en0".to_string()))
+        );
+        let only_scoped =
+            "Internet:\ndefault            10.0.0.1           UGScIg                en0       \n";
+        assert_eq!(
+            darwin_netstat_default_route(only_scoped, "utun0"),
+            Some(("10.0.0.1".to_string(), "en0".to_string()))
+        );
+    }
+
+    #[test]
+    fn darwin_uplink_route_commands_are_scoped_and_gateway_aware() {
+        let wifi = darwin_uplink_route_via("192.168.23.254", "en0");
+        assert_eq!(wifi, vec!["192.168.23.254"]);
+        assert_eq!(
+            darwin_uplink_route_args("add", "-inet", &wifi, "en0"),
+            vec![
+                "-n",
+                "add",
+                "-inet",
+                "default",
+                "192.168.23.254",
+                "-ifscope",
+                "en0"
+            ]
+        );
+        assert_eq!(
+            darwin_uplink_route_args("change", "-inet", &wifi, "en0"),
+            vec![
+                "-n",
+                "change",
+                "-inet",
+                "default",
+                "192.168.23.254",
+                "-ifscope",
+                "en0"
+            ]
+        );
+        assert_eq!(
+            darwin_uplink_route_args("delete", "-inet", &wifi, "en0"),
+            vec!["-n", "delete", "-inet", "default", "-ifscope", "en0"]
+        );
+        let ppp = darwin_uplink_route_via("link#14", "ppp0");
+        assert_eq!(
+            darwin_uplink_route_args("add", "-inet", &ppp, "ppp0"),
+            vec![
+                "-n",
+                "add",
+                "-inet",
+                "default",
+                "-interface",
+                "ppp0",
+                "-ifscope",
+                "ppp0"
+            ]
+        );
+        let v6 = darwin_uplink_route_via("fe80::1%en0", "en0");
+        assert_eq!(
+            darwin_uplink_route_args("add", "-inet6", &v6, "en0"),
+            vec![
+                "-n",
+                "add",
+                "-inet6",
+                "default",
+                "fe80::1%en0",
+                "-ifscope",
+                "en0"
+            ]
+        );
+    }
+
+    #[test]
+    fn darwin_route_output_is_the_verdict_not_the_exit_status() {
+        assert_eq!(
+            darwin_route_outcome(true, "add net default: gateway 192.168.23.254\n"),
+            Ok(RouteOutcome::Done)
+        );
+        assert_eq!(
+            darwin_route_outcome(
+                true,
+                "route: writing to routing socket: File exists\nadd net default: gateway 192.168.23.254: File exists\n"
+            ),
+            Ok(RouteOutcome::Exists)
+        );
+        assert_eq!(
+            darwin_route_outcome(
+                true,
+                "delete net default: not in table\nroute: writing to routing socket: not in table\n"
+            ),
+            Ok(RouteOutcome::Missing)
+        );
+        assert!(
+            darwin_route_outcome(
+                true,
+                "route: writing to routing socket: Network is unreachable\n"
+            )
+            .is_err()
+        );
+        assert!(darwin_route_outcome(false, "").is_err());
+        assert_eq!(darwin_route_outcome(true, ""), Ok(RouteOutcome::Done));
     }
 
     #[test]
