@@ -71,10 +71,11 @@ pub const DEFAULT_TUN_ADDR: &str = "10.11.0.2/24";
 /// Default client IPv6 address inside the tunnel: ULA, as `--os-routing`
 /// sharers require for v6 client sources.
 pub const DEFAULT_TUN_ADDR6: &str = "fd00:5350::2/64";
-/// Default resolvers pushed into the tunnel. They must be public: a sharer
-/// drops inner traffic to private destinations, so a LAN resolver would go
-/// unanswered. Two operators, so one outage does not take DNS down.
-pub const DEFAULT_DNS: [&str; 2] = ["8.8.8.8", "1.1.1.1"];
+/// Default resolver pushed into the tunnel: the sharer's DNS forwarder at
+/// its synthetic address (`spora_core::dns::PROXY_ADDR`), which answers
+/// with the sharer's own resolvers. Any other resolver must be public: a
+/// sharer drops inner traffic to private destinations.
+pub const DEFAULT_DNS: [&str; 1] = ["100.64.0.53"];
 /// TUN MTU before spora-core reports the path's budget (the Android default).
 pub const INITIAL_MTU: u16 = 1280;
 /// Smallest MTU the TUN is ever set to (the IPv4 minimum reassembly size).
@@ -467,9 +468,10 @@ impl Options {
             .collect()
     }
 
-    /// Resolvers that the sharer would never answer (private destinations)
-    /// — a misconfiguration worth a loud warning, not an error (a split
-    /// tunnel may well reach them locally).
+    /// Resolvers that the sharer would never answer (private destinations,
+    /// other than its DNS forwarder's own synthetic address) — a
+    /// misconfiguration worth a loud warning, not an error (a split tunnel
+    /// may well reach them locally).
     pub fn unreachable_resolvers(&self) -> Vec<IpAddr> {
         if self.routes != RouteSet::Default {
             return Vec::new();
@@ -477,7 +479,9 @@ impl Options {
         self.dns
             .iter()
             .copied()
-            .filter(|ip| is_private_destination(*ip))
+            .filter(|ip| {
+                is_private_destination(*ip) && *ip != IpAddr::V4(spora_core::dns::PROXY_ADDR)
+            })
             .collect()
     }
 }
@@ -798,11 +802,18 @@ mod tests {
             o.route_prefixes(),
             vec![Prefix::V4_DEFAULT, Prefix::V6_DEFAULT]
         );
-        assert_eq!(o.dns.len(), 2);
-        assert_eq!(o.dns[0], "8.8.8.8".parse::<IpAddr>().unwrap());
+        assert_eq!(o.dns, vec![IpAddr::V4(spora_core::dns::PROXY_ADDR)]);
+        assert_eq!(
+            DEFAULT_DNS[0].parse::<Ipv4Addr>().unwrap(),
+            spora_core::dns::PROXY_ADDR,
+            "the literal default must stay the core's forwarder address"
+        );
         assert_eq!(o.mtu, MtuPolicy::Auto);
         assert_eq!(o.initial_mtu(), INITIAL_MTU);
-        assert!(o.unreachable_resolvers().is_empty());
+        assert!(
+            o.unreachable_resolvers().is_empty(),
+            "the forwarder address is private (CGNAT) but answered"
+        );
     }
 
     #[test]
@@ -894,7 +905,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(o.route_prefixes().len(), 2, "duplicates collapse");
-        assert_eq!(o.dns.len(), 2, "split tunnels still get the resolver");
+        assert_eq!(o.dns.len(), 1, "split tunnels still get the resolver");
         let o = Options::parse(
             DEFAULT_TUN_ADDR,
             DEFAULT_TUN_ADDR6,
@@ -1026,7 +1037,7 @@ mod tests {
             false,
             &["10.0.0.0/8".into(), "8.8.0.0/16".into()],
             false,
-            &[],
+            &["8.8.8.8".into(), "1.1.1.1".into()],
             false,
             None,
         )
@@ -1036,6 +1047,27 @@ mod tests {
             o.resolver_routes(),
             vec![Prefix {
                 addr: "1.1.1.1".parse().unwrap(),
+                len: 32
+            }]
+        );
+        // The default resolver (the sharer's forwarder) gets one as well: a
+        // split tunnel would otherwise send its queries out the uplink,
+        // where nothing answers that address.
+        let o = Options::parse(
+            DEFAULT_TUN_ADDR,
+            DEFAULT_TUN_ADDR6,
+            false,
+            &["10.0.0.0/8".into()],
+            false,
+            &[],
+            false,
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            o.resolver_routes(),
+            vec![Prefix {
+                addr: IpAddr::V4(spora_core::dns::PROXY_ADDR),
                 len: 32
             }]
         );

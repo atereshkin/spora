@@ -19,7 +19,13 @@
 //!    them.
 //!
 //! Packets to private/local destinations are dropped (parity with the
-//! netstack's `block_local`), so a client can't reach the sharer's LAN.
+//! netstack's `block_local`), so a client can't reach the sharer's LAN. The
+//! one exception is the DNS forwarder's synthetic resolver address
+//! (`spora_core::dns::PROXY_ADDR`, port 53): with NAT configured, a DNAT
+//! rule steers those packets to a forwarder socket bound on the TUN's own
+//! address (`OsRoute::start_dns_forwarder`), so clients resolve through the
+//! sharer's resolvers here exactly as they do in netstack mode — UDP and
+//! TCP alike, since the kernel owns the streams.
 //!
 //! Inner IPv6 rides alongside v4: a v6 client must source from ULA space
 //! (fc00::/7 — the v6 twin of the RFC1918-only rule), and the kernel's
@@ -35,6 +41,7 @@ use std::time::Instant;
 
 use futures_util::{SinkExt, StreamExt};
 use log::{debug, info, trace, warn};
+use spora_core::dns::{self, DnsForwarder};
 use spora_core::{CancellationToken, IpTransport, SessionFuture, SessionHandler, is_local_address};
 use tokio_tun::Tun;
 
@@ -134,7 +141,12 @@ enum Undo {
 
 struct Shared {
     tun_name: String,
+    tun_addr: Ipv4Addr,
     configure_nat: bool,
+    /// Set once the DNS DNAT rules are in place: the pump then forwards
+    /// packets for the synthetic resolver address to the kernel instead of
+    /// dropping them as a private destination.
+    dns_forward: AtomicBool,
     /// Learned client source addresses (both families) with their last-seen
     /// time, so the table can evict the least-recently-active peer instead of
     /// bricking once full.
@@ -152,6 +164,8 @@ pub struct OsRoute {
     tun: Arc<Tun>,
     mtu: u16,
     shared: Arc<Shared>,
+    /// The DNS forwarder's serving tasks (UDP + TCP), aborted on cleanup.
+    dns_tasks: Vec<tokio::task::AbortHandle>,
 }
 
 impl OsRoute {
@@ -199,7 +213,9 @@ impl OsRoute {
 
         let shared = Arc::new(Shared {
             tun_name: tun.name().to_string(),
+            tun_addr: opts.addr,
             configure_nat: opts.configure_nat,
+            dns_forward: AtomicBool::new(false),
             peers: Mutex::new(HashMap::new()),
             undo: Mutex::new(Vec::new()),
             shutting_down: AtomicBool::new(false),
@@ -208,6 +224,7 @@ impl OsRoute {
             tun: Arc::new(tun),
             mtu: opts.mtu,
             shared,
+            dns_tasks: Vec::new(),
         };
         if opts.configure_nat {
             route.configure_forwarding(opts);
@@ -355,6 +372,99 @@ impl OsRoute {
         }
     }
 
+    /// Answer clients' DNS queries here too (see `spora_core::dns`): bind a
+    /// forwarder on the TUN's own address (UDP + TCP, ephemeral port) and
+    /// DNAT the synthetic resolver address to it, so the kernel delivers
+    /// the client's queries locally and un-DNATs the answers on the way
+    /// back. Returns `Ok(false)` — nothing installed — under `--no-nat`,
+    /// where no rule of ours may exist; the synthetic address then stays a
+    /// dropped private destination.
+    pub async fn start_dns_forwarder(&mut self, fwd: Arc<DnsForwarder>) -> Result<bool, String> {
+        if !self.shared.configure_nat {
+            warn!(
+                "os-routing: --no-nat: no DNAT for the DNS forwarder, so clients cannot resolve \
+                 through {} (point them at public resolvers, or DNAT it yourself)",
+                dns::proxy_socket()
+            );
+            return Ok(false);
+        }
+        let bind = std::net::SocketAddr::from((self.shared.tun_addr, 0));
+        let udp = tokio::net::UdpSocket::bind(bind)
+            .await
+            .map_err(|e| format!("dns forwarder: bind udp {bind}: {e}"))?;
+        let udp_port = udp.local_addr().map_err(|e| e.to_string())?.port();
+        let tcp = tokio::net::TcpListener::bind(bind)
+            .await
+            .map_err(|e| format!("dns forwarder: bind tcp {bind}: {e}"))?;
+        let tcp_port = tcp.local_addr().map_err(|e| e.to_string())?.port();
+
+        let tun = self.shared.tun_name.clone();
+        let tun_addr = self.shared.tun_addr.to_string();
+        let proxy = format!("{}/32", dns::PROXY_ADDR);
+        let proxy_port = dns::PROXY_PORT.to_string();
+        let mut installed = 0;
+        for (proto, port) in [("udp", udp_port), ("tcp", tcp_port)] {
+            let port = port.to_string();
+            let to = format!("{tun_addr}:{port}");
+            let dnat = |verb: &str| {
+                svec(&[
+                    "-w",
+                    "-t",
+                    "nat",
+                    verb,
+                    "PREROUTING",
+                    "-i",
+                    &tun,
+                    "-d",
+                    &proxy,
+                    "-p",
+                    proto,
+                    "--dport",
+                    &proxy_port,
+                    "-j",
+                    "DNAT",
+                    "--to-destination",
+                    &to,
+                ])
+            };
+            let input = |verb: &str| {
+                svec(&[
+                    "-w", verb, "INPUT", "-i", &tun, "-d", &tun_addr, "-p", proto, "--dport",
+                    &port, "-j", "ACCEPT",
+                ])
+            };
+            for (add, del) in [(dnat("-I"), dnat("-D")), (input("-I"), input("-D"))] {
+                // `-I <chain>` without an index inserts at position 1.
+                if run_cmd("iptables", &add) {
+                    self.shared
+                        .undo
+                        .lock()
+                        .unwrap()
+                        .push(Undo::Cmd("iptables", del));
+                    installed += 1;
+                }
+            }
+        }
+        if installed < 4 {
+            return Err(
+                "dns forwarder: could not install the DNAT/INPUT rules (see the iptables errors above); \
+                 pass --no-dns-forwarder to share without it"
+                    .into(),
+            );
+        }
+        info!(
+            "os-routing: DNS forwarder on {}:{udp_port}/udp and :{tcp_port}/tcp, DNAT from {} on {tun}",
+            self.shared.tun_addr,
+            dns::proxy_socket()
+        );
+        self.dns_tasks
+            .push(tokio::spawn(dns::serve_udp(udp, fwd.clone(), None)).abort_handle());
+        self.dns_tasks
+            .push(tokio::spawn(dns::serve_tcp(tcp, fwd, None)).abort_handle());
+        self.shared.dns_forward.store(true, Ordering::Relaxed);
+        Ok(true)
+    }
+
     /// Build the per-session handler to plug into `Config::exit_mode`.
     pub fn session_handler(&self) -> SessionHandler {
         let dev = self.tun.clone();
@@ -365,7 +475,15 @@ impl OsRoute {
         Arc::new(move |transport, cancel| {
             let dev = dev.clone();
             let learn = peer_learner(shared.clone());
-            Box::pin(pump(transport, dev, cancel, learn, recv_buf_len))
+            let dns_forward = shared.dns_forward.load(Ordering::Relaxed);
+            Box::pin(pump(
+                transport,
+                dev,
+                cancel,
+                learn,
+                recv_buf_len,
+                dns_forward,
+            ))
         })
     }
 
@@ -377,6 +495,9 @@ impl OsRoute {
     fn cleanup(&self) {
         // Stop pumps from racing a fresh MASQUERADE add past our drain.
         self.shared.shutting_down.store(true, Ordering::Relaxed);
+        for task in &self.dns_tasks {
+            task.abort();
+        }
         let items: Vec<Undo> = match self.shared.undo.lock() {
             Ok(mut undo) => undo.drain(..).collect(),
             Err(_) => return, // poisoned during unwind — don't double-panic
@@ -754,20 +875,30 @@ enum Verdict {
     Drop(&'static str),
 }
 
+/// [`classify_with`] without the DNS forwarder (the pump always passes the
+/// forwarder's state; this is the historical shape the tests use).
+#[cfg(test)]
 fn classify(pkt: &[u8]) -> Verdict {
+    classify_with(pkt, false)
+}
+
+/// [`classify`] with the DNS forwarder's exception: when `dns_forward` is
+/// set, UDP/TCP to the synthetic resolver address (a private destination
+/// otherwise) is forwarded to the kernel, whose DNAT owns it from there.
+fn classify_with(pkt: &[u8], dns_forward: bool) -> Verdict {
     match pkt.first().map(|b| b >> 4) {
-        Some(4) => classify_v4(pkt),
+        Some(4) => classify_v4(pkt, dns_forward),
         Some(6) => classify_v6(pkt),
         _ => Verdict::Drop("not IP"),
     }
 }
 
-fn classify_v4(pkt: &[u8]) -> Verdict {
+fn classify_v4(pkt: &[u8], dns_forward: bool) -> Verdict {
     if pkt.len() < 20 {
         return Verdict::Drop("truncated IPv4");
     }
     let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
-    if is_local_address(IpAddr::V4(dst)) {
+    if is_local_address(IpAddr::V4(dst)) && !(dns_forward && is_dns_forwarder_query(pkt)) {
         if let Some(reply) = icmp_echo_reply_for(pkt) {
             return Verdict::ReplyEcho(reply);
         }
@@ -808,6 +939,22 @@ fn classify_v6(pkt: &[u8]) -> Verdict {
     Verdict::Forward(IpAddr::V6(src))
 }
 
+/// An unfragmented IPv4 UDP or TCP packet to the DNS forwarder's synthetic
+/// address, port 53 — the shape the DNAT rule matches.
+fn is_dns_forwarder_query(pkt: &[u8]) -> bool {
+    let ihl = usize::from(pkt[0] & 0x0F) * 4;
+    if ihl < 20 || pkt.len() < ihl + 4 {
+        return false;
+    }
+    let fragment = pkt[6] & 0x20 != 0 || u16::from_be_bytes([pkt[6] & 0x1F, pkt[7]]) != 0;
+    if fragment || !matches!(pkt[9], 6 | 17) {
+        return false;
+    }
+    let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+    let dport = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
+    dst == dns::PROXY_ADDR && dport == dns::PROXY_PORT
+}
+
 /// True for source addresses a client is allowed to use for its inner TUN:
 /// RFC1918 private space plus RFC6598 CGNAT (100.64.0.0/10). Everything else —
 /// public unicast, loopback, link-local, multicast, broadcast — is refused so a
@@ -843,6 +990,7 @@ async fn pump<D: ExitDevice>(
     cancel: CancellationToken,
     learn: PeerLearner,
     recv_buf_len: usize,
+    dns_forward: bool,
 ) {
     info!("os-routing: session pump started");
     let mut buf = vec![0u8; recv_buf_len];
@@ -858,7 +1006,7 @@ async fn pump<D: ExitDevice>(
                 break;
             }
             res = transport.next() => match res {
-                Some(Ok(pkt)) => match classify(&pkt) {
+                Some(Ok(pkt)) => match classify_with(&pkt, dns_forward) {
                     Verdict::Forward(src) => {
                         if seen.insert(src) {
                             learn(src).await;
@@ -1229,6 +1377,74 @@ mod tests {
             .write(&mut pkt, b"spka")
             .unwrap();
         pkt
+    }
+
+    /// IPv4 TCP SYN from `src` to `dst`:`dport`.
+    fn ipv4_tcp_syn(src: [u8; 4], dst: [u8; 4], dport: u16) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        etherparse::PacketBuilder::ipv4(src, dst, 64)
+            .tcp(40000, dport, 1, 65535)
+            .syn()
+            .write(&mut pkt, &[])
+            .unwrap();
+        pkt
+    }
+
+    #[test]
+    fn dns_forwarder_address_is_forwarded_only_with_the_dnat_in_place() {
+        let proxy = dns::PROXY_ADDR.octets();
+        let udp = ipv4_udp([10, 0, 85, 1], proxy, b"q"); // dport 53
+        let tcp = ipv4_tcp_syn([10, 0, 85, 1], proxy, dns::PROXY_PORT);
+        // Without the forwarder it is a private destination like any other.
+        assert!(matches!(classify(&udp), Verdict::Drop("local destination")));
+        assert!(matches!(
+            classify_with(&udp, false),
+            Verdict::Drop("local destination")
+        ));
+        assert!(matches!(
+            classify_with(&tcp, false),
+            Verdict::Drop("local destination")
+        ));
+        // With it, UDP and TCP to port 53 go to the kernel (learning the
+        // client's source on the way, as any forwarded packet does).
+        assert!(matches!(
+            classify_with(&udp, true),
+            Verdict::Forward(IpAddr::V4(s)) if s == Ipv4Addr::new(10, 0, 85, 1)
+        ));
+        assert!(matches!(classify_with(&tcp, true), Verdict::Forward(_)));
+        // Other ports on the synthetic address, and other private hosts on
+        // port 53, stay blocked.
+        assert!(matches!(
+            classify_with(&ipv4_tcp_syn([10, 0, 85, 1], proxy, 80), true),
+            Verdict::Drop("local destination")
+        ));
+        assert!(matches!(
+            classify_with(&ipv4_udp([10, 0, 85, 1], [192, 168, 1, 1], b"q"), true),
+            Verdict::Drop("local destination")
+        ));
+        // The source rule still applies to forwarder traffic.
+        assert!(matches!(
+            classify_with(&ipv4_udp([8, 8, 8, 8], proxy, b"q"), true),
+            Verdict::Drop("non-private source")
+        ));
+        // A keepalive ping at the synthetic address is still answered
+        // locally (ICMP is not the forwarder's business).
+        assert!(matches!(
+            classify_with(&icmp_echo_request([10, 0, 0, 1], proxy, 1, 1), true),
+            Verdict::ReplyEcho(_)
+        ));
+        // A non-first fragment has no transport header to match on.
+        let mut frag = udp.clone();
+        frag[6] = 0x00;
+        frag[7] = 0x08; // fragment offset 8
+        frag[10] = 0;
+        frag[11] = 0;
+        let csum = inet_checksum(&frag[..20]);
+        frag[10..12].copy_from_slice(&csum.to_be_bytes());
+        assert!(matches!(
+            classify_with(&frag, true),
+            Verdict::Drop("local destination")
+        ));
     }
 
     #[test]
@@ -1695,7 +1911,7 @@ mod tests {
         });
 
         let cancel = CancellationToken::new();
-        let pump_task = tokio::spawn(pump(transport, dev, cancel.clone(), learn, 2048));
+        let pump_task = tokio::spawn(pump(transport, dev, cancel.clone(), learn, 2048, false));
 
         Harness {
             to_transport,

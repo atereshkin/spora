@@ -61,6 +61,12 @@ Capability token authorizing this sharer to use the relay(s), when the relay req
 **`--no-conn-log`** *(default `false`)*  
 Disable the connection log. By default the sharer keeps a local per-flow record (who connected to which destination, when) at $XDG_STATE_HOME/spora/connlog/\<routing-key\>/, the sharer's own egress accountability record for answering abuse reports
 
+**`--dns-upstream <DNS_UPSTREAM>`** *(repeatable)*  
+Answer clients' DNS queries from these servers (ip or ip:port, repeatable, in preference order) instead of this host's own resolvers. Used exclusively: no public fallback
+
+**`--no-dns-forwarder`** *(default `false`)*  
+Don't answer clients' DNS queries at all: queries to the tunnel's resolver address (100.64.0.53) are dropped like any other private destination, so clients must bring public resolvers of their own
+
 **`--conn-log-dir <CONN_LOG_DIR>`**  
 Override the connection-log directory
 
@@ -121,7 +127,7 @@ Route only this prefix into the tunnel (repeatable) instead of everything. The h
 Bring the interface up with its address and MTU but install no routes and leave the resolver alone: you route into it yourself
 
 **`--dns <DNS>`** *(repeatable)*  
-Resolver to use while connected (repeatable; default 8.8.8.8 and 1.1.1.1). It is reached through the tunnel, so it must be public
+Resolver to use while connected (repeatable). The default, 100.64.0.53, is the sharer's DNS forwarder, which answers from the sharer's own resolvers. Anything else is reached through the tunnel, so it must be public
 
 **`--no-dns`** *(default `false`)*  
 Leave the host's resolver configuration alone

@@ -48,6 +48,31 @@ Be aware of the limits: destinations are IPs, not names, and a session that
 stayed on the relay path never directly observes the client's own address.
 The log states what kind of evidence each recorded address is.
 
+## Your client's DNS
+
+By default the client resolves names through you. Its queries arrive at a
+resolver address inside the tunnel (`100.64.0.53`), and the share answers
+them from the resolvers your own machine uses (`/etc/resolv.conf`; the
+adapters' DNS servers on Windows), forwarding each query verbatim to one
+of them and the answer verbatim back. The client never learns those
+addresses, and it still cannot reach anything else on your LAN. Should
+your resolvers stop answering, the share falls back to public ones
+(8.8.8.8, 1.1.1.1) until they recover. `spora share` prints which
+resolvers it is forwarding to.
+
+`--dns-upstream <ip[:port]>` (repeatable) forwards to these servers
+instead, and only to them: no public fallback. `--no-dns-forwarder`
+switches the forwarding off; the client then needs public resolvers of
+its own (`spora use --dns`).
+
+Known limitation: if your system resolves over encrypted DNS configured in
+the OS itself (DNS over TLS or HTTPS on Android, macOS, iOS or Windows,
+as opposed to a local stub such as systemd-resolved doing it on the
+machine's behalf), the share still sends the client's queries in plain
+UDP to the same servers. They resolve, but not over the encrypted
+transport you chose. With `--os-routing` the forwarder is wired in through
+a DNAT rule, so it is unavailable under `--no-nat`.
+
 ## Running it permanently
 
 The share is a single foreground process, so a systemd unit is all it

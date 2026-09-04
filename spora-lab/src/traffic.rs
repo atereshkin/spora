@@ -175,6 +175,27 @@ pub enum TrafficCmd {
         server: std::net::SocketAddr,
         respond: tokio::sync::oneshot::Sender<Result<bool, String>>,
     },
+    /// Send one raw UDP `payload` to `server` from a fresh inner port and
+    /// wait up to `grace` for the first datagram back from `server` to that
+    /// port: `Ok(Some(reply payload))`, or `Ok(None)` if nothing came. The
+    /// DNS suite's primitive (the payload is a query for the exit's
+    /// forwarder); unrelated inbound is ignored.
+    UdpQuery {
+        server: std::net::SocketAddr,
+        payload: Vec<u8>,
+        grace: Duration,
+        respond: tokio::sync::oneshot::Sender<Result<Option<Vec<u8>>, String>>,
+    },
+    /// One TCP request/response exchange (smoltcp) through the tunnel:
+    /// connect to `server`, send `request`, read until the server closes
+    /// its side, return everything it sent. `grace` bounds each wait for
+    /// progress (connect, send, receive).
+    TcpRequest {
+        server: std::net::SocketAddr,
+        request: Vec<u8>,
+        grace: Duration,
+        respond: tokio::sync::oneshot::Sender<Result<Vec<u8>, String>>,
+    },
     /// Drop the composed transport chain while the host runtime is still
     /// alive and end the pump. Unlike host teardown (which drops the whole
     /// runtime mid-poll — abrupt, no clean close on the wire), this lets the
@@ -327,6 +348,32 @@ impl TrafficPump {
                 };
                 let _ = respond.send(result);
             }
+            TrafficCmd::UdpQuery {
+                server,
+                payload,
+                grace,
+                respond,
+            } => {
+                let result = if self.dead {
+                    Err("transport is closed".to_string())
+                } else {
+                    self.udp_query(server, payload, grace).await
+                };
+                let _ = respond.send(result);
+            }
+            TrafficCmd::TcpRequest {
+                server,
+                request,
+                grace,
+                respond,
+            } => {
+                let result = if self.dead {
+                    Err("transport is closed".to_string())
+                } else {
+                    self.tcp_request(server, request, grace).await
+                };
+                let _ = respond.send(result);
+            }
             // Handled inline in `run` (it must end the pump loop).
             TrafficCmd::Shutdown { respond } => {
                 let _ = respond.send(Err("shutdown must be handled by run()".into()));
@@ -465,6 +512,156 @@ impl TrafficPump {
                     }
                 },
                 _ = tokio::time::sleep_until(deadline) => return Ok(None),
+            }
+        }
+    }
+
+    /// Send one raw UDP `payload` to `server` from a fresh inner port and
+    /// wait up to `grace` for the first datagram back from `server` to that
+    /// port (see [`TrafficCmd::UdpQuery`]).
+    async fn udp_query(
+        &mut self,
+        server: SocketAddr,
+        payload: Vec<u8>,
+        grace: Duration,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let local_port = self.alloc_port();
+        let mut reasm = Reassembler::default();
+        let pkt = build_udp_packet(local_port, server, &payload);
+        self.transport
+            .send(pkt)
+            .await
+            .map_err(|e| format!("udp query send: {e}"))?;
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
+            tokio::select! {
+                pkt = self.transport.next() => match pkt {
+                    Some(Ok(p)) => {
+                        if let Some(full) = reasm.push(p)
+                            && let Some(reply) = match_udp_reply(&full, server, local_port)
+                        {
+                            return Ok(Some(reply.to_vec()));
+                        }
+                    }
+                    Some(Err(e)) => log::debug!("udp query: transport error: {e}"),
+                    None => {
+                        self.dead = true;
+                        return Err("transport closed mid-query".into());
+                    }
+                },
+                _ = tokio::time::sleep_until(deadline) => return Ok(None),
+            }
+        }
+    }
+
+    /// One TCP request/response exchange (see [`TrafficCmd::TcpRequest`]):
+    /// connect, write `request`, read until the server closes its side.
+    /// `grace` bounds the wait for progress at every stage.
+    async fn tcp_request(
+        &mut self,
+        server: SocketAddr,
+        request: Vec<u8>,
+        grace: Duration,
+    ) -> Result<Vec<u8>, String> {
+        use smoltcp::socket::tcp;
+
+        const MAX_IDLE: Duration = Duration::from_millis(20);
+
+        let local_port = self.alloc_port();
+        let (mut device, mut iface, mut sockets, handle) =
+            tcp_session(server, local_port, &TcpOpts::default())?;
+        let mut scratch = vec![0u8; 16 * 1024];
+        let mut written = 0usize;
+        let mut received: Vec<u8> = Vec::new();
+        let mut reasm = Reassembler::default();
+        let mut last_progress = std::time::Instant::now();
+
+        loop {
+            iface.poll(SmolInstant::now(), &mut device, &mut sockets);
+            while let Some(frame) = device.tx.pop_front() {
+                self.transport
+                    .send(frame)
+                    .await
+                    .map_err(|e| format!("tcp request: transport send: {e}"))?;
+            }
+
+            let done = {
+                let sock = sockets.get_mut::<tcp::Socket>(handle);
+                while sock.can_send() && written < request.len() {
+                    let n = sock
+                        .send_slice(&request[written..])
+                        .map_err(|e| format!("tcp request send: {e}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    written += n;
+                    last_progress = std::time::Instant::now();
+                }
+                while sock.can_recv() {
+                    let n = sock
+                        .recv_slice(&mut scratch)
+                        .map_err(|e| format!("tcp request recv: {e}"))?;
+                    if n == 0 {
+                        break;
+                    }
+                    received.extend_from_slice(&scratch[..n]);
+                    last_progress = std::time::Instant::now();
+                }
+                let state = sock.state();
+                if state == tcp::State::Closed && written < request.len() {
+                    return Err(format!(
+                        "tcp request: connection closed before the request was sent ({written}/{})",
+                        request.len()
+                    ));
+                }
+                // With the request out and the receive half closed by the
+                // peer (drained above), everything it had to say is in.
+                let done =
+                    written == request.len() && (!sock.may_recv() || state == tcp::State::Closed);
+                if done {
+                    sock.close();
+                }
+                done
+            };
+            if done {
+                iface.poll(SmolInstant::now(), &mut device, &mut sockets);
+                while let Some(frame) = device.tx.pop_front() {
+                    let _ = self.transport.send(frame).await;
+                }
+                return Ok(received);
+            }
+            if last_progress.elapsed() > grace {
+                return Err(format!(
+                    "tcp request stalled (sent {written}/{}, received {} bytes)",
+                    request.len(),
+                    received.len()
+                ));
+            }
+
+            let delay = iface
+                .poll_delay(SmolInstant::now(), &sockets)
+                .map(|d| Duration::from_micros(d.total_micros()))
+                .unwrap_or(MAX_IDLE)
+                .min(MAX_IDLE);
+            if delay.is_zero() {
+                continue;
+            }
+            tokio::select! {
+                pkt = self.transport.next() => match pkt {
+                    Some(Ok(p)) => {
+                        if let Some(full) = reasm.push(p)
+                            && is_session_tcp(&full, server, local_port)
+                        {
+                            device.rx.push_back(full);
+                        }
+                    }
+                    Some(Err(e)) => log::warn!("tcp request: transport error: {e}"),
+                    None => {
+                        self.dead = true;
+                        return Err("transport closed mid-request".into());
+                    }
+                },
+                _ = tokio::time::sleep(delay) => {}
             }
         }
     }
@@ -1088,23 +1285,43 @@ fn build_echo_request(
     payload.extend_from_slice(&seq.to_be_bytes());
     payload.extend_from_slice(&nonce.to_be_bytes());
     payload.resize(payload_len, 0xA5);
+    build_udp_packet(local_port, server, &payload)
+}
 
+/// IP+UDP datagram carrying `payload` from our inner address (the family
+/// follows `server`) at `local_port` to `server`.
+fn build_udp_packet(local_port: u16, server: SocketAddr, payload: &[u8]) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(48 + payload.len());
     match server {
         SocketAddr::V4(s) => {
             etherparse::PacketBuilder::ipv4(CLIENT_INNER_IP.octets(), s.ip().octets(), 64)
                 .udp(local_port, s.port())
-                .write(&mut pkt, &payload)
+                .write(&mut pkt, payload)
                 .expect("writing a UDP packet into a Vec cannot fail");
         }
         SocketAddr::V6(s) => {
             etherparse::PacketBuilder::ipv6(CLIENT_INNER_IP6.octets(), s.ip().octets(), 64)
                 .udp(local_port, s.port())
-                .write(&mut pkt, &payload)
+                .write(&mut pkt, payload)
                 .expect("writing a UDP packet into a Vec cannot fail");
         }
     }
     pkt
+}
+
+/// If `pkt` is a whole IP/UDP datagram from `server` to our inner address
+/// at `local_port`, return its payload (bounded by the UDP length field).
+fn match_udp_reply(pkt: &[u8], server: SocketAddr, local_port: u16) -> Option<&[u8]> {
+    let off = session_transport_offset(pkt, server, 17)?;
+    if pkt.len() < off + 8
+        || u16::from_be_bytes([pkt[off], pkt[off + 1]]) != server.port()
+        || u16::from_be_bytes([pkt[off + 2], pkt[off + 3]]) != local_port
+    {
+        return None;
+    }
+    let udp_len = usize::from(u16::from_be_bytes([pkt[off + 4], pkt[off + 5]]));
+    let end = (off + udp_len).clamp(off + 8, pkt.len());
+    Some(&pkt[off + 8..end])
 }
 
 /// If `pkt` is a whole IP packet of `proto` (17 = UDP, 6 = TCP) from

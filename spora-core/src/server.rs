@@ -1,8 +1,9 @@
 use crate::SocketProtector;
 use crate::connlog::{FlowGuard, SessionLog};
+use crate::dns::{self, DnsForwarder};
 use crate::transport::IpTransport;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
-use log::{error, info, trace, warn};
+use log::{debug, error, info, trace, warn};
 use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
 use std::collections::HashMap;
 use std::io;
@@ -358,7 +359,9 @@ enum Dialed {
     /// deliberate trade against the storm; half-close after the dial
     /// completes works normally.
     Abandoned,
-    Failed(io::Error),
+    /// The dial failed or timed out; `stash` hands the early inner bytes on
+    /// to a retry (the DNS forwarder tries the next upstream).
+    Failed { error: io::Error, stash: Vec<u8> },
 }
 
 /// Dial `remote` while watching the inner stream — see [`Dialed`].
@@ -366,8 +369,8 @@ async fn dial_watching_inner(
     inner: &mut netstack_smoltcp::TcpStream,
     remote: SocketAddr,
     protector: &SocketProtector,
+    mut stash: Vec<u8>,
 ) -> Dialed {
-    let mut stash: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 16 * 1024];
     let dial = tokio::time::timeout(EXIT_CONNECT_TIMEOUT, new_tcp_stream(remote, protector));
     tokio::pin!(dial);
@@ -376,11 +379,14 @@ async fn dial_watching_inner(
             d = &mut dial => {
                 return match d {
                     Ok(Ok((stream, egress))) => Dialed::Connected { stream, egress, stash },
-                    Ok(Err(e)) => Dialed::Failed(e),
-                    Err(_) => Dialed::Failed(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!("connect to {remote}: no answer within {EXIT_CONNECT_TIMEOUT:?}"),
-                    )),
+                    Ok(Err(error)) => Dialed::Failed { error, stash },
+                    Err(_) => Dialed::Failed {
+                        error: io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            format!("connect to {remote}: no answer within {EXIT_CONNECT_TIMEOUT:?}"),
+                        ),
+                        stash,
+                    },
                 };
             }
             n = inner.read(&mut buf), if stash.len() < DIAL_STASH_LIMIT => match n {
@@ -395,11 +401,20 @@ async fn handle_tcp_streams(
     mut tcp_listener: TcpListener,
     protector: SocketProtector,
     block_local: bool,
+    dns: Option<Arc<DnsForwarder>>,
     cancel: CancellationToken,
     slog: Option<Arc<SessionLog>>,
 ) {
     while let Some((mut stream, local, remote)) = tcp_listener.next().await {
-        if block_local && is_local_address(remote.ip()) {
+        // DNS over TCP aimed at the forwarder's synthetic address is dialed to
+        // an upstream of the exit's choosing — ahead of the private-destination
+        // block, which the synthetic address would otherwise trip (see
+        // `crate::dns`).
+        let dns_fwd = dns
+            .as_ref()
+            .filter(|_| dns::is_proxy_target(remote))
+            .cloned();
+        if dns_fwd.is_none() && block_local && is_local_address(remote.ip()) {
             warn!(
                 "blocked TCP connection to local address: {:?} => {:?}",
                 local, remote
@@ -411,12 +426,18 @@ async fn handle_tcp_streams(
         }
         // The listener yields after the inner (client-side) handshake, so this
         // records "the client opened a connection toward `remote`"; whether the
-        // outbound leg succeeded is the `established` flag set below.
-        let flow = slog
-            .as_ref()
-            .and_then(|sl| sl.flow_open(PROTO_TCP, local, remote, true));
+        // outbound leg succeeded is the `established` flag set below. A
+        // forwarded DNS connection's destination is only known once an
+        // upstream accepted the dial, so its record is opened then.
+        let flow = match dns_fwd {
+            Some(_) => None,
+            None => slog
+                .as_ref()
+                .and_then(|sl| sl.flow_open(PROTO_TCP, local, remote, true)),
+        };
         let protector = protector.clone();
         let cancel = cancel.clone();
+        let slog = slog.clone();
         tokio::spawn(async move {
             info!("new tcp connection: {:?} => {:?}", local, remote);
             // Race the proxy against teardown so the connection (and its OS
@@ -426,7 +447,19 @@ async fn handle_tcp_streams(
             tokio::select! {
                 _ = cancel.cancelled() => {}
                 r = async {
-                    match dial_watching_inner(&mut stream, remote, &protector).await {
+                    let (dialed, remote) = match &dns_fwd {
+                        Some(fwd) => dial_dns_upstream(&mut stream, fwd, &protector).await,
+                        None => (
+                            dial_watching_inner(&mut stream, remote, &protector, Vec::new()).await,
+                            remote,
+                        ),
+                    };
+                    let flow = flow.or_else(|| {
+                        dns_fwd.as_ref()?;
+                        slog.as_ref()
+                            .and_then(|sl| sl.flow_open(PROTO_TCP, local, remote, true))
+                    });
+                    match dialed {
                         Dialed::Connected { stream: remote_stream, egress, stash } => {
                             if let Some(f) = &flow {
                                 f.established(Some(egress));
@@ -467,7 +500,7 @@ async fn handle_tcp_streams(
                                 f.close("abandoned", Duration::ZERO);
                             }
                         }
-                        Dialed::Failed(e) => {
+                        Dialed::Failed { error: e, .. } => {
                             warn!("failed to new tcp stream {:?}=>{:?}, err: {:?}", local, remote, e);
                             if let Some(f) = &flow {
                                 f.close("connect_failed", Duration::ZERO);
@@ -480,11 +513,52 @@ async fn handle_tcp_streams(
     }
 }
 
+/// Dial an upstream for a forwarded DNS connection (see `crate::dns`): the
+/// forwarder's pick order, moving on when an upstream refuses or times out,
+/// with the client's early bytes carried between attempts. Returns the
+/// outcome and the upstream it applies to.
+async fn dial_dns_upstream(
+    inner: &mut netstack_smoltcp::TcpStream,
+    fwd: &DnsForwarder,
+    protector: &SocketProtector,
+) -> (Dialed, SocketAddr) {
+    let mut tried: Vec<SocketAddr> = Vec::with_capacity(dns::MAX_ATTEMPTS);
+    let mut stash: Vec<u8> = Vec::new();
+    let mut last: Option<(io::Error, SocketAddr)> = None;
+    while tried.len() < dns::MAX_ATTEMPTS {
+        let Some(up) = fwd.pick(&tried) else { break };
+        tried.push(up);
+        match dial_watching_inner(inner, up, protector, stash).await {
+            Dialed::Failed { error, stash: kept } => {
+                debug!("dns forwarder: tcp {up}: {error}");
+                fwd.failed(up);
+                stash = kept;
+                last = Some((error, up));
+            }
+            connected @ Dialed::Connected { .. } => {
+                fwd.answered(up);
+                return (connected, up);
+            }
+            Dialed::Abandoned => return (Dialed::Abandoned, up),
+        }
+    }
+    match last {
+        Some((error, up)) => (Dialed::Failed { error, stash }, up),
+        None => (
+            Dialed::Failed {
+                error: io::Error::other("no DNS upstream configured"),
+                stash,
+            },
+            dns::proxy_socket(),
+        ),
+    }
+}
+
 /// Connect toward `addr` from a fresh OS socket. Also returns the socket's
 /// local address — the egress source the destination actually saw from this
 /// host, which is the single most attribution-critical field in the
 /// connection log.
-async fn new_tcp_stream(
+pub(crate) async fn new_tcp_stream(
     addr: SocketAddr,
     protector: &SocketProtector,
 ) -> std::io::Result<(TcpStream, SocketAddr)> {
@@ -539,10 +613,57 @@ impl NATEntry {
     }
 }
 
+/// Forward one UDP query to an upstream and write the answer back to the
+/// client from the synthetic address (see `crate::dns`). One connection-log
+/// flow per query, against the upstream that was actually used — the
+/// forwarder's re-origination point is as much an egress as the NAT's.
+async fn forward_dns_query(
+    fwd: Arc<DnsForwarder>,
+    query: Vec<u8>,
+    local: SocketAddr,
+    remote: SocketAddr,
+    protector: SocketProtector,
+    tx: tokio::sync::mpsc::UnboundedSender<(Vec<u8>, SocketAddr, SocketAddr)>,
+    slog: Option<Arc<SessionLog>>,
+) {
+    match dns::forward_query(&fwd, &query, &protector).await {
+        Ok(answer) => {
+            if let Some(f) = slog
+                .as_ref()
+                .and_then(|sl| sl.flow_open(PROTO_UDP, local, answer.upstream, true))
+            {
+                f.established(answer.egress);
+                f.add_up(query.len() as u64);
+                f.add_down(answer.response.len() as u64);
+                f.close("closed", Duration::ZERO);
+            }
+            trace!(
+                "dns forwarder: {local} -> {} answered ({} bytes, attempt {})",
+                answer.upstream,
+                answer.response.len(),
+                answer.attempts
+            );
+            let _ = tx.send((answer.response, local, remote));
+        }
+        Err(e) => {
+            if let dns::ForwardError::Unanswered { last_upstream, .. } = &e
+                && let Some(f) = slog
+                    .as_ref()
+                    .and_then(|sl| sl.flow_open(PROTO_UDP, local, *last_upstream, true))
+            {
+                f.add_up(query.len() as u64);
+                f.close("error", Duration::ZERO);
+            }
+            debug!("dns forwarder: query from {local}: {e}");
+        }
+    }
+}
+
 async fn handle_inbound_datagram(
     udp_socket: netstack_smoltcp::UdpSocket,
     protector: SocketProtector,
     block_local: bool,
+    dns: Option<Arc<DnsForwarder>>,
     cancel: CancellationToken,
     slog: Option<Arc<SessionLog>>,
 ) {
@@ -562,6 +683,8 @@ async fn handle_inbound_datagram(
 
     let mut entries: HashMap<NATKey, NATEntry> = HashMap::new();
     let mut sweep_interval = tokio::time::interval(UDP_NAT_SWEEP_INTERVAL);
+    // Forwarded DNS queries in flight (the per-session rate cap).
+    let dns_inflight = Arc::new(tokio::sync::Semaphore::new(dns::MAX_INFLIGHT));
 
     loop {
         tokio::select! {
@@ -575,6 +698,29 @@ async fn handle_inbound_datagram(
                 // bad datagram and keep going instead; real shutdown is driven
                 // by `start_tunnel` aborting this task when the tunnel ends.
                 let Some((data, local, remote)) = packet else { continue };
+                if let Some(fwd) = dns.as_ref().filter(|_| dns::is_proxy_target(remote)) {
+                    // A query for the DNS forwarder: its own task, its own
+                    // socket, retries across upstreams (see `crate::dns`) —
+                    // never a NAT entry. Past the in-flight cap the query is
+                    // dropped and the client's stub retries.
+                    let Ok(permit) = dns_inflight.clone().try_acquire_owned() else {
+                        debug!(
+                            "dns forwarder: {} queries in flight; dropping one from {local}",
+                            dns::MAX_INFLIGHT
+                        );
+                        continue;
+                    };
+                    let (fwd, protector, tx, slog, cancel) =
+                        (fwd.clone(), protector.clone(), tx.clone(), slog.clone(), cancel.clone());
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        tokio::select! {
+                            _ = cancel.cancelled() => {}
+                            _ = forward_dns_query(fwd, data, local, remote, protector, tx, slog) => {}
+                        }
+                    });
+                    continue;
+                }
                 if block_local && is_local_address(remote.ip()) {
                     warn!("blocked UDP datagram to local address: {:?} => {:?}", local, remote);
                     if let Some(sl) = &slog {
@@ -699,7 +845,7 @@ fn insert_bounded(
     entries.insert(key, entry);
 }
 
-async fn new_udp_packet(
+pub(crate) async fn new_udp_packet(
     addr: SocketAddr,
     protector: &SocketProtector,
 ) -> std::io::Result<tokio::net::UdpSocket> {
@@ -737,14 +883,18 @@ pub enum TunnelError {
 
 /// Start the virtual IP stack and tunnel with the given transport.
 ///
-/// Blocks until the tunnel ends or `cancel` is triggered. `slog`, when set,
+/// Blocks until the tunnel ends or `cancel` is triggered. `dns`, when set,
+/// answers queries to the forwarder's synthetic resolver address (see
+/// `crate::dns`) ahead of the `block_local` check. `slog`, when set,
 /// receives per-flow connection-log records (TCP at accept/close with byte
-/// counts and the egress source address; UDP per NAT-table flow).
+/// counts and the egress source address; UDP per NAT-table flow; forwarded
+/// DNS per query, against the upstream used).
 pub(crate) async fn start_tunnel(
     transport: IpTransport,
     protector: SocketProtector,
     cancel: CancellationToken,
     block_local: bool,
+    dns: Option<Arc<DnsForwarder>>,
     slog: Option<Arc<SessionLog>>,
 ) -> io::Result<()> {
     info!("Starting tunnel (virtual IP stack)");
@@ -772,6 +922,7 @@ pub(crate) async fn start_tunnel(
         tcp_listener,
         protector.clone(),
         block_local,
+        dns.clone(),
         flow_cancel.clone(),
         slog.clone(),
     ));
@@ -779,6 +930,7 @@ pub(crate) async fn start_tunnel(
         udp_socket,
         protector,
         block_local,
+        dns,
         flow_cancel.clone(),
         slog,
     ));
@@ -968,7 +1120,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let cancel_inner = cancel.clone();
         tokio::spawn(async move {
-            let _ = start_tunnel(transport, None, cancel_inner, false, None).await;
+            let _ = start_tunnel(transport, None, cancel_inner, false, None, None).await;
         });
         tokio::time::sleep(Duration::from_millis(100)).await;
 
@@ -1000,6 +1152,120 @@ mod tests {
             "tunnel stopped forwarding after a single malformed UDP packet"
         );
 
+        cancel.cancel();
+    }
+
+    /// IPv4 UDP `payload` from the client's inner address to the DNS
+    /// forwarder's synthetic address.
+    fn dns_query_packet(src_port: u16, payload: &[u8]) -> Vec<u8> {
+        let mut pkt = Vec::new();
+        etherparse::PacketBuilder::ipv4([10, 200, 0, 2], dns::PROXY_ADDR.octets(), 64)
+            .udp(src_port, dns::PROXY_PORT)
+            .write(&mut pkt, payload)
+            .unwrap();
+        pkt
+    }
+
+    /// `(src, dst, payload)` of an IPv4/UDP packet.
+    fn parse_udp(pkt: &[u8]) -> Option<(SocketAddr, SocketAddr, &[u8])> {
+        if pkt.len() < 28 || pkt[0] >> 4 != 4 || pkt[9] != 17 {
+            return None;
+        }
+        let ihl = usize::from(pkt[0] & 0x0F) * 4;
+        let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
+        let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+        let sport = u16::from_be_bytes([pkt[ihl], pkt[ihl + 1]]);
+        let dport = u16::from_be_bytes([pkt[ihl + 2], pkt[ihl + 3]]);
+        Some((
+            SocketAddr::from((src, sport)),
+            SocketAddr::from((dst, dport)),
+            &pkt[ihl + 8..],
+        ))
+    }
+
+    async fn recv_udp_from(
+        handle: &mut MockTransportHandle,
+        from: SocketAddr,
+        timeout: Duration,
+    ) -> Option<Vec<u8>> {
+        tokio::time::timeout(timeout, async {
+            loop {
+                match handle.recv().await {
+                    Some(pkt) => {
+                        if let Some((src, dst, payload)) = parse_udp(&pkt)
+                            && src == from
+                            && dst == SocketAddr::from(([10, 200, 0, 2], 40000))
+                        {
+                            return Some(payload.to_vec());
+                        }
+                    }
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    /// A fake resolver on loopback: echoes each query with the QR bit set.
+    async fn fake_resolver() -> SocketAddr {
+        let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = sock.local_addr().unwrap();
+        tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((n, src)) = sock.recv_from(&mut buf).await {
+                buf[2] |= 0x80;
+                let _ = sock.send_to(&buf[..n], src).await;
+            }
+        });
+        addr
+    }
+
+    /// The forwarder's synthetic address is inside `block_local`'s range; a
+    /// query to it must still be answered — from that address — when the
+    /// forwarder is on, and dropped like any private destination when it
+    /// is off.
+    #[tokio::test]
+    async fn dns_query_to_synthetic_address_is_forwarded_past_block_local() {
+        let _ = env_logger::builder().is_test(true).try_init();
+        let upstream = fake_resolver().await;
+        let fwd =
+            dns::DnsForwarder::with_fallback(dns::DnsUpstream::Servers(vec![upstream]), Vec::new());
+        let query = b"\x12\x34\x01\x00\x00\x01\x00\x00\x00\x00\x00\x00\x07example\x03com\x00\x00\x01\x00\x01";
+
+        let (mock, mut handle) = mock_transport();
+        let cancel = CancellationToken::new();
+        let cancel_inner = cancel.clone();
+        tokio::spawn(async move {
+            let _ = start_tunnel(Box::new(mock), None, cancel_inner, true, Some(fwd), None).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        handle.send(dns_query_packet(40000, query)).unwrap();
+        let answer = recv_udp_from(&mut handle, dns::proxy_socket(), Duration::from_secs(3))
+            .await
+            .expect("answer from the synthetic resolver address");
+        assert_eq!(&answer[..2], &query[..2], "same transaction id");
+        assert_eq!(answer[2] & 0x80, 0x80, "the upstream's answer, verbatim");
+        assert_eq!(answer.len(), query.len());
+        cancel.cancel();
+
+        // Forwarder off: the same query is a datagram to a private address.
+        let (mock, mut handle) = mock_transport();
+        let cancel = CancellationToken::new();
+        let cancel_inner = cancel.clone();
+        tokio::spawn(async move {
+            let _ = start_tunnel(Box::new(mock), None, cancel_inner, true, None, None).await;
+        });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        handle.send(dns_query_packet(40000, query)).unwrap();
+        assert!(
+            recv_udp_from(&mut handle, dns::proxy_socket(), Duration::from_millis(500))
+                .await
+                .is_none(),
+            "blocked without a forwarder"
+        );
         cancel.cancel();
     }
 }

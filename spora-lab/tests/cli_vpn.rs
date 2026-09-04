@@ -616,7 +616,7 @@ fn full_tunnel_relay() -> Result<(), String> {
         format!("routes: {ready}"),
     )?;
     expect(
-        json_strings(&ready["dns"]) == ["8.8.8.8", "1.1.1.1"],
+        json_strings(&ready["dns"]) == ["100.64.0.53"],
         format!("dns: {ready}"),
     )?;
     let dns_method = ready["dns_method"].as_str().unwrap_or("").to_string();
@@ -672,7 +672,7 @@ fn full_tunnel_relay() -> Result<(), String> {
     if dns_method != "resolvectl" {
         let text = resolv.current()?;
         expect(
-            text.contains("nameserver 8.8.8.8\n") && text.contains("nameserver 1.1.1.1\n"),
+            text.contains("nameserver 100.64.0.53\n"),
             format!("resolv.conf while up ({dns_method}):\n{text}"),
         )?;
     }

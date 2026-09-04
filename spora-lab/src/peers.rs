@@ -60,6 +60,25 @@ pub struct LabPeerOpts {
     /// sharer pass the SAME identity so the share URL — and the routing key
     /// the relay and the surviving client hold — stays stable.
     pub identity: Option<Identity>,
+    /// Share side only: what the sharer's DNS forwarder does
+    /// (`Config::dns_forwarder`, see spora-core's `dns`).
+    pub dns: DnsExit,
+}
+
+/// The sharer's DNS forwarder in a scenario.
+#[derive(Clone, Default)]
+pub enum DnsExit {
+    /// The core default: this host's system resolvers. Meaningless inside a
+    /// namespace (nothing there answers them), harmless unless a scenario
+    /// sends DNS.
+    #[default]
+    Default,
+    /// No forwarder: the synthetic resolver address is a dropped private
+    /// destination like any other.
+    Off,
+    /// A forwarder the scenario built itself (upstreams, timeouts) and keeps
+    /// a handle on, to assert on its health decisions.
+    Forwarder(Arc<spora_core::dns::DnsForwarder>),
 }
 
 impl LabPeerOpts {
@@ -74,6 +93,7 @@ impl LabPeerOpts {
             conn_log: None,
             record: None,
             identity: None,
+            dns: DnsExit::Default,
         }
     }
 
@@ -89,7 +109,7 @@ impl LabPeerOpts {
     /// options is `Config::default()` (notably `exit_mode: Netstack`).
     pub fn config(&self) -> (Config, EventStream) {
         let (hook, events) = event_channel();
-        let config = Config {
+        let mut config = Config {
             // Lab scenarios name their isolated in-namespace STUN service
             // explicitly and must never fall back to the public internet.
             stun_servers: vec![self.stun_server.clone()],
@@ -101,6 +121,11 @@ impl LabPeerOpts {
             record: self.record.clone(),
             ..Config::default()
         };
+        match &self.dns {
+            DnsExit::Default => {}
+            DnsExit::Off => config.dns_forwarder = None,
+            DnsExit::Forwarder(fwd) => config.dns_forwarder = Some(fwd.clone()),
+        }
         (config, events)
     }
 }
@@ -448,6 +473,50 @@ impl ClientHandle {
             .map_err(|_| "client traffic pump is gone".to_string())?;
         // The pump answers within `grace` + scheduling slack.
         recv_result(rx, grace + Duration::from_secs(5), "udp probe")
+    }
+
+    /// Send one raw UDP `payload` to `server` through the tunnel and wait
+    /// up to `grace` for the first datagram back from it: `Ok(Some(reply))`,
+    /// or `Ok(None)` if nothing came. The DNS suite's primitive.
+    pub fn udp_query(
+        &self,
+        server: impl Into<SocketAddr>,
+        payload: Vec<u8>,
+        grace: Duration,
+    ) -> Result<Option<Vec<u8>>, String> {
+        let server = server.into();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmds
+            .send(TrafficCmd::UdpQuery {
+                server,
+                payload,
+                grace,
+                respond: tx,
+            })
+            .map_err(|_| "client traffic pump is gone".to_string())?;
+        recv_result(rx, grace + Duration::from_secs(5), "udp query")
+    }
+
+    /// One TCP request/response exchange through the tunnel: connect to
+    /// `server`, send `request`, read until it closes its side. `grace`
+    /// bounds each wait for progress.
+    pub fn tcp_request(
+        &self,
+        server: impl Into<SocketAddr>,
+        request: Vec<u8>,
+        grace: Duration,
+    ) -> Result<Vec<u8>, String> {
+        let server = server.into();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        self.cmds
+            .send(TrafficCmd::TcpRequest {
+                server,
+                request,
+                grace,
+                respond: tx,
+            })
+            .map_err(|_| "client traffic pump is gone".to_string())?;
+        recv_result(rx, grace * 3 + Duration::from_secs(5), "tcp request")
     }
 
     /// Close the session CLEANLY: the pump drops the composed transport

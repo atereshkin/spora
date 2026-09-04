@@ -68,7 +68,7 @@ You will see something like:
 ```text
 Tunnel up on spora0 (10.11.0.2/24, fd00:5350::2/64), MTU 1280 (follows the path).
 Routing all traffic through the tunnel.
-Resolver: 8.8.8.8, 1.1.1.1 (set via resolvectl; restored on exit).
+Resolver: 100.64.0.53 (set via resolvectl; restored on exit).
 Press Ctrl+C to disconnect.
 ```
 

@@ -121,6 +121,16 @@ enum Mode {
         /// egress accountability record for answering abuse reports.
         #[arg(long)]
         no_conn_log: bool,
+        /// Answer clients' DNS queries from these servers (ip or ip:port,
+        /// repeatable, in preference order) instead of this host's own
+        /// resolvers. Used exclusively: no public fallback.
+        #[arg(long, conflicts_with = "no_dns_forwarder")]
+        dns_upstream: Vec<String>,
+        /// Don't answer clients' DNS queries at all: queries to the tunnel's
+        /// resolver address (100.64.0.53) are dropped like any other private
+        /// destination, so clients must bring public resolvers of their own.
+        #[arg(long)]
+        no_dns_forwarder: bool,
         /// Override the connection-log directory.
         #[arg(long, conflicts_with = "no_conn_log")]
         conn_log_dir: Option<PathBuf>,
@@ -190,8 +200,10 @@ enum Mode {
         /// routes and leave the resolver alone: you route into it yourself.
         #[arg(long, conflicts_with_all = ["tun_name", "route"])]
         no_routes: bool,
-        /// Resolver to use while connected (repeatable; default 8.8.8.8 and
-        /// 1.1.1.1). It is reached through the tunnel, so it must be public.
+        /// Resolver to use while connected (repeatable). The default,
+        /// 100.64.0.53, is the sharer's DNS forwarder, which answers from the
+        /// sharer's own resolvers. Anything else is reached through the
+        /// tunnel, so it must be public.
         #[arg(long, conflicts_with_all = ["tun_name", "no_routes"])]
         dns: Vec<String>,
         /// Leave the host's resolver configuration alone.
@@ -361,6 +373,41 @@ enum HoldCmd {
     },
 }
 
+/// The share's DNS forwarder from `--dns-upstream` / `--no-dns-forwarder`
+/// (see spora-core's `dns`): this host's system resolvers with a public
+/// fallback by default; an explicit list is used exclusively; `None` when
+/// disabled.
+fn dns_forwarder_config(
+    upstreams: &[String],
+    disabled: bool,
+) -> Result<Option<std::sync::Arc<spora_core::dns::DnsForwarder>>, String> {
+    use spora_core::dns::{DnsForwarder, DnsUpstream};
+    if disabled {
+        return Ok(None);
+    }
+    if upstreams.is_empty() {
+        return Ok(Some(DnsForwarder::system()));
+    }
+    let mut servers = Vec::with_capacity(upstreams.len());
+    for u in upstreams {
+        servers.push(parse_resolver(u).map_err(|e| format!("--dns-upstream: {e}"))?);
+    }
+    Ok(Some(DnsForwarder::with_fallback(
+        DnsUpstream::Servers(servers),
+        Vec::new(),
+    )))
+}
+
+/// `ip` (port 53) or `ip:port` — literals only; a resolver is not something
+/// to look up with a resolver.
+fn parse_resolver(s: &str) -> Result<std::net::SocketAddr, String> {
+    if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+        return Ok(std::net::SocketAddr::new(ip, 53));
+    }
+    s.parse::<std::net::SocketAddr>()
+        .map_err(|_| format!("'{s}' is not an IP address or ip:port (a v6 literal with a port is bracketed: [::1]:53)"))
+}
+
 /// Load a relay capability token from `--relay-token`: either a path to a file
 /// containing the base64url token, or the token string itself. Returns the raw
 /// (decoded) token bytes for `Config::relay_token`.
@@ -415,6 +462,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             no_direct_upgrade,
             relay_token,
             no_conn_log,
+            dns_upstream,
+            no_dns_forwarder,
             conn_log_dir,
             conn_log_retention_days,
             conn_log_sessions_only,
@@ -472,6 +521,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 config.stun_servers = stun;
             }
             config.enable_direct_upgrade = !no_direct_upgrade;
+            // Reassigned only under --os-routing (Linux).
+            #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
+            let mut dns_forwarder = dns_forwarder_config(&dns_upstream, no_dns_forwarder)?;
+            config.dns_forwarder = dns_forwarder.clone();
             install_json_event_hook(&mut config, json);
             let connlog_dir = if no_conn_log {
                 None
@@ -496,7 +549,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 #[cfg(target_os = "linux")]
                 {
                     let opts = os_route::Options::parse(&tun_addr, &tun_addr6, tun_mtu, !no_nat)?;
-                    let guard = os_route::OsRoute::setup(&opts)?;
+                    let mut guard = os_route::OsRoute::setup(&opts)?;
+                    if let Some(fwd) = &dns_forwarder
+                        && !guard.start_dns_forwarder(fwd.clone()).await?
+                    {
+                        // --no-nat: no DNAT, so the synthetic address stays
+                        // unanswered. Say so rather than claim a forwarder.
+                        dns_forwarder = None;
+                        config.dns_forwarder = None;
+                    }
                     config.exit_mode = ExitMode::Custom(guard.session_handler());
                     routing = Some(guard);
                 }
@@ -519,6 +580,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                     "tun_name": routing.as_ref().map(|g| g.tun_name()),
                     "record_dir": record_dir,
                     "upgrade_enabled": upgrade_enabled,
+                    "dns_upstreams": dns_forwarder.as_ref().map(|f| {
+                        f.upstreams().iter().map(ToString::to_string).collect::<Vec<_>>()
+                    }),
+                    "dns_fallback": dns_forwarder.as_ref().map(|f| {
+                        f.fallback().iter().map(ToString::to_string).collect::<Vec<_>>()
+                    }),
                 }))?;
             } else {
                 println!("Share this URL with the peer that wants to connect:");
@@ -549,6 +616,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                         "Diagnostic record: {} (read it with `spora record`, disable with --no-record)",
                         dir.display()
                     );
+                }
+                match &dns_forwarder {
+                    Some(f) => {
+                        let ups = f.upstreams();
+                        let join = |v: &[std::net::SocketAddr]| {
+                            v.iter()
+                                .map(ToString::to_string)
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        };
+                        if ups.is_empty() {
+                            println!(
+                                "DNS forwarder: no system resolvers found; clients resolve through {} (public fallback)",
+                                join(&f.fallback())
+                            );
+                        } else {
+                            println!(
+                                "DNS forwarder: clients resolve through this host's resolvers ({})",
+                                join(&ups)
+                            );
+                        }
+                    }
+                    None => println!(
+                        "DNS forwarder DISABLED: clients must point their resolver at a public address."
+                    ),
                 }
                 println!("Press Ctrl+C to stop sharing.");
             }
@@ -1826,6 +1918,59 @@ mod identity_persistence_tests {
         assert!(leftover.is_empty(), "temp file leaked: {:?}", leftover);
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+}
+
+#[cfg(test)]
+mod dns_upstream_tests {
+    use super::*;
+
+    #[test]
+    fn parse_resolver_accepts_literals_only() {
+        assert_eq!(
+            parse_resolver("192.168.1.1").unwrap(),
+            "192.168.1.1:53".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_resolver("10.0.0.1:5353").unwrap(),
+            "10.0.0.1:5353".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert_eq!(
+            parse_resolver("2606:4700:4700::1111").unwrap(),
+            "[2606:4700:4700::1111]:53"
+                .parse::<std::net::SocketAddr>()
+                .unwrap()
+        );
+        assert_eq!(
+            parse_resolver("[::1]:5300").unwrap(),
+            "[::1]:5300".parse::<std::net::SocketAddr>().unwrap()
+        );
+        assert!(parse_resolver("dns.google").is_err(), "no hostnames");
+        assert!(parse_resolver("").is_err());
+    }
+
+    #[test]
+    fn dns_forwarder_config_modes() {
+        use spora_core::dns::DnsUpstream;
+        assert!(dns_forwarder_config(&[], true).unwrap().is_none());
+        let system = dns_forwarder_config(&[], false).unwrap().unwrap();
+        assert_eq!(system.mode(), DnsUpstream::System);
+        assert!(
+            !system.fallback().is_empty(),
+            "system mode falls back to public resolvers"
+        );
+        let explicit = dns_forwarder_config(&["9.9.9.9".into()], false)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            explicit.mode(),
+            DnsUpstream::Servers(vec!["9.9.9.9:53".parse().unwrap()])
+        );
+        assert!(
+            explicit.fallback().is_empty(),
+            "an explicit list is used exclusively"
+        );
+        assert!(dns_forwarder_config(&["nope".into()], false).is_err());
     }
 }
 

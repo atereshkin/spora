@@ -120,3 +120,11 @@ harness = false
 [[test]]
 name = "exit"
 harness = false
+
+# The exit's DNS forwarder (spora-core `dns`): a client resolving through the
+# synthetic address 100.64.0.53 is answered by the sharer's own upstreams —
+# UDP and TCP, with failover from a refused and from a silent upstream — and
+# by nothing at all when the forwarder is off.
+[[test]]
+name = "dns"
+harness = false

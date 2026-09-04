@@ -139,6 +139,9 @@ struct TunnelSession {
 struct ShareSessionEntry {
     cancel: CancellationToken,
     task: JoinHandle<()>,
+    /// The session's DNS forwarder (see spora-core's `dns`), so the app can
+    /// hand it the device's resolvers (`set_share_dns_servers`).
+    dns: Arc<spora_core::dns::DnsForwarder>,
 }
 
 static SHARE_SESSIONS: Lazy<Mutex<HashMap<i32, ShareSessionEntry>>> =
@@ -252,9 +255,14 @@ pub fn share(
         cfg.log_destinations = !conn_log_sessions_only;
         cfg
     });
+    // Android has no resolv.conf, so `System` finds nothing and the public
+    // fallback answers until the app supplies the network's resolvers via
+    // `set_share_dns_servers`.
+    let dns = spora_core::dns::DnsForwarder::system();
     let config = spora_core::Config {
         protector: protector.and_then(wrap_protector),
         conn_log,
+        dns_forwarder: Some(dns.clone()),
         ..spora_core::Config::default()
     };
     let session = RUNTIME
@@ -269,9 +277,50 @@ pub fn share(
     SHARE_SESSIONS
         .lock()
         .unwrap()
-        .insert(id, ShareSessionEntry { cancel, task });
+        .insert(id, ShareSessionEntry { cancel, task, dns });
 
     Ok(ShareResult { handle: id, url })
+}
+
+/// The tunnel's synthetic resolver address (spora-core's `dns::PROXY_ADDR`,
+/// port 53). A *client* app sets it as the VPN's DNS server
+/// (`VpnService.Builder.addDnsServer`); the sharer's DNS forwarder answers
+/// it from the sharer's own resolvers, so the client never needs to know
+/// what those are. Pure convention — nothing is negotiated on the wire.
+#[uniffi::export]
+pub fn dns_forwarder_address() -> String {
+    spora_core::dns::PROXY_ADDR.to_string()
+}
+
+/// Tell a share session which resolvers this device is using, so clients'
+/// queries are forwarded there. Android has no resolv.conf, so the app
+/// supplies them: `ConnectivityManager.getLinkProperties(activeNetwork)
+/// .getDnsServers()` right after `share()`, and again from
+/// `NetworkCallback.onLinkPropertiesChanged`. Entries are `ip` or `ip:port`
+/// (a v6 literal with a port is bracketed); unparseable ones are skipped
+/// with a log line. An empty list means "unknown": the public fallback
+/// answers.
+///
+/// Known defect: with Private DNS in strict mode the system resolves over
+/// TLS while the forwarder sends plain UDP to the same addresses (see
+/// spora-core's `dns`).
+#[uniffi::export]
+pub fn set_share_dns_servers(handle: i32, servers: Vec<String>) -> Result<(), TunnelError> {
+    let sessions = SHARE_SESSIONS.lock().unwrap();
+    let entry = sessions.get(&handle).ok_or(TunnelError::InvalidHandle)?;
+    let mut parsed = Vec::with_capacity(servers.len());
+    for s in &servers {
+        if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+            parsed.push(std::net::SocketAddr::new(ip, 53));
+        } else if let Ok(addr) = s.parse::<std::net::SocketAddr>() {
+            parsed.push(addr);
+        } else {
+            log::warn!("set_share_dns_servers: ignoring unparseable resolver {s:?}");
+        }
+    }
+    info!("FFI set_share_dns_servers(handle={handle}, servers={parsed:?})");
+    entry.dns.set_servers(parsed);
+    Ok(())
 }
 
 /// Stops the share session associated with the given handle.

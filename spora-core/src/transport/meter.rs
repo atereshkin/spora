@@ -116,6 +116,9 @@ pub struct MeteredTransport {
     inner: IpTransport,
     slog: Arc<SessionLog>,
     keepalive_pair: (Ipv4Addr, Ipv4Addr),
+    /// Whether the exit runs a DNS forwarder: flows to its synthetic
+    /// resolver address are then forwarded, not blocked (see `crate::dns`).
+    dns_forwarded: bool,
     tcp_flows: LruCache<FlowKey, MeterFlow>,
     other_flows: LruCache<FlowKey, MeterFlow>,
     frags: LruCache<FragKey, FlowKey>,
@@ -129,6 +132,7 @@ impl MeteredTransport {
         inner: IpTransport,
         slog: Arc<SessionLog>,
         keepalive_pair: (Ipv4Addr, Ipv4Addr),
+        dns_forwarded: bool,
     ) -> Self {
         let udp_idle = slog.udp_idle;
         let tcp_idle = slog.tcp_idle;
@@ -136,6 +140,7 @@ impl MeteredTransport {
             inner,
             slog,
             keepalive_pair,
+            dns_forwarded,
             tcp_flows: LruCache::new(NonZeroUsize::new(TCP_FLOW_CAP).unwrap()),
             other_flows: LruCache::new(NonZeroUsize::new(OTHER_FLOW_CAP).unwrap()),
             frags: LruCache::new(NonZeroUsize::new(FRAG_CAP).unwrap()),
@@ -248,7 +253,8 @@ impl MeteredTransport {
             return;
         }
 
-        let blocked = is_local_address(key.dst.ip());
+        let blocked = is_local_address(key.dst.ip())
+            && !(self.dns_forwarded && crate::dns::is_proxy_target(key.dst));
         let guard = if blocked {
             self.slog.flow_blocked(key.proto, key.src, key.dst);
             None
@@ -581,6 +587,7 @@ mod tests {
             Box::new(mock),
             session.clone(),
             (Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2)),
+            false,
         );
         Rig {
             meter,

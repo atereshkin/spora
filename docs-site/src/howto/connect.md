@@ -8,8 +8,8 @@
    when a path can be punched;
 3. route your traffic into the tunnel, without ever touching your system's
    own default route;
-4. switch your DNS to public resolvers reached through the tunnel
-   (8.8.8.8 and 1.1.1.1 unless you say otherwise);
+4. send your DNS queries to the sharer, whose exit answers them from its
+   own resolvers (or to public resolvers of your choosing);
 5. follow the network path's real packet-size budget, so the interface MTU
    is what the path actually supports instead of a guess;
 6. put everything back the way it was when you disconnect.
@@ -38,9 +38,14 @@ silently.
 
 ## DNS
 
-While connected, name lookups go to public resolvers through the tunnel,
-so they resolve the way the sharer's network sees the world instead of
-being answered by your local network. One honest exception: Windows may
+While connected, name lookups go to the sharer. The tunnel carries them to
+a fixed resolver address inside it (`100.64.0.53`), and the sharer's exit
+answers each one from whatever resolvers the sharer's own machine uses,
+so names resolve exactly the way the sharer's network sees the world,
+including the resolvers that network hands out, which are often the ones
+that work best (or at all) from there. You never learn the sharer's
+resolver addresses, and the sharer still carries no traffic to its own
+LAN. One honest exception: Windows may
 still consult other adapters' resolvers in parallel (its multi-homed name
 resolution); the tunnel's resolver is made the preferred one, but a
 strict lockdown would need firewall-level filtering that spora does not
@@ -51,8 +56,10 @@ killed outright, the next start repairs the common leftovers (a replaced
 `resolv.conf` on Linux, the per-service settings on macOS).
 
 Pick different resolvers with `--dns` (repeatable), or keep your own setup
-with `--no-dns`. The resolvers must be public addresses: the sharer does
-not carry traffic to private ones.
+with `--no-dns`. Any resolver other than the sharer's must be a public
+address: the sharer does not carry traffic to private ones. A sharer that
+runs with `--no-dns-forwarder` does not answer the tunnel's resolver
+address at all; connect to one with `--dns` and public resolvers.
 
 ## MTU
 

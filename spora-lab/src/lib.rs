@@ -82,6 +82,9 @@ pub const ECHO_UDP_PORT: u16 = 7;
 /// used by smoke tests to verify NAT mapping behavior.
 pub const WHOAMI_UDP_PORT: u16 = 7001;
 pub const ECHO_TCP_PORT: u16 = 7002;
+/// The wan stub resolver (UDP + TCP) the DNS suite points the sharer's
+/// forwarder at, and the one A record it answers with.
+pub use services::{DNS_PORT, DNS_STUB_ANSWER};
 /// Bulk TCP source (download) / sink (upload) services for one-directional
 /// throughput measurement; defined next to the other extra wan services.
 pub use services::{TCP_SINK_PORT, TCP_SOURCE_PORT};

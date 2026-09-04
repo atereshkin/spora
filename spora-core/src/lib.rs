@@ -1,5 +1,6 @@
 mod carrier;
 pub mod connlog;
+pub mod dns;
 pub mod e2e;
 pub mod e2e_noise;
 pub mod e2e_tls;
@@ -284,6 +285,12 @@ pub struct Config {
     /// enable it by default with a platform-appropriate directory. When set
     /// but unwritable, `share()` fails loudly rather than running unlogged.
     pub conn_log: Option<ConnLogConfig>,
+    /// Share side only: the DNS forwarder behind the tunnel's synthetic
+    /// resolver address (see [`dns`]). The default forwards clients' queries
+    /// to this host's own system resolvers, with a public fallback. `None`
+    /// disables it: queries to the synthetic address are then dropped like
+    /// any other private destination.
+    pub dns_forwarder: Option<Arc<dns::DnsForwarder>>,
     /// Whether, and where, to keep a diagnostic record of how each
     /// connection went (see [`record`]). `None` — the default — records
     /// nothing: writing to a user's disk is the platform's decision, not the
@@ -310,6 +317,7 @@ impl Default for Config {
             event_hook: None,
             enable_direct_upgrade: true,
             conn_log: None,
+            dns_forwarder: Some(dns::DnsForwarder::system()),
             record: None,
             relay_token: None,
         }
@@ -1529,6 +1537,7 @@ fn spawn_responder_tunnel(
     }
 
     let exit_slog = slog.clone();
+    let dns_forwarder = config.dns_forwarder.clone();
     let end_cancel = tunnel_cancel.clone();
     rec.mark(StepKind::ExitStart)
         .detail(match &config.exit_mode {
@@ -1543,6 +1552,7 @@ fn spawn_responder_tunnel(
                 protector_for_tunnel,
                 tunnel_cancel,
                 true,
+                dns_forwarder,
                 exit_slog,
             )
             .await;
@@ -1557,6 +1567,7 @@ fn spawn_responder_tunnel(
                     transport,
                     sl.clone(),
                     keepalive_pair,
+                    dns_forwarder.is_some(),
                 )) as IpTransport,
                 None => transport,
             };

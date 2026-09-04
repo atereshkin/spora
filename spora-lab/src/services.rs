@@ -56,6 +56,13 @@ pub const TCP_SOURCE_PORT: u16 = 7004;
 /// Bulk TCP sink: counts bytes until EOF, replies with the count as 8 bytes
 /// big-endian, closes. Upload-direction counterpart of [`TCP_SOURCE_PORT`].
 pub const TCP_SINK_PORT: u16 = 7005;
+/// A stub DNS resolver, UDP and TCP: answers every query with one A record
+/// ([`DNS_STUB_ANSWER`], TTL 60) built by [`dns_stub_answer`] — enough to
+/// see, from the client's side of the tunnel, that a query reached THIS
+/// upstream and came back verbatim. The TCP side closes after one answer.
+pub const DNS_PORT: u16 = 53;
+/// The A record the stub resolver answers with.
+pub const DNS_STUB_ANSWER: Ipv4Addr = Ipv4Addr::new(203, 0, 113, 53);
 
 const STUN_COOKIE: [u8; 4] = [0x21, 0x12, 0xA4, 0x42];
 
@@ -192,6 +199,8 @@ where
                 tokio::spawn(tcp_echo(bind_tcp(ip, ECHO_TCP_PORT).await?));
                 tokio::spawn(tcp_source(bind_tcp(ip, TCP_SOURCE_PORT).await?));
                 tokio::spawn(tcp_sink(bind_tcp(ip, TCP_SINK_PORT).await?));
+                tokio::spawn(dns_stub_udp(bind_udp(ip, DNS_PORT).await?));
+                tokio::spawn(dns_stub_tcp(bind_tcp(ip, DNS_PORT).await?));
             }
             // TCP/TLS relay carrier, alongside the UDP relay (same port, TCP).
             tokio::spawn(relay::tcp::serve_tcp(
@@ -381,6 +390,85 @@ async fn tcp_sink(listener: TcpListener) {
     }
 }
 
+/// The stub resolver's answer to `query`: the query's 12-byte header with
+/// QR and RA set, ANCOUNT=1 and no authority/additional records, the
+/// question section copied verbatim, and one A record ([`DNS_STUB_ANSWER`],
+/// TTL 60) whose name is a pointer to the question name. `None` when the
+/// query is too short to hold a header and one question.
+pub fn dns_stub_answer(query: &[u8]) -> Option<Vec<u8>> {
+    if query.len() < 12 {
+        return None;
+    }
+    // Walk the question name: labels until the root, or a compression pointer.
+    let mut off = 12;
+    loop {
+        let len = *query.get(off)?;
+        if len == 0 {
+            off += 1;
+            break;
+        }
+        if len & 0xC0 == 0xC0 {
+            off += 2;
+            break;
+        }
+        off += 1 + usize::from(len);
+    }
+    let question_end = off + 4; // QTYPE + QCLASS
+    if query.len() < question_end {
+        return None;
+    }
+    let mut out = Vec::with_capacity(question_end + 16);
+    out.extend_from_slice(&query[..2]); // ID
+    out.push(query[2] | 0x80); // QR + the query's opcode/RD
+    out.push(0x80); // RA, RCODE 0
+    out.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 0]); // QD=1 AN=1 NS=0 AR=0
+    out.extend_from_slice(&query[12..question_end]);
+    out.extend_from_slice(&[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]);
+    out.extend_from_slice(&DNS_STUB_ANSWER.octets());
+    Some(out)
+}
+
+async fn dns_stub_udp(sock: UdpSocket) {
+    let mut buf = vec![0u8; 4096];
+    loop {
+        match sock.recv_from(&mut buf).await {
+            Ok((n, src)) => {
+                if let Some(answer) = dns_stub_answer(&buf[..n]) {
+                    let _ = sock.send_to(&answer, src).await;
+                }
+            }
+            Err(e) => log::warn!("dns stub recv: {e}"),
+        }
+    }
+}
+
+/// DNS over TCP (RFC 7766 framing): one length-prefixed query per
+/// connection, answered and then closed.
+async fn dns_stub_tcp(listener: TcpListener) {
+    loop {
+        match listener.accept().await {
+            Ok((mut conn, _)) => {
+                tokio::spawn(async move {
+                    let mut len = [0u8; 2];
+                    if conn.read_exact(&mut len).await.is_err() {
+                        return;
+                    }
+                    let mut query = vec![0u8; usize::from(u16::from_be_bytes(len))];
+                    if conn.read_exact(&mut query).await.is_err() {
+                        return;
+                    }
+                    if let Some(answer) = dns_stub_answer(&query) {
+                        let _ = conn.write_all(&(answer.len() as u16).to_be_bytes()).await;
+                        let _ = conn.write_all(&answer).await;
+                    }
+                    let _ = conn.shutdown().await;
+                });
+            }
+            Err(e) => log::warn!("dns stub accept: {e}"),
+        }
+    }
+}
+
 async fn stun_responder(sock: UdpSocket) {
     let mut buf = [0u8; 1500];
     loop {
@@ -489,6 +577,28 @@ mod tests {
         let octets: Vec<u8> = reply[28..44].iter().zip(key).map(|(b, k)| b ^ k).collect();
         let ip = std::net::Ipv6Addr::from(<[u8; 16]>::try_from(octets.as_slice()).unwrap());
         assert_eq!(ip, "2001:db8:0:b::2".parse::<std::net::Ipv6Addr>().unwrap());
+    }
+
+    #[test]
+    fn dns_stub_answer_shape() {
+        // ID 0x1234, RD, one question: example.com A IN.
+        let mut q = vec![0x12, 0x34, 0x01, 0x00, 0, 1, 0, 0, 0, 0, 0, 0];
+        q.extend_from_slice(b"\x07example\x03com\x00\x00\x01\x00\x01");
+        let a = dns_stub_answer(&q).expect("valid query");
+        assert_eq!(&a[..2], &[0x12, 0x34], "id copied");
+        assert_eq!(a[2], 0x81, "QR + RD");
+        assert_eq!(a[3], 0x80, "RA, NOERROR");
+        assert_eq!(&a[4..12], &[0, 1, 0, 1, 0, 0, 0, 0]);
+        assert_eq!(&a[12..12 + 17], &q[12..], "question verbatim");
+        assert_eq!(a.len(), q.len() + 16);
+        assert_eq!(&a[a.len() - 4..], &DNS_STUB_ANSWER.octets());
+        assert_eq!(
+            &a[a.len() - 16..a.len() - 4],
+            &[0xC0, 0x0C, 0, 1, 0, 1, 0, 0, 0, 60, 0, 4]
+        );
+        // Too short, or a truncated question.
+        assert!(dns_stub_answer(&q[..11]).is_none());
+        assert!(dns_stub_answer(&q[..20]).is_none());
     }
 
     #[test]
