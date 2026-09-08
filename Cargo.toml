@@ -1,6 +1,6 @@
 [workspace]
 members = [
-    "spora-core", "spora-cli",
+    "spora-core", "spora-vpn", "spora-cli",
     "relay", "relay-client", "spora-ffi",
     "spora-lab",
 ]

@@ -1,6 +1,9 @@
-//! Client-side VPN integration for `spora use`: bring up the TUN, give it an
-//! address and an MTU, point the host's traffic at it, swap the resolver, keep
-//! the tunnel's own outer sockets out of the tunnel, and undo all of it on exit.
+//! Client-side host integration for a spora tunnel: bring up the TUN, give it
+//! an address and an MTU, point the host's traffic at it, swap the resolver,
+//! keep the tunnel's own outer sockets out of the tunnel, and undo all of it on
+//! exit. One crate, two consumers: `spora use` (spora-cli) and the Windows
+//! service (spora-wincore, sibling repo) link it directly, so the host-side
+//! behaviour is the same code on every platform and in every client.
 //!
 //! The composition mirrors the Android client (the functional reference,
 //! `ConnectVpnService.kt`): a TUN with an address but no routes while the
@@ -41,15 +44,15 @@
 
 use std::fmt;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, Weak};
 
 /// `resolv.conf` handling (Linux's last-resort resolver tier).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-pub mod dns;
+pub(crate) mod dns;
 /// Parsers for host-tool output. Each has one platform consumer; all are
 /// compiled and tested everywhere.
 #[allow(dead_code)]
-pub mod parsers;
+pub(crate) mod parsers;
 
 #[cfg(target_os = "linux")]
 #[path = "linux.rs"]
@@ -572,10 +575,7 @@ impl Session {
     /// no DNS: the relay dial that follows must use the normal network.
     pub fn setup(opts: Options) -> Result<Session, String> {
         let mut undo = UndoStack::default();
-        let backend = imp::Backend::setup(&opts, &mut undo).map_err(|e| {
-            undo.unwind();
-            e
-        })?;
+        let backend = imp::Backend::setup(&opts, &mut undo).inspect_err(|_| undo.unwind())?;
         Ok(Session {
             mtu: std::sync::atomic::AtomicU16::new(opts.initial_mtu()),
             opts,
@@ -669,6 +669,78 @@ pub async fn run_pump(
     imp::run_pump(transport, handle).await
 }
 
+/// What the MTU hook did with one of spora-core's reports (see
+/// [`mtu_callback`]).
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum MtuEvent {
+    /// spora-core reported the carrier's datagram budget (after PMTUD
+    /// converges, and again after a direct upgrade).
+    Reported(u16),
+    /// The TUN MTU was set to this value as a result (see [`mtu_for_report`]).
+    Applied(u16),
+    /// The report could not be applied to the interface.
+    Failed { reported: u16, error: String },
+}
+
+/// Build `Config.mtu_callback`: route spora-core's MTU reports to the session's
+/// MTU policy. The callback must not block, so it only queues; a task applies
+/// the value off the async runtime and tells `notify` both what was reported
+/// and what was set. With no session (an attach-mode caller) reports are only
+/// announced. Must be called from within a tokio runtime.
+pub fn mtu_callback(
+    session: Option<&Arc<Session>>,
+    notify: impl Fn(MtuEvent) + Send + Sync + 'static,
+) -> spora_core::MtuCallback {
+    let session: Option<Weak<Session>> = session.map(Arc::downgrade);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u16>();
+    tokio::spawn(async move {
+        while let Some(reported) = rx.recv().await {
+            notify(MtuEvent::Reported(reported));
+            let Some(session) = session.as_ref().and_then(Weak::upgrade) else {
+                continue;
+            };
+            match tokio::task::spawn_blocking(move || session.on_mtu_report(reported)).await {
+                Ok(Ok(Some(mtu))) => notify(MtuEvent::Applied(mtu)),
+                Ok(Ok(None)) => {}
+                Ok(Err(error)) => notify(MtuEvent::Failed { reported, error }),
+                Err(e) => notify(MtuEvent::Failed {
+                    reported,
+                    error: format!("MTU task: {e}"),
+                }),
+            }
+        }
+    });
+    Some(Arc::new(move |mtu| {
+        let _ = tx.send(mtu);
+    }))
+}
+
+/// Build `Config.event_hook`: when the tunnel reconnects, let the session
+/// re-detect its uplink first (the network may have changed underneath, and
+/// macOS/Windows bind the outer sockets to it), then hand every event to
+/// `inner` in order. Non-blocking towards spora-core (events are queued).
+/// Must be called from within a tokio runtime.
+pub fn event_hook(
+    session: Option<&Arc<Session>>,
+    inner: impl Fn(spora_core::TunnelEvent) + Send + Sync + 'static,
+) -> spora_core::EventHook {
+    let session: Option<Weak<Session>> = session.map(Arc::downgrade);
+    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<spora_core::TunnelEvent>();
+    tokio::spawn(async move {
+        while let Some(event) = rx.recv().await {
+            if matches!(event, spora_core::TunnelEvent::Reconnecting)
+                && let Some(s) = session.as_ref().and_then(Weak::upgrade)
+            {
+                let _ = tokio::task::spawn_blocking(move || s.refresh_uplink()).await;
+            }
+            inner(event);
+        }
+    });
+    Some(Arc::new(move |event| {
+        let _ = tx.send(event);
+    }))
+}
+
 /// Hold an exclusive advisory lock for the life of the session. The startup
 /// sweep of a crashed run's leftovers (policy rules, resolver backups) is
 /// only safe when no other instance is live — without this, a second
@@ -692,6 +764,7 @@ pub(crate) fn acquire_instance_lock(path: &str) -> Result<std::fs::File, String>
     }
     let f = std::fs::OpenOptions::new()
         .create(true)
+        .truncate(false)
         .write(true)
         .open(p)
         .map_err(|e| format!("cannot open {path}: {e}{}", needs_root(&e)))?;

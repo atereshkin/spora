@@ -55,6 +55,7 @@ serially on a quiet machine rather than re-running the full suite a few times.
 Workspace members (resolver v3):
 
 - **spora-core** — Core library. Exposes `share()` (sharer mode) and `connect(url)` (client mode). Contains all networking logic.
+- **spora-vpn** — Client-side host integration for a tunnel (TUN, routes, resolver, MTU policy, outer-socket bypass, undo-on-exit) on Linux, macOS and Windows: the code behind `spora use`, linked as a library by spora-cli AND by spora-wincore (sibling `../spora-win` repo) so both clients share one implementation.
 - **spora-cli** — CLI binary with `spora share` and `spora use <URL>` subcommands, building on Linux, macOS and Windows. `spora use` is a full VPN client (see "Client VPN mode"); `spora share --os-routing` enables the privileged netstack bypass (see "Share-side exit modes", Linux only). `--relay <host:port>` (share) and `--stun <host:port>` (share/use) override the built-in endpoints.
 - **spora-ffi** — Uniffi-based FFI for Android/JNI. Wraps core functions for Kotlin. Builds as `cdylib`.
 - **spora-wincore**, **spora-winui** — Windows service + UI.
@@ -143,7 +144,7 @@ Clients resolve through the sharer's own resolvers without ever learning what th
 - Client side: `spora use` defaults `--dns` to the synthetic address (`vpn::DEFAULT_DNS`, asserted equal to `dns::PROXY_ADDR`), excludes it from the private-resolver warning, and routes it as a host route in split-tunnel mode; the FFI exposes `dns_forwarder_address()` for the Android client's `addDnsServer`.
 - e2e coverage: `cargo test -p spora-lab --test dns` (UDP, TCP, refused/silent failover, forwarder off); unit tests in `dns.rs` (health, resolv.conf, serve_*), `server.rs` (rewrite past `block_local`) and `os_route.rs` (`classify_with`).
 
-### Client VPN mode (`spora use`, `spora-cli/src/vpn/`)
+### Client VPN mode (`spora use`, crate `spora-vpn`)
 
 Without `--tun-name`, `spora use` is a turnkey VPN client on Linux, macOS and
 Windows (privileged: root / Administrator). The bring-up is two-phase, exactly

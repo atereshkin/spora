@@ -15,7 +15,7 @@ mod docs;
 mod os_route;
 /// Client-side tunnel integration for `spora use` (interface, routes, MTU,
 /// resolver) on Linux, macOS and Windows.
-mod vpn;
+use spora_vpn as vpn;
 
 /// Active keepalive/liveness probe interval (seconds) for the always-on CLI
 /// client. Non-zero opts out of spora-core's dormant ("screen off") mode.
@@ -785,12 +785,11 @@ async fn run_use(args: UseArgs) -> Result<(), Box<dyn std::error::Error>> {
         }
         UseMode::Attach(_) => None,
     };
-    let weak = session.as_ref().map(std::sync::Arc::downgrade);
     if let Some(s) = &session {
         config.protector = s.protector();
     }
-    install_event_hook(&mut config, json, weak.clone());
-    install_mtu_hook(&mut config, json, weak);
+    install_event_hook(&mut config, json, session.as_ref());
+    install_mtu_hook(&mut config, json, session.as_ref());
 
     let configured_record_dir = record_config(
         &mut config,
@@ -974,20 +973,11 @@ async fn wait_for_tunnel_end(
 
 /// Route spora-core's MTU reports (the carrier's datagram budget, reported
 /// after PMTUD converges and again after a direct upgrade) to the tunnel
-/// interface. The callback must not block, so it only queues; a task applies
-/// the value off the async runtime and announces both the report and what was
-/// set.
-fn install_mtu_hook(
-    config: &mut Config,
-    json: bool,
-    session: Option<std::sync::Weak<vpn::Session>>,
-) {
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<u16>();
-    config.mtu_callback = Some(std::sync::Arc::new(move |mtu| {
-        let _ = tx.send(mtu);
-    }));
-    tokio::spawn(async move {
-        while let Some(reported) = rx.recv().await {
+/// interface through spora-vpn's MTU policy, announcing both the report and
+/// what was set.
+fn install_mtu_hook(config: &mut Config, json: bool, session: Option<&std::sync::Arc<vpn::Session>>) {
+    config.mtu_callback = vpn::mtu_callback(session, move |event| match event {
+        vpn::MtuEvent::Reported(reported) => {
             if json {
                 let _ = emit_json_event(
                     serde_json::json!({"v": 1, "event": "path_mtu", "mtu": reported}),
@@ -995,25 +985,17 @@ fn install_mtu_hook(
             } else {
                 log::info!("path MTU budget reported: {reported}");
             }
-            let Some(session) = session.as_ref().and_then(std::sync::Weak::upgrade) else {
-                continue;
-            };
-            let applied =
-                tokio::task::spawn_blocking(move || session.on_mtu_report(reported)).await;
-            match applied {
-                Ok(Ok(Some(mtu))) => {
-                    if json {
-                        let _ = emit_json_event(
-                            serde_json::json!({"v": 1, "event": "tun_mtu", "mtu": mtu}),
-                        );
-                    } else {
-                        log::info!("tunnel interface MTU set to {mtu}");
-                    }
-                }
-                Ok(Ok(None)) => {}
-                Ok(Err(e)) => log::warn!("could not apply MTU {reported}: {e}"),
-                Err(e) => log::warn!("MTU task: {e}"),
+        }
+        vpn::MtuEvent::Applied(mtu) => {
+            if json {
+                let _ =
+                    emit_json_event(serde_json::json!({"v": 1, "event": "tun_mtu", "mtu": mtu}));
+            } else {
+                log::info!("tunnel interface MTU set to {mtu}");
             }
+        }
+        vpn::MtuEvent::Failed { reported, error } => {
+            log::warn!("could not apply MTU {reported}: {error}");
         }
     });
 }
@@ -1033,29 +1015,18 @@ fn install_json_event_hook(config: &mut spora_core::Config, enabled: bool) {
 /// Consume spora-core's lifecycle events: print them as JSON when asked, and
 /// let the VPN session re-detect its uplink when the tunnel reconnects (the
 /// network may have changed underneath; macOS/Windows bind the outer sockets
-/// to it).
+/// to it — spora-vpn's hook does that before the event reaches us).
 fn install_event_hook(
     config: &mut spora_core::Config,
     json: bool,
-    session: Option<std::sync::Weak<vpn::Session>>,
+    session: Option<&std::sync::Arc<vpn::Session>>,
 ) {
     if !json && session.is_none() {
         return;
     }
-    let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel();
-    config.event_hook = Some(std::sync::Arc::new(move |event| {
-        let _ = sender.send(event);
-    }));
-    tokio::spawn(async move {
-        while let Some(event) = receiver.recv().await {
-            if matches!(event, spora_core::TunnelEvent::Reconnecting)
-                && let Some(s) = session.as_ref().and_then(std::sync::Weak::upgrade)
-            {
-                let _ = tokio::task::spawn_blocking(move || s.refresh_uplink()).await;
-            }
-            if json {
-                let _ = emit_json_event(tunnel_event_json(event));
-            }
+    config.event_hook = vpn::event_hook(session, move |event| {
+        if json {
+            let _ = emit_json_event(tunnel_event_json(event));
         }
     });
 }

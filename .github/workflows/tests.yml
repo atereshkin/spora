@@ -70,7 +70,7 @@ jobs:
     # `spora use` is a full VPN client on Windows (wintun + IP Helper);
     # nothing else builds the workspace for a Windows target, so this job
     # catches windows-gated breakage (spora-core's protector plumbing, the
-    # vpn::windows backend) at the commit that causes it. Check only: the
+    # spora-vpn windows backend) at the commit that causes it. Check only: the
     # runtime needs wintun.dll and elevation, which CI has no business doing.
     runs-on: windows-latest
     timeout-minutes: 20
@@ -86,7 +86,7 @@ jobs:
   cli-macos:
     # Same rationale for macOS (utun + BSD route/ifconfig backend). The unit
     # the cross-platform parsers are tested in the ubuntu job too; this one
-    # compiles AND tests the darwin-gated code (vpn::macos).
+    # compiles AND tests the darwin-gated code (spora-vpn's macos backend).
     runs-on: macos-latest
     timeout-minutes: 20
     steps:
@@ -97,7 +97,7 @@ jobs:
           key: cli-macos
           cache-on-failure: true
       - run: cargo check -p spora-cli
-      - run: cargo test -p spora-cli
+      - run: cargo test -p spora-cli -p spora-vpn
 
   test:
     runs-on: ubuntu-latest
