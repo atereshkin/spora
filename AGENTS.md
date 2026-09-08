@@ -197,6 +197,15 @@ exactly when sweeping is safe. Key invariants:
   SIGTERM/Ctrl+C, and the Windows console-close events), while what a SIGKILL
   would leak is either process-lifetime (the interface) or recovered at the
   next start (rules sweep, resolv.conf backup, macOS DNS state file).
+- **Windows: duplicate address detection is off on the wintun adapter**
+  (`DadTransmits = 0`, set BEFORE the addresses are added, as WireGuard does).
+  With DAD on, the address is Tentative for ~3 s; once the half-default routes
+  make the adapter the DNS client's first-choice interface, every name lookup
+  on the host fails instantly for the rest of that window (the query is built
+  on the tentative interface and Windows does not fall back to the uplink) —
+  core's STUN lookups, ~80 ms after session-up, always lost the first direct
+  attempt to it (direct path 15 s late). Found on the Windows test box,
+  2026-09-08.
 - **`--tun-name <name>` attaches to a pre-created TUN and touches NOTHING
   else** — a Linux-only product feature used by the in-tree `cli_vpn` lab
   test: caller owns address, MTU, routes, cleanup. Attach mode installs no

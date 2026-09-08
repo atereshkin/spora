@@ -21,6 +21,12 @@
 //! but a strict no-leak DNS policy would need WFP filters, which this tool
 //! does not install.
 //!
+//! Duplicate address detection is switched off on the adapter before its
+//! addresses are added (`DadTransmits = 0`, as WireGuard does): otherwise the
+//! address is Tentative for ~3 s and, with the half-default routes making the
+//! adapter the DNS client's first-choice interface, every name lookup on the
+//! host fails for the rest of that window.
+//!
 //! Needs an elevated (Administrator) console.
 
 use std::io;
@@ -86,11 +92,23 @@ impl Backend {
             .get_name()
             .unwrap_or_else(|_| ADAPTER_NAME.to_string());
 
-        add_address(luid, index, IpAddr::V4(opts.tun_addr), opts.tun_prefix)?;
+        // Interface settings BEFORE the addresses: `configure_interface` turns
+        // duplicate address detection off, and that only covers addresses
+        // added afterwards. With DAD on, a fresh address sits in the Tentative
+        // state for ~3 s (three ARP probes nobody answers on a tunnel), and
+        // the moment the half-default routes make this adapter the DNS
+        // client's first-choice interface, every name lookup on the machine
+        // fails instantly for the rest of that window — the query is built on
+        // this interface, finds no usable source address, and the DNS client
+        // does not fall back to the uplink. Core's STUN lookups run ~80 ms
+        // after the relay session is up, squarely inside it.
         configure_interface(luid, AF_INET, opts.initial_mtu())?;
+        if opts.tun_addr6.is_some() {
+            configure_interface(luid, AF_INET6, opts.initial_mtu())?;
+        }
+        add_address(luid, index, IpAddr::V4(opts.tun_addr), opts.tun_prefix)?;
         if let Some((a6, p6)) = opts.tun_addr6 {
             add_address(luid, index, IpAddr::V6(a6), p6)?;
-            configure_interface(luid, AF_INET6, opts.initial_mtu())?;
         }
         let session = Arc::new(
             adapter
@@ -440,7 +458,11 @@ fn add_address(luid: NET_LUID_LH, index: u32, ip: IpAddr, prefix: u8) -> Result<
     Ok(())
 }
 
-/// Set the MTU and pin the interface metric to 0 for one address family.
+/// Set the MTU, pin the interface metric to 0 and disable duplicate address
+/// detection for one address family. DAD is meaningless on a point-to-point
+/// tunnel (WireGuard for Windows disables it the same way) and, left on, it
+/// keeps the address Tentative for ~3 s during which name resolution on the
+/// whole machine fails once the tunnel routes are in (see `Backend::setup`).
 fn configure_interface(luid: NET_LUID_LH, family: ADDRESS_FAMILY, mtu: u16) -> Result<(), String> {
     let mut row: MIB_IPINTERFACE_ROW = unsafe { std::mem::zeroed() };
     row.Family = family;
@@ -452,6 +474,7 @@ fn configure_interface(luid: NET_LUID_LH, family: ADDRESS_FAMILY, mtu: u16) -> R
     row.NlMtu = u32::from(mtu);
     row.UseAutomaticMetric = 0;
     row.Metric = 0;
+    row.DadTransmits = 0;
     // Required to be 0 for IPv4 on input, per the SetIpInterfaceEntry docs.
     row.SitePrefixLength = 0;
     let ret = unsafe { SetIpInterfaceEntry(&mut row) };
