@@ -30,4 +30,7 @@ windows-sys = { version = "0.52", features = [
     "Win32_NetworkManagement_IpHelper",
     "Win32_NetworkManagement_Ndis",
     "Win32_Networking_WinSock",
+    # NetBIOS-over-TCP/IP switch for the adapter (registry, src/windows.rs).
+    "Win32_Security",
+    "Win32_System_Registry",
 ] }

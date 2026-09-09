@@ -122,7 +122,7 @@ After the relay-via session is up, both sides try to establish a direct path:
 
 How the share side turns tunneled IP packets into real traffic:
 
-- **`ExitMode::Netstack`** (default, unprivileged) — userland smoltcp netstack (`server::start_tunnel`): TCP/UDP flows are terminated in-process and re-originated from OS sockets. Used by FFI/Android and the CLI without flags.
+- **`ExitMode::Netstack`** (default, unprivileged) — userland smoltcp netstack (`server::start_tunnel`): TCP/UDP flows are terminated in-process and re-originated from OS sockets. Used by FFI/Android and the CLI without flags. Inner traffic to local/private destinations is dropped (`block_local`); a blocked UDP destination is logged at WARN once per session (then debug), because a Windows client's NetBIOS broadcasts would otherwise flood the log.
 - **`ExitMode::Custom(SessionHandler)`** — netstack bypass. The handler is called once per accepted session with the composed `IpTransport` and a `CancellationToken` (cancelled when a new peer replaces the session or the share stops). The core still owns accept/registration/direct-upgrade.
 
 The CLI implements OS routing on top of `Custom` (`spora share --os-routing`, plus `--tun-addr`, `--tun-mtu`, `--no-nat`; see `spora-cli/src/os_route.rs`). Requires root/CAP_NET_ADMIN, Linux only. It creates a TUN device and pumps packets transport↔TUN; the kernel forwards/NATs. Key invariants:
@@ -206,7 +206,12 @@ exactly when sweeping is safe. Key invariants:
   on the tentative interface and Windows does not fall back to the uplink) —
   core's STUN lookups, ~80 ms after session-up, always lost the first direct
   attempt to it (direct path 15 s late). Found on the Windows test box,
-  2026-09-08.
+  2026-09-08. NetBIOS over TCP/IP is switched off for the adapter as well
+  (`NetbiosOptions = 2` under its NetBT interface key, written after the
+  adapter exists — NetBT resets the key at bind — and before the address is
+  added, which is when NetBT re-reads it): otherwise Windows broadcasts its
+  NetBIOS name registrations into the tunnel (UDP 137, a dozen packets per
+  bring-up) for the exit to drop.
 - **`--tun-name <name>` attaches to a pre-created TUN and touches NOTHING
   else** — a Linux-only product feature used by the in-tree `cli_vpn` lab
   test: caller owns address, MTU, routes, cleanup. Attach mode installs no

@@ -87,6 +87,17 @@ impl Backend {
         let index = adapter
             .get_adapter_index()
             .map_err(|e| format!("cannot read the adapter index: {e}"))?;
+
+        // NetBIOS over TCP/IP off for the adapter, now that it exists (NetBT
+        // recreates the interface key with defaults when it binds) and BEFORE
+        // the address goes on: with it on, Windows registers the host's
+        // NetBIOS names on every new address by broadcasting to the tunnel
+        // subnet (UDP 137, a burst of a dozen packets per bring-up) — chatter
+        // the exit has to drop and log. Best effort: a failure costs noise,
+        // not the tunnel.
+        if let Err(e) = disable_netbios(adapter.get_guid()) {
+            log::warn!("could not disable NetBIOS over TCP/IP on the adapter: {e}");
+        }
         let luid = adapter.get_luid();
         let name = adapter
             .get_name()
@@ -527,6 +538,70 @@ fn unicast_if(sock: spora_core::SocketHandle, level: i32, opt: i32, value: u32) 
         )
     };
     r == 0
+}
+
+/// Write `NetbiosOptions = 2` (NetBIOS over TCP/IP disabled) under the
+/// adapter's NetBT interface key — the value behind the adapter's "Disable
+/// NetBIOS over TCP/IP" setting. NetBT reads it when the interface's address
+/// configuration changes, so it must be in place before the address is added.
+fn disable_netbios(guid: u128) -> Result<(), String> {
+    use windows_sys::Win32::System::Registry::{
+        HKEY, HKEY_LOCAL_MACHINE, KEY_SET_VALUE, REG_DWORD, REG_OPTION_NON_VOLATILE, RegCloseKey,
+        RegCreateKeyExW, RegSetValueExW,
+    };
+    let g = windows_sys::core::GUID::from_u128(guid);
+    let path = format!(
+        "SYSTEM\\CurrentControlSet\\Services\\NetBT\\Parameters\\Interfaces\\Tcpip_{{{:08X}-{:04X}-{:04X}-{:02X}{:02X}-{:02X}{:02X}{:02X}{:02X}{:02X}{:02X}}}",
+        g.data1,
+        g.data2,
+        g.data3,
+        g.data4[0],
+        g.data4[1],
+        g.data4[2],
+        g.data4[3],
+        g.data4[4],
+        g.data4[5],
+        g.data4[6],
+        g.data4[7]
+    );
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let name: Vec<u16> = "NetbiosOptions"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut key: HKEY = 0;
+    let ret = unsafe {
+        RegCreateKeyExW(
+            HKEY_LOCAL_MACHINE,
+            wide.as_ptr(),
+            0,
+            std::ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE,
+            std::ptr::null(),
+            &mut key,
+            std::ptr::null_mut(),
+        )
+    };
+    if ret != NO_ERROR {
+        return Err(format!("RegCreateKeyExW({path}) error {ret}"));
+    }
+    let value: u32 = 2;
+    let ret = unsafe {
+        RegSetValueExW(
+            key,
+            name.as_ptr(),
+            0,
+            REG_DWORD,
+            &value as *const u32 as *const u8,
+            std::mem::size_of::<u32>() as u32,
+        )
+    };
+    unsafe { RegCloseKey(key) };
+    if ret != NO_ERROR {
+        return Err(format!("RegSetValueExW({path}\\NetbiosOptions) error {ret}"));
+    }
+    Ok(())
 }
 
 fn set_interface_dns(guid: u128, servers: &str, ipv6: bool) -> Result<(), String> {

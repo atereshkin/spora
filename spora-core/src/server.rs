@@ -5,9 +5,13 @@ use crate::transport::IpTransport;
 use futures_util::{Sink, SinkExt, Stream, StreamExt};
 use log::{debug, error, info, trace, warn};
 use netstack_smoltcp::{Stack, StackBuilder, TcpListener};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+
+/// How many distinct blocked destinations a session reports at warn level
+/// before further ones are only logged at debug.
+const BLOCKED_SEEN_CAP: usize = 256;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -682,6 +686,9 @@ async fn handle_inbound_datagram(
     });
 
     let mut entries: HashMap<NATKey, NATEntry> = HashMap::new();
+    // Destinations already reported as blocked (see below); bounded so a
+    // client scanning private space cannot grow it without limit.
+    let mut blocked_seen: HashSet<IpAddr> = HashSet::new();
     let mut sweep_interval = tokio::time::interval(UDP_NAT_SWEEP_INTERVAL);
     // Forwarded DNS queries in flight (the per-session rate cap).
     let dns_inflight = Arc::new(tokio::sync::Semaphore::new(dns::MAX_INFLIGHT));
@@ -722,7 +729,19 @@ async fn handle_inbound_datagram(
                     continue;
                 }
                 if block_local && is_local_address(remote.ip()) {
-                    warn!("blocked UDP datagram to local address: {:?} => {:?}", local, remote);
+                    // The first datagram to a blocked destination is worth a
+                    // warning; the rest go to debug. A Windows client's
+                    // NetBIOS name registrations (UDP 137 to the tunnel
+                    // subnet's broadcast address, a burst per bring-up) would
+                    // otherwise flood the log with one line per packet.
+                    if blocked_seen.len() < BLOCKED_SEEN_CAP && blocked_seen.insert(remote.ip()) {
+                        warn!(
+                            "blocked UDP datagram to local address: {:?} => {:?} (further datagrams to this address are logged at debug level)",
+                            local, remote
+                        );
+                    } else {
+                        debug!("blocked UDP datagram to local address: {:?} => {:?}", local, remote);
+                    }
                     if let Some(sl) = &slog {
                         sl.flow_blocked(PROTO_UDP, local, remote);
                     }
