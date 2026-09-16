@@ -30,6 +30,8 @@ cargo build --release
 
 The client is then at `target/release/spora-cli` (symlink or alias it to `spora` if you like — it names itself `spora` in `--help`). The build also produces the `relay` daemon, which you only need if you want to run your own relay; a public one is built in.
 
+Contributing? Point git at the repository's hooks once (`git config core.hooksPath .githooks`): the pre-commit hook runs rustfmt over what you stage, so CI's formatting check never trips on a commit.
+
 ### Share your connection — be an exit
 
 ```bash

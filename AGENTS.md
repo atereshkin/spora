@@ -13,10 +13,20 @@ cargo build                    # Build all workspace crates
 cargo build --release          # Release build
 cargo test                     # Run tests (includes the spora-lab network suites)
 cargo clippy                   # Lint
+cargo fmt --check              # What CI's `fmt` job runs (workspace members only; vendor/ is excluded)
 ./build-ffi.sh                 # Cross-compile for Android + generate Kotlin bindings
 ```
 
 The FFI build requires Android NDK linkers configured in `~/.cargo/config.toml` and Android targets installed via `rustup target add`.
+
+**Formatting is enforced at commit time.** `.githooks/pre-commit` runs rustfmt
+over every staged Rust file (the staged content itself, so partially staged
+files keep their unstaged hunks; vendor/ skipped like CI) and refuses a file
+rustfmt cannot parse. Enable it once per clone with
+`git config core.hooksPath .githooks`; `git commit --no-verify` bypasses it.
+CI's macOS and Windows jobs compile code this Linux host cannot
+(`cargo check -p spora-cli --target x86_64-pc-windows-gnu` covers Windows; for
+darwin, run the job's commands on the lab Mac — see the field-lab notes).
 
 ### e2e network lab
 

@@ -1,0 +1,54 @@
+#!/usr/bin/env bash
+# Git pre-commit hook: run rustfmt over every staged Rust file, so the `fmt`
+# job of CI (.github/workflows/tests.yml runs `cargo fmt --check`) cannot go
+# red on a commit made from this clone.
+#
+# It formats the STAGED content (the index blob), not the working tree, so a
+# partially staged file keeps its unstaged hunks unstaged; the working-tree
+# copy is formatted as well so `git status` is clean afterwards. vendor/ is
+# skipped, exactly as CI skips it (workspace `exclude`).
+#
+# One-time setup per clone:  git config core.hooksPath .githooks
+# Skip once (a WIP commit):  git commit --no-verify
+set -euo pipefail
+cd "$(git rev-parse --show-toplevel)"
+
+if ! command -v rustfmt >/dev/null 2>&1; then
+    echo "pre-commit: rustfmt not found (rustup component add rustfmt)" >&2
+    exit 1
+fi
+
+EDITION=2024 # every workspace crate (AGENTS.md, "Conventions")
+tmp=$(mktemp)
+trap 'rm -f "$tmp"' EXIT
+touched=()
+
+while IFS= read -r -d '' path; do
+    case "$path" in vendor/*) continue ;; esac
+    mode=$(git ls-files --stage -- "$path" | cut -d' ' -f1)
+    case "$mode" in 100644 | 100755) ;; *) continue ;; esac # symlinks etc.
+
+    # The content that is about to be committed.
+    if ! git show ":$path" | rustfmt --edition "$EDITION" >"$tmp"; then
+        echo "pre-commit: rustfmt cannot format the staged $path (see above);" >&2
+        echo "pre-commit: fix it, or commit with --no-verify" >&2
+        exit 1
+    fi
+    if git show ":$path" | cmp -s - "$tmp"; then
+        continue
+    fi
+    blob=$(git hash-object -w --stdin <"$tmp")
+    git update-index --cacheinfo "$mode,$blob,$path"
+
+    # The working-tree copy, independently: it may carry unstaged hunks.
+    if rustfmt --edition "$EDITION" <"$path" >"$tmp" 2>/dev/null; then
+        cat "$tmp" >"$path"
+    else
+        echo "pre-commit: $path: staged copy formatted; working-tree copy does not parse, left alone" >&2
+    fi
+    touched+=("$path")
+done < <(git diff --cached --name-only --diff-filter=ACMR -z -- '*.rs')
+
+if ((${#touched[@]})); then
+    echo "pre-commit: rustfmt applied to: ${touched[*]}" >&2
+fi
