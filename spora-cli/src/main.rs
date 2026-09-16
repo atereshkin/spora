@@ -975,7 +975,11 @@ async fn wait_for_tunnel_end(
 /// after PMTUD converges and again after a direct upgrade) to the tunnel
 /// interface through spora-vpn's MTU policy, announcing both the report and
 /// what was set.
-fn install_mtu_hook(config: &mut Config, json: bool, session: Option<&std::sync::Arc<vpn::Session>>) {
+fn install_mtu_hook(
+    config: &mut Config,
+    json: bool,
+    session: Option<&std::sync::Arc<vpn::Session>>,
+) {
     config.mtu_callback = vpn::mtu_callback(session, move |event| match event {
         vpn::MtuEvent::Reported(reported) => {
             if json {

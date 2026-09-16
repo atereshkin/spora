@@ -2265,6 +2265,7 @@ dependencies = [
  "futures-util",
  "libc",
  "log",
+ "serde_json",
  "spora-core",
  "tokio",
  "tokio-tun",

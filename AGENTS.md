@@ -328,7 +328,9 @@ Composition (client side): `QuicPeerTransport → UpgradableTransport → KeepAl
 
 ## Conventions
 
-- Edition 2024 across the workspace (spora-core now too).
+- Edition 2024 across the workspace (spora-core now too). A crate's target-gated
+  dependencies live in ITS manifest: a `cfg(target_os = "macos")` file that
+  moves between crates takes its deps along, or only the macOS CI job notices.
 - Async throughout using tokio with full features.
 - `spora-core/build.rs` stamps the git commit + a dirty flag into the binary
   (overridable with `SPORA_BUILD_COMMIT`/`SPORA_BUILD_DIRTY` for release

@@ -21,6 +21,11 @@ tokio-tun = "0.12.1"
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
+[target.'cfg(target_os = "macos")'.dependencies]
+# Crash-recovery state files of the macOS backend (which scoped uplink routes
+# and resolver settings are ours; src/macos.rs).
+serde_json = "1"
+
 [target.'cfg(windows)'.dependencies]
 # wintun adapter (the DLL is loaded at runtime from next to the executable)
 # plus the IP Helper API for addresses, routes, MTU and DNS (src/windows.rs).

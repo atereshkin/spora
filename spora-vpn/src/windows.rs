@@ -599,7 +599,9 @@ fn disable_netbios(guid: u128) -> Result<(), String> {
     };
     unsafe { RegCloseKey(key) };
     if ret != NO_ERROR {
-        return Err(format!("RegSetValueExW({path}\\NetbiosOptions) error {ret}"));
+        return Err(format!(
+            "RegSetValueExW({path}\\NetbiosOptions) error {ret}"
+        ));
     }
     Ok(())
 }
